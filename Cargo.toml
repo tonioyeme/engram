@@ -6,7 +6,7 @@ rust-version = "1.75"
 description = "Neuroscience-grounded memory system for AI agents. ACT-R activation, Hebbian learning, Ebbinghaus forgetting, cognitive consolidation."
 authors = ["Toni Tang <tonitangpotato@gmail.com>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tonitangpotato/engramai"
+repository = "https://github.com/tonitangpotato/engram-ai-rust"
 keywords = ["ai", "memory", "cognitive-science", "agent", "neuroscience"]
 categories = ["science", "database", "algorithms"]
 

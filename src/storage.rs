@@ -29,6 +29,11 @@ impl Storage {
         
         Ok(Self { conn })
     }
+    
+    /// Get a reference to the underlying database connection.
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
 
     fn create_schema(conn: &Connection) -> SqlResult<()> {
         conn.execute_batch(

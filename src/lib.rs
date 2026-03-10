@@ -57,12 +57,14 @@
 //! let config = MemoryConfig::researcher();
 //! ```
 
+pub mod bus;
 pub mod config;
 pub mod memory;
 pub mod models;
 pub mod storage;
 pub mod types;
 
+pub use bus::{EmotionalBus, SoulUpdate, HeartbeatUpdate, Drive, HeartbeatTask, Identity, EmotionalTrend, ActionStats};
 pub use config::MemoryConfig;
 pub use memory::Memory;
 pub use types::{AclEntry, MemoryLayer, MemoryRecord, MemoryStats, MemoryType, Permission, RecallResult};

@@ -7,11 +7,14 @@
 //!   engram consolidate --ns trading
 //!   engram grant agent-id --ns namespace --perm read
 //!   engram revoke agent-id --ns namespace
+//!   engram bus trends
+//!   engram bus suggest
+//!   engram bus log-outcome check_email --positive
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use engramai::{Memory, MemoryConfig, MemoryType, Permission};
+use engramai::{Memory, MemoryConfig, MemoryType, Permission, EmotionalBus};
 
 /// Engram — Neuroscience-grounded memory system for AI agents.
 #[derive(Parser)]
@@ -25,6 +28,10 @@ struct Cli {
     /// Agent ID for this session (used for ACL)
     #[arg(short, long, env = "ENGRAM_AGENT_ID")]
     agent_id: Option<String>,
+    
+    /// Workspace directory for Emotional Bus (SOUL.md, HEARTBEAT.md, etc.)
+    #[arg(short, long, env = "ENGRAM_WORKSPACE")]
+    workspace: Option<PathBuf>,
     
     #[command(subcommand)]
     command: Commands,
@@ -52,6 +59,14 @@ enum Commands {
         /// Source identifier
         #[arg(long, short = 's')]
         source: Option<String>,
+        
+        /// Emotional valence (-1.0 to 1.0)
+        #[arg(long, short = 'e')]
+        emotion: Option<f64>,
+        
+        /// Domain for emotional tracking
+        #[arg(long)]
+        domain: Option<String>,
     },
     
     /// Recall memories by query
@@ -159,6 +174,70 @@ enum Commands {
         #[arg(long, short = 'n', default_value = "3")]
         recent: usize,
     },
+    
+    /// Emotional Bus commands
+    Bus {
+        #[command(subcommand)]
+        action: BusAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum BusAction {
+    /// Show emotional trends by domain
+    Trends {
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+    
+    /// Show suggested SOUL/HEARTBEAT updates
+    Suggest {
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+    
+    /// Log a behavior outcome
+    LogOutcome {
+        /// Action name (e.g., "check_email", "run_consolidation")
+        action: String,
+        
+        /// Mark outcome as positive
+        #[arg(long, conflicts_with = "negative")]
+        positive: bool,
+        
+        /// Mark outcome as negative
+        #[arg(long, conflicts_with = "positive")]
+        negative: bool,
+    },
+    
+    /// Show behavior statistics
+    BehaviorStats {
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+    
+    /// Record an emotional event
+    RecordEmotion {
+        /// Domain (e.g., "coding", "communication")
+        domain: String,
+        
+        /// Emotional valence (-1.0 to 1.0)
+        #[arg(long, short = 'v')]
+        valence: f64,
+    },
+    
+    /// Check drive alignment for content
+    Alignment {
+        /// Content to check alignment for
+        content: String,
+        
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
 }
 
 #[derive(Clone, ValueEnum)]
@@ -207,22 +286,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     
     let db_path = cli.database.to_str().ok_or("invalid database path")?;
-    let mut mem = Memory::new(db_path, Some(MemoryConfig::default()))?;
+    
+    // Create Memory with or without Emotional Bus
+    let mut mem = if let Some(ref workspace) = cli.workspace {
+        let ws_path = workspace.to_str().ok_or("invalid workspace path")?;
+        Memory::with_emotional_bus(db_path, ws_path, Some(MemoryConfig::default()))?
+    } else {
+        Memory::new(db_path, Some(MemoryConfig::default()))?
+    };
     
     if let Some(agent_id) = &cli.agent_id {
         mem.set_agent_id(agent_id);
     }
     
     match cli.command {
-        Commands::Store { content, ns, r#type, importance, source } => {
-            let id = mem.add_to_namespace(
-                &content,
-                r#type.into(),
-                importance,
-                source.as_deref(),
-                None,
-                Some(&ns),
-            )?;
+        Commands::Store { content, ns, r#type, importance, source, emotion, domain } => {
+            // If emotion is provided, use add_with_emotion
+            let id = if let (Some(em), Some(dom)) = (emotion, domain.as_ref()) {
+                mem.add_with_emotion(
+                    &content,
+                    r#type.into(),
+                    importance,
+                    source.as_deref(),
+                    None,
+                    Some(&ns),
+                    em,
+                    dom,
+                )?
+            } else {
+                mem.add_to_namespace(
+                    &content,
+                    r#type.into(),
+                    importance,
+                    source.as_deref(),
+                    None,
+                    Some(&ns),
+                )?
+            };
             println!("{}", id);
         }
         
@@ -324,6 +424,130 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Reward { feedback, recent } => {
             mem.reward(&feedback, recent)?;
             println!("Applied reward signal to {} recent memories", recent);
+        }
+        
+        Commands::Bus { action } => {
+            // Bus commands require workspace
+            let workspace = cli.workspace.as_ref()
+                .ok_or("Emotional Bus commands require --workspace")?;
+            let ws_path = workspace.to_str().ok_or("invalid workspace path")?;
+            
+            // Create bus directly if not already attached
+            let bus = EmotionalBus::new(ws_path, mem.connection())?;
+            
+            match action {
+                BusAction::Trends { json } => {
+                    let trends = bus.get_trends(mem.connection())?;
+                    
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&trends)?);
+                    } else {
+                        if trends.is_empty() {
+                            println!("No emotional trends recorded yet.");
+                        } else {
+                            println!("Emotional Trends:");
+                            for trend in &trends {
+                                let flag = if trend.needs_soul_update() { " ⚠️ needs update" } else { "" };
+                                println!("  {}: {:.2} avg over {} events{}",
+                                    trend.domain, trend.valence, trend.count, flag);
+                            }
+                        }
+                    }
+                }
+                
+                BusAction::Suggest { json } => {
+                    let soul_updates = bus.suggest_soul_updates(mem.connection())?;
+                    let heartbeat_updates = bus.suggest_heartbeat_updates(mem.connection())?;
+                    
+                    if json {
+                        let combined = serde_json::json!({
+                            "soul_updates": soul_updates,
+                            "heartbeat_updates": heartbeat_updates,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&combined)?);
+                    } else {
+                        if soul_updates.is_empty() && heartbeat_updates.is_empty() {
+                            println!("No suggested updates at this time.");
+                        } else {
+                            if !soul_updates.is_empty() {
+                                println!("SOUL.md Suggestions:");
+                                for s in &soul_updates {
+                                    println!("  [{}/{}] {}", s.domain, s.action, s.content);
+                                }
+                            }
+                            if !heartbeat_updates.is_empty() {
+                                println!("\nHEARTBEAT.md Suggestions:");
+                                for h in &heartbeat_updates {
+                                    println!("  [{}] {} (score: {:.0}%, {} attempts)",
+                                        h.suggestion, h.action, h.stats.score * 100.0, h.stats.total);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                BusAction::LogOutcome { action, positive, negative } => {
+                    let outcome = if positive {
+                        true
+                    } else if negative {
+                        false
+                    } else {
+                        return Err("Must specify --positive or --negative".into());
+                    };
+                    
+                    bus.log_behavior(mem.connection(), &action, outcome)?;
+                    let outcome_str = if outcome { "positive" } else { "negative" };
+                    println!("Logged {} outcome for '{}'", outcome_str, action);
+                }
+                
+                BusAction::BehaviorStats { json } => {
+                    let stats = bus.get_behavior_stats(mem.connection())?;
+                    
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&stats)?);
+                    } else {
+                        if stats.is_empty() {
+                            println!("No behavior statistics recorded yet.");
+                        } else {
+                            println!("Behavior Statistics:");
+                            for s in &stats {
+                                let flag = if s.should_deprioritize() { " ⚠️ deprioritize" } else { "" };
+                                println!("  {}: {:.0}% success ({}/{} positive){}",
+                                    s.action, s.score * 100.0, s.positive, s.total, flag);
+                            }
+                        }
+                    }
+                }
+                
+                BusAction::RecordEmotion { domain, valence } => {
+                    bus.process_interaction(mem.connection(), "", valence, &domain)?;
+                    println!("Recorded emotion {:.2} for domain '{}'", valence, domain);
+                }
+                
+                BusAction::Alignment { content, json } => {
+                    let score = bus.alignment_score(&content);
+                    let boost = bus.align_importance(&content);
+                    let aligned = bus.find_aligned(&content);
+                    
+                    if json {
+                        let result = serde_json::json!({
+                            "score": score,
+                            "importance_boost": boost,
+                            "aligned_drives": aligned,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        println!("Alignment score: {:.2}", score);
+                        println!("Importance boost: {:.2}x", boost);
+                        if !aligned.is_empty() {
+                            println!("Aligned drives:");
+                            for (name, s) in &aligned {
+                                println!("  {}: {:.2}", name, s);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     

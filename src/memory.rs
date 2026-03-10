@@ -4,6 +4,7 @@ use chrono::Utc;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::bus::EmotionalBus;
 use crate::config::MemoryConfig;
 use crate::models::{effective_strength, retrieval_activation, run_consolidation_cycle};
 use crate::storage::Storage;
@@ -19,6 +20,8 @@ pub struct Memory {
     created_at: chrono::DateTime<Utc>,
     /// Agent ID for this memory instance (used for ACL checks)
     agent_id: Option<String>,
+    /// Optional Emotional Bus for drive alignment and emotional tracking
+    emotional_bus: Option<EmotionalBus>,
 }
 
 impl Memory {
@@ -39,7 +42,54 @@ impl Memory {
             config,
             created_at,
             agent_id: None,
+            emotional_bus: None,
         })
+    }
+    
+    /// Create a Memory instance with an Emotional Bus attached.
+    ///
+    /// The Emotional Bus connects memory to workspace files (SOUL.md, HEARTBEAT.md)
+    /// for drive alignment and emotional feedback loops.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to SQLite database file
+    /// * `workspace_dir` - Path to the agent workspace directory
+    /// * `config` - Optional MemoryConfig
+    pub fn with_emotional_bus(
+        path: &str,
+        workspace_dir: &str,
+        config: Option<MemoryConfig>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let storage = Storage::new(path)?;
+        let config = config.unwrap_or_default();
+        let created_at = Utc::now();
+        
+        // Create Emotional Bus using storage's connection
+        let emotional_bus = Some(EmotionalBus::new(workspace_dir, storage.connection())?);
+        
+        Ok(Self {
+            storage,
+            config,
+            created_at,
+            agent_id: None,
+            emotional_bus,
+        })
+    }
+    
+    /// Get a reference to the Emotional Bus, if attached.
+    pub fn emotional_bus(&self) -> Option<&EmotionalBus> {
+        self.emotional_bus.as_ref()
+    }
+    
+    /// Get a mutable reference to the Emotional Bus, if attached.
+    pub fn emotional_bus_mut(&mut self) -> Option<&mut EmotionalBus> {
+        self.emotional_bus.as_mut()
+    }
+    
+    /// Get a reference to the underlying storage connection.
+    pub fn connection(&self) -> &rusqlite::Connection {
+        self.storage.connection()
     }
     
     /// Set the agent ID for this memory instance.
@@ -100,7 +150,15 @@ impl Memory {
     ) -> Result<String, Box<dyn std::error::Error>> {
         let ns = namespace.unwrap_or("default");
         let id = format!("{}", Uuid::new_v4())[..8].to_string();
-        let importance = importance.unwrap_or_else(|| memory_type.default_importance());
+        let base_importance = importance.unwrap_or_else(|| memory_type.default_importance());
+        
+        // Apply drive alignment boost if Emotional Bus is attached
+        let importance = if let Some(ref bus) = self.emotional_bus {
+            let boost = bus.align_importance(content);
+            (base_importance * boost).min(1.0) // Cap at 1.0
+        } else {
+            base_importance
+        };
 
         let record = MemoryRecord {
             id: id.clone(),
@@ -122,6 +180,44 @@ impl Memory {
         };
 
         self.storage.add(&record, ns)?;
+        Ok(id)
+    }
+    
+    /// Store a new memory with emotional tracking.
+    ///
+    /// This method both stores the memory and records the emotional valence
+    /// in the Emotional Bus for trend tracking. Requires an Emotional Bus
+    /// to be attached.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - The memory content
+    /// * `memory_type` - Memory type classification
+    /// * `importance` - 0-1 importance score (None = auto)
+    /// * `source` - Source identifier
+    /// * `metadata` - Optional metadata
+    /// * `namespace` - Namespace to store in
+    /// * `emotion` - Emotional valence (-1.0 to 1.0)
+    /// * `domain` - Domain for emotional tracking
+    pub fn add_with_emotion(
+        &mut self,
+        content: &str,
+        memory_type: MemoryType,
+        importance: Option<f64>,
+        source: Option<&str>,
+        metadata: Option<serde_json::Value>,
+        namespace: Option<&str>,
+        emotion: f64,
+        domain: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        // Store the memory (with importance boost from alignment)
+        let id = self.add_to_namespace(content, memory_type, importance, source, metadata, namespace)?;
+        
+        // Record emotion if bus is attached
+        if let Some(ref bus) = self.emotional_bus {
+            bus.process_interaction(self.storage.connection(), content, emotion, domain)?;
+        }
+        
         Ok(id)
     }
 

@@ -202,7 +202,7 @@ fn test_subscription_wildcard() {
 
 #[test]
 fn test_unsubscribe() {
-    let mut mem = setup_memory();
+    let mem = setup_memory();
     
     // Subscribe
     mem.subscribe("agent1", "trading", 0.5).unwrap();

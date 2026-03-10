@@ -3,7 +3,7 @@
 **Neuroscience-grounded memory system for AI agents** — pure Rust, zero external dependencies.
 
 [![Crates.io](https://img.shields.io/crates/v/engramai)](https://crates.io/crates/engramai)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 > Give your AI agent a brain that actually remembers, associates, and forgets like a human.
 
@@ -173,7 +173,7 @@ See [examples/ironclaw_integration.rs](examples/ironclaw_integration.rs) for a c
 
 ## License
 
-MIT OR Apache-2.0
+AGPL-3.0-or-later — see [LICENSE](LICENSE). Commercial licensing available, see [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
 
 ## Citation
 

@@ -11,6 +11,7 @@
 //! - **Ebbinghaus Forgetting**: Exponential decay with spaced repetition
 //! - **Hebbian Learning**: Co-activation forms associative links
 //! - **STDP**: Temporal patterns infer causal relationships
+//! - **LLM Extraction**: Optional fact extraction via Anthropic/Ollama before storage
 //!
 //! ## Quick Start
 //!
@@ -39,6 +40,36 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
+//! ## LLM-Based Extraction
+//!
+//! Optionally extract structured facts from raw text before storage:
+//!
+//! ```rust,no_run
+//! use engramai::{Memory, MemoryType, OllamaExtractor, AnthropicExtractor};
+//!
+//! let mut mem = Memory::new("./agent.db", None)?;
+//!
+//! // Use Ollama for local extraction
+//! mem.set_extractor(Box::new(OllamaExtractor::new("llama3.2:3b")));
+//!
+//! // Or use Anthropic Claude (Haiku recommended for cost)
+//! // mem.set_extractor(Box::new(AnthropicExtractor::new("sk-ant-...", false)));
+//!
+//! // Now add() extracts facts via LLM before storing
+//! mem.add(
+//!     "我昨天和小明一起吃了火锅，很好吃。他说下周要去上海出差。",
+//!     MemoryType::Episodic,
+//!     None,
+//!     None,
+//!     None,
+//! )?;
+//! // Stores extracted facts like:
+//! // - "User ate hotpot yesterday with Xiaoming" (episodic, 0.5)
+//! // - "User found the hotpot delicious" (emotional, 0.6)
+//! // - "Xiaoming will travel to Shanghai for business next week" (factual, 0.7)
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
 //! ## Configuration Presets
 //!
 //! ```rust
@@ -57,14 +88,30 @@
 //! let config = MemoryConfig::researcher();
 //! ```
 
+pub mod anomaly;
 pub mod bus;
+pub mod confidence;
 pub mod config;
+pub mod embeddings;
+pub mod extractor;
+pub mod hybrid_search;
 pub mod memory;
 pub mod models;
+pub mod session_wm;
 pub mod storage;
 pub mod types;
 
+// Re-export main types
 pub use bus::{EmotionalBus, SoulUpdate, HeartbeatUpdate, Drive, HeartbeatTask, Identity, EmotionalTrend, ActionStats, SubscriptionManager, Subscription, Notification};
 pub use config::MemoryConfig;
+pub use embeddings::{EmbeddingConfig, EmbeddingProvider, EmbeddingError};
+pub use extractor::{MemoryExtractor, ExtractedFact, AnthropicExtractor, AnthropicExtractorConfig, OllamaExtractor, OllamaExtractorConfig};
 pub use memory::Memory;
+pub use storage::EmbeddingStats;
 pub use types::{AclEntry, CrossLink, HebbianLink, MemoryLayer, MemoryRecord, MemoryStats, MemoryType, Permission, RecallResult, RecallWithAssociationsResult};
+
+// Re-export new modules
+pub use anomaly::{BaselineTracker, Baseline, AnomalyResult};
+pub use confidence::{confidence_score, confidence_label, confidence_detail, content_reliability, retrieval_salience, ConfidenceDetail};
+pub use hybrid_search::{hybrid_search, adaptive_hybrid_search, reciprocal_rank_fusion, HybridSearchResult, HybridSearchOpts};
+pub use session_wm::{SessionWorkingMemory, SessionRegistry, SessionRecallResult};

@@ -2,9 +2,24 @@
 //!
 //! Monitors emotional patterns over time and flags domains that need SOUL updates.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+
+/// Convert a Unix float (seconds since epoch) to `DateTime<Utc>`.
+fn f64_to_datetime(ts: f64) -> DateTime<Utc> {
+    let secs = ts.floor() as i64;
+    let nanos = ((ts - secs as f64) * 1_000_000_000.0).max(0.0) as u32;
+    Utc.timestamp_opt(secs, nanos)
+        .single()
+        .unwrap_or_else(Utc::now)
+}
+
+/// Get the current time as a Unix float (seconds since epoch).
+fn now_f64() -> f64 {
+    let now = Utc::now();
+    now.timestamp() as f64 + now.timestamp_subsec_nanos() as f64 / 1_000_000_000.0
+}
 
 /// Threshold for negative valence to trigger SOUL update suggestion.
 pub const NEGATIVE_THRESHOLD: f64 = -0.5;
@@ -67,7 +82,7 @@ impl<'a> EmotionalAccumulator<'a> {
                 domain TEXT PRIMARY KEY,
                 valence REAL NOT NULL DEFAULT 0.0,
                 count INTEGER NOT NULL DEFAULT 0,
-                last_updated TEXT NOT NULL
+                last_updated REAL NOT NULL
             );
             "#,
         )?;
@@ -81,7 +96,6 @@ impl<'a> EmotionalAccumulator<'a> {
     pub fn record_emotion(&self, domain: &str, valence: f64) -> Result<(), rusqlite::Error> {
         // Clamp valence to valid range
         let valence = valence.max(-1.0).min(1.0);
-        let now = Utc::now().to_rfc3339();
         
         // Try to get existing trend
         let existing: Option<(f64, i32)> = self.conn
@@ -100,14 +114,14 @@ impl<'a> EmotionalAccumulator<'a> {
                 
                 self.conn.execute(
                     "UPDATE emotional_trends SET valence = ?, count = ?, last_updated = ? WHERE domain = ?",
-                    params![new_valence, new_count, now, domain],
+                    params![new_valence, new_count, now_f64(), domain],
                 )?;
             }
             None => {
                 // Insert new trend
                 self.conn.execute(
                     "INSERT INTO emotional_trends (domain, valence, count, last_updated) VALUES (?, ?, 1, ?)",
-                    params![domain, valence, now],
+                    params![domain, valence, now_f64()],
                 )?;
             }
         }
@@ -122,14 +136,12 @@ impl<'a> EmotionalAccumulator<'a> {
                 "SELECT domain, valence, count, last_updated FROM emotional_trends WHERE domain = ?",
                 params![domain],
                 |row| {
-                    let last_updated_str: String = row.get(3)?;
+                    let last_updated_f64: f64 = row.get(3)?;
                     Ok(EmotionalTrend {
                         domain: row.get(0)?,
                         valence: row.get(1)?,
                         count: row.get(2)?,
-                        last_updated: DateTime::parse_from_rfc3339(&last_updated_str)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(|_| Utc::now()),
+                        last_updated: f64_to_datetime(last_updated_f64),
                     })
                 },
             )
@@ -143,14 +155,12 @@ impl<'a> EmotionalAccumulator<'a> {
         )?;
         
         let rows = stmt.query_map([], |row| {
-            let last_updated_str: String = row.get(3)?;
+            let last_updated_f64: f64 = row.get(3)?;
             Ok(EmotionalTrend {
                 domain: row.get(0)?,
                 valence: row.get(1)?,
                 count: row.get(2)?,
-                last_updated: DateTime::parse_from_rfc3339(&last_updated_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
+                last_updated: f64_to_datetime(last_updated_f64),
             })
         })?;
         
@@ -175,10 +185,9 @@ impl<'a> EmotionalAccumulator<'a> {
     /// Decay all trends by a factor (used during consolidation).
     /// This moves trends toward neutral over time.
     pub fn decay_trends(&self, factor: f64) -> Result<usize, rusqlite::Error> {
-        let now = Utc::now().to_rfc3339();
         let affected = self.conn.execute(
             "UPDATE emotional_trends SET valence = valence * ?, last_updated = ?",
-            params![factor, now],
+            params![factor, now_f64()],
         )?;
         Ok(affected)
     }

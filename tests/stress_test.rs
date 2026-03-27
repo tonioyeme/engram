@@ -6,6 +6,9 @@ fn test_bulk_store_and_recall() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("stress.db");
     let mut mem = Memory::new(db_path.to_str().unwrap(), None).unwrap();
+    
+    // Check if embedding is enabled (affects timing)
+    let has_embedding = mem.has_embedding_support();
 
     // Store 500 memories (simulating a busy agent)
     let start = Instant::now();
@@ -19,8 +22,12 @@ fn test_bulk_store_and_recall() {
         ).unwrap();
     }
     let store_time = start.elapsed();
-    println!("Stored 500 memories in {:?}", store_time);
-    assert!(store_time.as_millis() < 5000, "Store too slow: {:?}", store_time);
+    println!("Stored 500 memories in {:?} (embedding: {})", store_time, has_embedding);
+    
+    // With embedding enabled, each memory requires an Ollama API call (~15-20ms each)
+    // so 500 memories can take 8-10 seconds. Without embedding, should be <5s.
+    let max_store_ms = if has_embedding { 30000 } else { 5000 };
+    assert!(store_time.as_millis() < max_store_ms, "Store too slow: {:?}", store_time);
 
     // Recall should be fast even with 500 memories
     let start = Instant::now();

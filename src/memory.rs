@@ -2,14 +2,19 @@
 
 use chrono::Utc;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
 use uuid::Uuid;
 
 use crate::bus::EmotionalBus;
 use crate::config::MemoryConfig;
+use crate::embeddings::{EmbeddingConfig, EmbeddingProvider, EmbeddingError};
+use crate::extractor::MemoryExtractor;
 use crate::models::{effective_strength, retrieval_activation, run_consolidation_cycle};
-use crate::storage::Storage;
+use crate::storage::{Storage, EmbeddingStats};
 use crate::bus::{SubscriptionManager, Subscription, Notification};
 use crate::models::hebbian::{MemoryWithNamespace, record_cross_namespace_coactivation};
+use crate::session_wm::{SessionWorkingMemory, SessionRecallResult};
 use crate::types::{AclEntry, CrossLink, HebbianLink, LayerStats, MemoryLayer, MemoryRecord, MemoryStats, MemoryType, Permission, RecallResult, RecallWithAssociationsResult, TypeStats};
 
 /// Main interface to the Engram memory system.
@@ -24,6 +29,10 @@ pub struct Memory {
     agent_id: Option<String>,
     /// Optional Emotional Bus for drive alignment and emotional tracking
     emotional_bus: Option<EmotionalBus>,
+    /// Embedding provider for semantic similarity (optional - falls back to FTS if unavailable)
+    embedding: Option<EmbeddingProvider>,
+    /// Optional LLM-based memory extractor for converting raw text to structured facts
+    extractor: Option<Box<dyn MemoryExtractor>>,
 }
 
 impl Memory {
@@ -34,18 +43,121 @@ impl Memory {
     /// * `path` - Path to SQLite database file. Created if it doesn't exist.
     ///           Use `:memory:` for in-memory (non-persistent) operation.
     /// * `config` - MemoryConfig with tunable parameters. None = literature defaults.
+    ///
+    /// If Ollama is available, embeddings will be used for semantic search.
+    /// Otherwise, falls back to FTS5 keyword matching.
     pub fn new(path: &str, config: Option<MemoryConfig>) -> Result<Self, Box<dyn std::error::Error>> {
         let storage = Storage::new(path)?;
         let config = config.unwrap_or_default();
         let created_at = Utc::now();
+        
+        // Create embedding provider (optional - check if Ollama is available)
+        let embedding_provider = EmbeddingProvider::new(config.embedding.clone());
+        let embedding = if embedding_provider.is_available() {
+            log::info!("Ollama available at {}, embedding enabled", config.embedding.host);
+            Some(embedding_provider)
+        } else {
+            log::warn!("Ollama not available at {}, falling back to FTS", config.embedding.host);
+            None
+        };
 
-        Ok(Self {
+        let mut mem = Self {
             storage,
             config,
             created_at,
             agent_id: None,
             emotional_bus: None,
-        })
+            embedding,
+            extractor: None,
+        };
+        
+        // Auto-configure extractor from environment/config
+        mem.auto_configure_extractor();
+        
+        Ok(mem)
+    }
+    
+    /// Initialize Engram memory system requiring embeddings.
+    ///
+    /// Returns an error if Ollama is not available. Use this when embedding
+    /// support is required for your use case.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to SQLite database file
+    /// * `config` - MemoryConfig with tunable parameters
+    pub fn new_with_required_embedding(
+        path: &str,
+        config: Option<MemoryConfig>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let storage = Storage::new(path)?;
+        let config = config.unwrap_or_default();
+        let created_at = Utc::now();
+        
+        // Create embedding provider and validate Ollama is available
+        let embedding = EmbeddingProvider::new(config.embedding.clone());
+        if !embedding.is_available() {
+            return Err(Box::new(EmbeddingError::OllamaNotAvailable(
+                config.embedding.host.clone()
+            )));
+        }
+
+        let mut mem = Self {
+            storage,
+            config,
+            created_at,
+            agent_id: None,
+            emotional_bus: None,
+            embedding: Some(embedding),
+            extractor: None,
+        };
+        
+        // Auto-configure extractor from environment/config
+        mem.auto_configure_extractor();
+        
+        Ok(mem)
+    }
+    
+    /// Initialize Engram memory system with custom embedding config.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to SQLite database file
+    /// * `config` - MemoryConfig with tunable parameters
+    /// * `embedding_config` - Custom embedding configuration (overrides config.embedding)
+    pub fn with_embedding(
+        path: &str,
+        config: Option<MemoryConfig>,
+        embedding_config: EmbeddingConfig,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let storage = Storage::new(path)?;
+        let mut config = config.unwrap_or_default();
+        config.embedding = embedding_config;
+        let created_at = Utc::now();
+        
+        // Create embedding provider (optional - check if Ollama is available)
+        let embedding_provider = EmbeddingProvider::new(config.embedding.clone());
+        let embedding = if embedding_provider.is_available() {
+            Some(embedding_provider)
+        } else {
+            log::warn!("Ollama not available at {}, falling back to FTS", config.embedding.host);
+            None
+        };
+
+        let mut mem = Self {
+            storage,
+            config,
+            created_at,
+            agent_id: None,
+            emotional_bus: None,
+            embedding,
+            extractor: None,
+        };
+        
+        // Auto-configure extractor from environment/config
+        mem.auto_configure_extractor();
+        
+        Ok(mem)
     }
     
     /// Create a Memory instance with an Emotional Bus attached.
@@ -70,13 +182,29 @@ impl Memory {
         // Create Emotional Bus using storage's connection
         let emotional_bus = Some(EmotionalBus::new(workspace_dir, storage.connection())?);
         
-        Ok(Self {
+        // Create embedding provider (optional - check if Ollama is available)
+        let embedding_provider = EmbeddingProvider::new(config.embedding.clone());
+        let embedding = if embedding_provider.is_available() {
+            Some(embedding_provider)
+        } else {
+            log::warn!("Ollama not available at {}, falling back to FTS", config.embedding.host);
+            None
+        };
+        
+        let mut mem = Self {
             storage,
             config,
             created_at,
             agent_id: None,
             emotional_bus,
-        })
+            embedding,
+            extractor: None,
+        };
+        
+        // Auto-configure extractor from environment/config
+        mem.auto_configure_extractor();
+        
+        Ok(mem)
     }
     
     /// Get a reference to the Emotional Bus, if attached.
@@ -106,6 +234,156 @@ impl Memory {
     pub fn agent_id(&self) -> Option<&str> {
         self.agent_id.as_deref()
     }
+    
+    /// Set a memory extractor for LLM-based fact extraction.
+    ///
+    /// When an extractor is set, `add()` and `add_to_namespace()` will
+    /// pass the raw content through the LLM to extract structured facts,
+    /// storing each fact as a separate memory. If extraction fails,
+    /// the raw content is stored as a fallback.
+    ///
+    /// # Arguments
+    ///
+    /// * `extractor` - The extractor implementation (e.g., AnthropicExtractor, OllamaExtractor)
+    pub fn set_extractor(&mut self, extractor: Box<dyn MemoryExtractor>) {
+        self.extractor = Some(extractor);
+    }
+    
+    /// Remove the memory extractor (revert to storing raw content).
+    pub fn clear_extractor(&mut self) {
+        self.extractor = None;
+    }
+    
+    /// Check if an extractor is configured.
+    pub fn has_extractor(&self) -> bool {
+        self.extractor.is_some()
+    }
+    
+    /// Auto-configure extractor from environment and config file.
+    ///
+    /// Called during Memory::new() if no extractor is explicitly set.
+    /// This provides "just works" behavior for users who set env vars.
+    ///
+    /// Detection order (high → low priority):
+    /// 1. ANTHROPIC_AUTH_TOKEN env var → AnthropicExtractor with OAuth
+    /// 2. ANTHROPIC_API_KEY env var → AnthropicExtractor with API key
+    /// 3. ~/.config/engram/config.json extractor section
+    /// 4. None → no extraction (backward compatible)
+    ///
+    /// Model can be overridden via ENGRAM_EXTRACTOR_MODEL env var.
+    pub fn auto_configure_extractor(&mut self) {
+        use crate::extractor::{AnthropicExtractor, AnthropicExtractorConfig};
+        
+        // Check ANTHROPIC_AUTH_TOKEN first (OAuth mode)
+        if let Ok(token) = std::env::var("ANTHROPIC_AUTH_TOKEN") {
+            let model = std::env::var("ENGRAM_EXTRACTOR_MODEL")
+                .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+            let config = AnthropicExtractorConfig {
+                model,
+                ..Default::default()
+            };
+            self.extractor = Some(Box::new(AnthropicExtractor::with_config(&token, true, config)));
+            log::info!("Extractor: Anthropic (OAuth) from ANTHROPIC_AUTH_TOKEN");
+            return;
+        }
+        
+        // Check ANTHROPIC_API_KEY (API key mode)
+        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+            let model = std::env::var("ENGRAM_EXTRACTOR_MODEL")
+                .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+            let config = AnthropicExtractorConfig {
+                model,
+                ..Default::default()
+            };
+            self.extractor = Some(Box::new(AnthropicExtractor::with_config(&key, false, config)));
+            log::info!("Extractor: Anthropic (API key) from ANTHROPIC_API_KEY");
+            return;
+        }
+        
+        // Check config file
+        if let Some(extractor) = self.load_extractor_from_config() {
+            self.extractor = Some(extractor);
+            return;
+        }
+        
+        // No extractor configured - that's fine, backward compatible
+        log::debug!("No extractor configured, storing raw text");
+    }
+    
+    /// Load extractor configuration from ~/.config/engram/config.json.
+    ///
+    /// The config file stores non-sensitive settings (provider, model, host).
+    /// Auth tokens MUST come from environment variables or code.
+    ///
+    /// Config format:
+    /// ```json
+    /// {
+    ///   "extractor": {
+    ///     "provider": "anthropic",  // or "ollama"
+    ///     "model": "claude-haiku-4-5-20251001"
+    ///   }
+    /// }
+    /// ```
+    fn load_extractor_from_config(&self) -> Option<Box<dyn MemoryExtractor>> {
+        use crate::extractor::{AnthropicExtractor, AnthropicExtractorConfig, OllamaExtractor};
+        
+        // Get config directory
+        let config_path = dirs::config_dir()?.join("engram/config.json");
+        if !config_path.exists() {
+            return None;
+        }
+        
+        // Read and parse config file
+        let content = std::fs::read_to_string(&config_path).ok()?;
+        let config: serde_json::Value = serde_json::from_str(&content).ok()?;
+        
+        // Get extractor section
+        let extractor_config = config.get("extractor")?;
+        let provider = extractor_config.get("provider")?.as_str()?;
+        
+        match provider {
+            "anthropic" => {
+                // Still need env var for auth - config file NEVER stores tokens
+                let token = std::env::var("ANTHROPIC_AUTH_TOKEN")
+                    .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+                    .ok()?;
+                let is_oauth = std::env::var("ANTHROPIC_AUTH_TOKEN").is_ok();
+                
+                let model = extractor_config
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("claude-haiku-4-5-20251001")
+                    .to_string();
+                
+                let api_config = AnthropicExtractorConfig {
+                    model: model.clone(),
+                    ..Default::default()
+                };
+                
+                log::info!("Extractor: Anthropic ({}) from config file", model);
+                Some(Box::new(AnthropicExtractor::with_config(&token, is_oauth, api_config)))
+            }
+            "ollama" => {
+                let model = extractor_config
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("llama3.2:3b")
+                    .to_string();
+                let host = extractor_config
+                    .get("host")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("http://localhost:11434")
+                    .to_string();
+                
+                log::info!("Extractor: Ollama ({}) from config file", model);
+                Some(Box::new(OllamaExtractor::with_host(&model, &host)))
+            }
+            _ => {
+                log::warn!("Unknown extractor provider in config: {}", provider);
+                None
+            }
+        }
+    }
 
     /// Store a new memory. Returns memory ID.
     ///
@@ -133,15 +411,96 @@ impl Memory {
     
     /// Store a new memory in a specific namespace. Returns memory ID.
     ///
+    /// If an extractor is configured, the content is first passed through
+    /// the LLM to extract structured facts. Each extracted fact is stored
+    /// as a separate memory. If extraction fails or returns nothing,
+    /// the raw content is stored as a fallback.
+    ///
     /// # Arguments
     ///
     /// * `content` - The memory content (natural language)
-    /// * `memory_type` - Memory type classification
-    /// * `importance` - 0-1 importance score (None = auto from type)
+    /// * `memory_type` - Memory type classification (used as fallback if extraction fails)
+    /// * `importance` - 0-1 importance score (None = auto from type, or from extraction)
     /// * `source` - Source identifier (e.g., filename, conversation ID)
     /// * `metadata` - Optional structured metadata (e.g., for causal memories)
     /// * `namespace` - Namespace to store in (None = "default")
     pub fn add_to_namespace(
+        &mut self,
+        content: &str,
+        memory_type: MemoryType,
+        importance: Option<f64>,
+        source: Option<&str>,
+        metadata: Option<serde_json::Value>,
+        namespace: Option<&str>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        // If extractor is configured, try to extract facts first
+        if let Some(ref extractor) = self.extractor {
+            match extractor.extract(content) {
+                Ok(facts) if !facts.is_empty() => {
+                    log::info!("Extracted {} facts from content ({}...)", facts.len(),
+                        content.chars().take(40).collect::<String>());
+                    let mut last_id = String::new();
+                    for fact in &facts {
+                        log::info!("  → [{}] (imp={:.1}) {}", fact.memory_type, fact.importance,
+                            fact.content.chars().take(80).collect::<String>());
+                    }
+                    for fact in facts {
+                        // Convert extracted memory_type string to MemoryType enum
+                        let fact_type = Self::parse_memory_type(&fact.memory_type)
+                            .unwrap_or(memory_type);
+                        
+                        // Use extracted importance, fall back to provided or type default
+                        let fact_importance = Some(fact.importance);
+                        
+                        // Store each extracted fact separately
+                        last_id = self.add_raw(
+                            &fact.content,
+                            fact_type,
+                            fact_importance,
+                            source,
+                            metadata.clone(),
+                            namespace,
+                        )?;
+                    }
+                    return Ok(last_id);
+                }
+                Ok(_) => {
+                    // No facts extracted - nothing worth storing
+                    log::info!("Extractor: nothing worth storing in: {}...", 
+                        content.chars().take(50).collect::<String>());
+                    return Ok(String::new());
+                }
+                Err(e) => {
+                    // Extractor failed - fall back to storing raw text
+                    log::warn!("Extractor failed, storing raw: {}", e);
+                    // Fall through to raw storage below
+                }
+            }
+        }
+        
+        // No extractor or extractor failed - store raw (backward compatible)
+        self.add_raw(content, memory_type, importance, source, metadata, namespace)
+    }
+    
+    /// Parse a memory type string into MemoryType enum.
+    fn parse_memory_type(s: &str) -> Option<MemoryType> {
+        match s.to_lowercase().as_str() {
+            "factual" => Some(MemoryType::Factual),
+            "episodic" => Some(MemoryType::Episodic),
+            "relational" => Some(MemoryType::Relational),
+            "emotional" => Some(MemoryType::Emotional),
+            "procedural" => Some(MemoryType::Procedural),
+            "opinion" => Some(MemoryType::Opinion),
+            "causal" => Some(MemoryType::Causal),
+            _ => None,
+        }
+    }
+    
+    /// Store a memory directly without extraction (internal method).
+    ///
+    /// This is the raw storage path used when no extractor is configured
+    /// or when extractor fails.
+    fn add_raw(
         &mut self,
         content: &str,
         memory_type: MemoryType,
@@ -182,6 +541,25 @@ impl Memory {
         };
 
         self.storage.add(&record, ns)?;
+        
+        // Generate and store embedding if provider is available
+        if let Some(ref embedding_provider) = self.embedding {
+            match embedding_provider.embed(content) {
+                Ok(embedding) => {
+                    self.storage.store_embedding(
+                        &id,
+                        &embedding,
+                        &self.config.embedding.model,
+                        self.config.embedding.dimensions,
+                    )?;
+                }
+                Err(e) => {
+                    // Log warning but don't fail — memory is stored, just not embedded
+                    log::warn!("Failed to generate embedding for memory {}: {}", id, e);
+                }
+            }
+        }
+        
         Ok(id)
     }
     
@@ -251,6 +629,12 @@ impl Memory {
     
     /// Retrieve relevant memories from a specific namespace.
     ///
+    /// Uses hybrid search: FTS + embedding + ACT-R activation.
+    /// FTS catches exact term matches, embedding catches semantic similarity,
+    /// ACT-R boosts frequently/recently accessed memories.
+    ///
+    /// When embedding is not available, uses FTS + ACT-R only.
+    ///
     /// # Arguments
     ///
     /// * `query` - Natural language query
@@ -270,17 +654,164 @@ impl Memory {
         let context = context.unwrap_or_default();
         let min_conf = min_confidence.unwrap_or(0.0);
         let ns = namespace.unwrap_or("default");
+        
+        // If embedding provider is available, use embedding-based recall
+        if let Some(ref embedding_provider) = self.embedding {
+            // Generate embedding for query
+            let query_embedding = match embedding_provider.embed(query) {
+                Ok(emb) => emb,
+                Err(e) => {
+                    log::warn!("Failed to generate query embedding, falling back to FTS: {}", e);
+                    return self.recall_fts(query, limit, &context, min_conf, ns, now);
+                }
+            };
+            
+            // Get all embeddings for namespace
+            let stored_embeddings = self.storage.get_embeddings_in_namespace(Some(ns))?;
+            
+            // If no embedded memories, fall back to FTS
+            if stored_embeddings.is_empty() {
+                log::debug!("No embedded memories in namespace '{}', falling back to FTS", ns);
+                return self.recall_fts(query, limit, &context, min_conf, ns, now);
+            }
+            
+            // Build a map of memory_id -> embedding similarity
+            let mut similarity_map: HashMap<String, f32> = HashMap::new();
+            for (memory_id, stored_emb) in &stored_embeddings {
+                let sim = EmbeddingProvider::cosine_similarity(&query_embedding, stored_emb);
+                similarity_map.insert(memory_id.clone(), sim);
+            }
+            
+            // Also get FTS results for exact term matching
+            let fts_results = self.storage.search_fts_ns(query, limit * 3, Some(ns))
+                .unwrap_or_default();
+            let fts_count = fts_results.len();
+            
+            // Build FTS score map (rank-based normalization)
+            let mut fts_score_map: HashMap<String, f64> = HashMap::new();
+            for (rank, record) in fts_results.iter().enumerate() {
+                let score = 1.0 - (rank as f64 / (fts_count.max(1)) as f64);
+                fts_score_map.insert(record.id.clone(), score);
+            }
+            
+            // Merge candidate IDs from both embedding and FTS
+            let mut all_ids: std::collections::HashSet<String> = similarity_map.keys().cloned().collect();
+            for record in &fts_results {
+                all_ids.insert(record.id.clone());
+            }
+            
+            // Get candidate memories
+            let mut candidates: Vec<MemoryRecord> = Vec::new();
+            for id in &all_ids {
+                if let Some(record) = self.storage.get(id)? {
+                    candidates.push(record);
+                }
+            }
+            
+            // Score each candidate with combined FTS + embedding + ACT-R
+            let fts_weight = 0.15; // 15% FTS for exact matching
+            let emb_adj_weight = self.config.embedding_weight * 0.85; // Scale down embedding
+            let actr_adj_weight = self.config.actr_weight;
+            
+            let mut scored: Vec<_> = candidates
+                .into_iter()
+                .map(|record| {
+                    // Get embedding similarity (already normalized to -1..1, convert to 0..1)
+                    let embedding_sim = similarity_map
+                        .get(&record.id)
+                        .copied()
+                        .unwrap_or(0.0);
+                    let embedding_score = (embedding_sim + 1.0) / 2.0; // Normalize to 0..1
+                    
+                    // Get FTS score (0 if not in FTS results)
+                    let fts_score = fts_score_map.get(&record.id).copied().unwrap_or(0.0);
+                    
+                    // Get ACT-R activation
+                    let activation = retrieval_activation(
+                        &record,
+                        &context,
+                        now,
+                        self.config.actr_decay,
+                        self.config.context_weight,
+                        self.config.importance_weight,
+                        self.config.contradiction_penalty,
+                    );
+                    
+                    // Normalize activation to 0..1 range (rough normalization)
+                    let activation_normalized = ((activation + 10.0) / 20.0).clamp(0.0, 1.0);
+                    
+                    // Combined: FTS + embedding + ACT-R
+                    let combined_score = (fts_weight * fts_score)
+                        + (emb_adj_weight * embedding_score as f64)
+                        + (actr_adj_weight * activation_normalized);
+                    
+                    (record, combined_score, activation)
+                })
+                .collect();
 
-        // Get candidate memories via FTS (namespace-aware)
-        let candidates = self.storage.search_fts_ns(query, limit * 3, Some(ns))?;
+            // Sort by combined score descending
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-        // Score each candidate with ACT-R activation
-        let mut scored: Vec<_> = candidates
+            // Take top-k and compute confidence
+            let results: Vec<_> = scored
+                .into_iter()
+                .take(limit)
+                .map(|(record, combined_score, activation)| {
+                    // Use combined score as confidence
+                    let confidence = combined_score.clamp(0.0, 1.0);
+                    let confidence_label = confidence_label(confidence);
+
+                    RecallResult {
+                        record,
+                        activation,
+                        confidence,
+                        confidence_label,
+                    }
+                })
+                .filter(|r| r.confidence >= min_conf)
+                .collect();
+
+            // Record access for all retrieved memories (ACT-R learning)
+            for result in &results {
+                self.storage.record_access(&result.record.id)?;
+            }
+
+            // Hebbian learning: record co-activation (namespace-aware)
+            if self.config.hebbian_enabled && results.len() >= 2 {
+                let memory_ids: Vec<_> = results.iter().map(|r| r.record.id.clone()).collect();
+                crate::models::record_coactivation_ns(
+                    &mut self.storage,
+                    &memory_ids,
+                    self.config.hebbian_threshold,
+                    ns,
+                )?;
+            }
+
+            Ok(results)
+        } else {
+            // No embedding provider, use FTS fallback
+            self.recall_fts(query, limit, &context, min_conf, ns, now)
+        }
+    }
+    
+    /// FTS-based recall fallback when embeddings are not available.
+    fn recall_fts(
+        &mut self,
+        query: &str,
+        limit: usize,
+        context: &[String],
+        min_conf: f64,
+        ns: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<RecallResult>, Box<dyn std::error::Error>> {
+        let fts_candidates = self.storage.search_fts_ns(query, limit * 3, Some(ns))?;
+        
+        let mut scored: Vec<_> = fts_candidates
             .into_iter()
             .map(|record| {
                 let activation = retrieval_activation(
                     &record,
-                    &context,
+                    context,
                     now,
                     self.config.actr_decay,
                     self.config.context_weight,
@@ -292,10 +823,8 @@ impl Memory {
             .filter(|(_, act)| *act > f64::NEG_INFINITY)
             .collect();
 
-        // Sort by activation descending
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-        // Take top-k and compute confidence
         let results: Vec<_> = scored
             .into_iter()
             .take(limit)
@@ -313,7 +842,6 @@ impl Memory {
             .filter(|r| r.confidence >= min_conf)
             .collect();
 
-        // Record access for all retrieved memories (ACT-R learning)
         for result in &results {
             self.storage.record_access(&result.record.id)?;
         }
@@ -553,6 +1081,433 @@ impl Memory {
         }
         Ok(())
     }
+    
+    // === Update Memory ===
+    
+    /// Update an existing memory's content.
+    ///
+    /// Stores the old content in metadata for audit trail and regenerates
+    /// the embedding if embedding support is enabled.
+    ///
+    /// # Arguments
+    ///
+    /// * `memory_id` - ID of the memory to update
+    /// * `new_content` - New content to replace the existing content
+    /// * `reason` - Reason for the update (stored in metadata)
+    ///
+    /// # Returns
+    ///
+    /// The memory ID on success, or an error if the memory doesn't exist.
+    pub fn update_memory(
+        &mut self,
+        memory_id: &str,
+        new_content: &str,
+        reason: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        // Get existing memory
+        let record = self.storage.get(memory_id)?
+            .ok_or_else(|| format!("Memory {} not found", memory_id))?;
+        
+        // Build updated metadata with audit trail
+        let mut metadata = record.metadata.clone().unwrap_or_else(|| serde_json::json!({}));
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert("previous_content".to_string(), serde_json::json!(record.content));
+            obj.insert("update_reason".to_string(), serde_json::json!(reason));
+            obj.insert("updated_at".to_string(), serde_json::json!(Utc::now().to_rfc3339()));
+        }
+        
+        // Update content in storage
+        self.storage.update_content(memory_id, new_content, Some(metadata))?;
+        
+        // Regenerate embedding if provider is available
+        if let Some(ref embedding_provider) = self.embedding {
+            match embedding_provider.embed(new_content) {
+                Ok(embedding) => {
+                    // Delete old embedding and store new one
+                    self.storage.delete_embedding(memory_id)?;
+                    self.storage.store_embedding(
+                        memory_id,
+                        &embedding,
+                        &self.config.embedding.model,
+                        self.config.embedding.dimensions,
+                    )?;
+                }
+                Err(e) => {
+                    log::warn!("Failed to regenerate embedding for {}: {}", memory_id, e);
+                }
+            }
+        }
+        
+        Ok(memory_id.to_string())
+    }
+    
+    // === Export ===
+    
+    /// Export all memories to a JSON file.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the output JSON file
+    ///
+    /// # Returns
+    ///
+    /// Number of memories exported.
+    pub fn export(&self, path: &str) -> Result<usize, Box<dyn std::error::Error>> {
+        self.export_namespace(path, None)
+    }
+    
+    /// Export memories from a specific namespace to a JSON file.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the output JSON file
+    /// * `namespace` - Namespace to export (None = all)
+    ///
+    /// # Returns
+    ///
+    /// Number of memories exported.
+    pub fn export_namespace(
+        &self,
+        path: &str,
+        namespace: Option<&str>,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let memories = self.storage.all_in_namespace(namespace)?;
+        let count = memories.len();
+        
+        // Serialize to JSON
+        let json = serde_json::to_string_pretty(&memories)?;
+        
+        // Write to file
+        let mut file = File::create(path)?;
+        file.write_all(json.as_bytes())?;
+        
+        log::info!("Exported {} memories to {}", count, path);
+        
+        Ok(count)
+    }
+    
+    // === Recall Causal ===
+    
+    /// Recall associated memories (type=causal, created by STDP during consolidation).
+    ///
+    /// # Arguments
+    ///
+    /// * `cause_query` - Optional query to filter causal memories
+    /// * `limit` - Maximum number of results
+    /// * `min_confidence` - Minimum confidence threshold
+    ///
+    /// # Returns
+    ///
+    /// Matching associated memories sorted by importance.
+    /// Hybrid recall combining FTS + embedding + ACT-R activation.
+    /// 
+    /// Unlike `recall()` which uses embedding+ACT-R only, this also includes
+    /// FTS exact matching. Better for queries with specific names/terms.
+    pub fn hybrid_recall(
+        &mut self,
+        query: &str,
+        limit: usize,
+        namespace: Option<&str>,
+    ) -> Result<Vec<RecallResult>, Box<dyn std::error::Error>> {
+        use crate::hybrid_search::{hybrid_search, HybridSearchOpts};
+        
+        // Generate query embedding if available
+        let query_vector = if let Some(ref embedding) = self.embedding {
+            embedding.embed(query).ok()
+        } else {
+            None
+        };
+        
+        let opts = HybridSearchOpts {
+            limit,
+            namespace: namespace.map(String::from),
+            ..Default::default()
+        };
+        
+        let results = hybrid_search(
+            &self.storage,
+            query_vector.as_deref(),
+            query,
+            opts,
+        )?;
+        
+        // Convert HybridSearchResult to RecallResult
+        let recall_results: Vec<RecallResult> = results.into_iter()
+            .filter_map(|hr| {
+                let record = hr.record?; // Skip if no record
+                let score = hr.score;
+                let label = if score > 0.7 {
+                    "confident".to_string()
+                } else if score > 0.4 {
+                    "likely".to_string()
+                } else {
+                    "uncertain".to_string()
+                };
+                Some(RecallResult {
+                    record,
+                    activation: score,
+                    confidence: score,
+                    confidence_label: label,
+                })
+            })
+            .collect();
+        
+        Ok(recall_results)
+    }
+    
+    /// Uses Hebbian links to find memories that frequently co-occur.
+    /// Note: this finds *associations*, not true causal relationships.
+    /// LLMs can infer causality from the associated context.
+    pub fn recall_associated(
+        &mut self,
+        cause_query: Option<&str>,
+        limit: usize,
+        min_confidence: f64,
+    ) -> Result<Vec<RecallResult>, Box<dyn std::error::Error>> {
+        self.recall_associated_ns(cause_query, limit, min_confidence, None)
+    }
+    
+    /// Recall associated memories from a specific namespace.
+    pub fn recall_associated_ns(
+        &mut self,
+        cause_query: Option<&str>,
+        limit: usize,
+        min_confidence: f64,
+        namespace: Option<&str>,
+    ) -> Result<Vec<RecallResult>, Box<dyn std::error::Error>> {
+        let now = Utc::now();
+        
+        if let Some(query) = cause_query {
+            // Do normal recall but filter to causal type
+            let results = self.recall_from_namespace(
+                query,
+                limit * 2, // Fetch more to filter
+                None,
+                Some(min_confidence),
+                namespace,
+            )?;
+            
+            // Filter to causal type
+            let filtered: Vec<_> = results
+                .into_iter()
+                .filter(|r| r.record.memory_type == MemoryType::Causal)
+                .take(limit)
+                .collect();
+            
+            Ok(filtered)
+        } else {
+            // Get all causal memories sorted by importance
+            let causal_memories = self.storage.search_by_type_ns(
+                MemoryType::Causal,
+                namespace,
+                limit * 2,
+            )?;
+            
+            // Score and filter
+            let mut scored: Vec<_> = causal_memories
+                .into_iter()
+                .map(|record| {
+                    let activation = retrieval_activation(
+                        &record,
+                        &[],
+                        now,
+                        self.config.actr_decay,
+                        self.config.context_weight,
+                        self.config.importance_weight,
+                        self.config.contradiction_penalty,
+                    );
+                    let confidence = self.compute_confidence(&record, activation);
+                    (record, activation, confidence)
+                })
+                .filter(|(_, _, conf)| *conf >= min_confidence)
+                .collect();
+            
+            // Sort by importance then activation
+            scored.sort_by(|a, b| {
+                b.0.importance.partial_cmp(&a.0.importance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            
+            // Take top-k
+            let results: Vec<_> = scored
+                .into_iter()
+                .take(limit)
+                .map(|(record, activation, confidence)| {
+                    RecallResult {
+                        record,
+                        activation,
+                        confidence,
+                        confidence_label: confidence_label(confidence),
+                    }
+                })
+                .collect();
+            
+            Ok(results)
+        }
+    }
+    
+    // === Session Recall ===
+    
+    /// Session-aware recall using working memory to avoid redundant searches.
+    ///
+    /// If the topic is continuous (high overlap with previous recall), returns
+    /// cached working memory items. If topic changed or WM is empty, does full recall.
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - Search query
+    /// * `session_wm` - Mutable reference to session's working memory
+    /// * `limit` - Maximum number of results
+    /// * `context` - Optional context keywords
+    /// * `min_confidence` - Minimum confidence threshold
+    ///
+    /// # Returns
+    ///
+    /// SessionRecallResult with memories and metadata about the recall.
+    pub fn session_recall(
+        &mut self,
+        query: &str,
+        session_wm: &mut SessionWorkingMemory,
+        limit: usize,
+        context: Option<Vec<String>>,
+        min_confidence: Option<f64>,
+    ) -> Result<SessionRecallResult, Box<dyn std::error::Error>> {
+        self.session_recall_ns(query, session_wm, limit, context, min_confidence, None)
+    }
+    
+    /// Session-aware recall from a specific namespace.
+    pub fn session_recall_ns(
+        &mut self,
+        query: &str,
+        session_wm: &mut SessionWorkingMemory,
+        limit: usize,
+        context: Option<Vec<String>>,
+        min_confidence: Option<f64>,
+        namespace: Option<&str>,
+    ) -> Result<SessionRecallResult, Box<dyn std::error::Error>> {
+        const CONTINUITY_THRESHOLD: f64 = 0.6;
+        
+        // Get active IDs from working memory
+        let active_ids = session_wm.get_active_ids();
+        
+        // Check if we need full recall
+        let need_full_recall = if active_ids.is_empty() {
+            true
+        } else {
+            // Do lightweight probe (3 results) to check topic continuity
+            let probe = self.recall_from_namespace(
+                query,
+                3,
+                context.clone(),
+                min_confidence,
+                namespace,
+            )?;
+            
+            let probe_ids: Vec<String> = probe.iter().map(|r| r.record.id.clone()).collect();
+            !session_wm.is_topic_continuous(&probe_ids, CONTINUITY_THRESHOLD)
+        };
+        
+        if need_full_recall {
+            // Topic changed or WM empty → full recall
+            let results = self.recall_from_namespace(
+                query,
+                limit,
+                context,
+                min_confidence,
+                namespace,
+            )?;
+            
+            // Update working memory
+            let result_ids: Vec<String> = results.iter().map(|r| r.record.id.clone()).collect();
+            session_wm.activate(&result_ids);
+            session_wm.set_query(query);
+            
+            Ok(SessionRecallResult {
+                results,
+                full_recall: true,
+                wm_size: session_wm.len(),
+                continuity_ratio: 0.0,
+            })
+        } else {
+            // Topic continuous → return cached WM items
+            let mut cached_results = Vec::new();
+            let now = Utc::now();
+            
+            for id in &active_ids {
+                if let Some(record) = self.storage.get(id)? {
+                    let activation = retrieval_activation(
+                        &record,
+                        &context.clone().unwrap_or_default(),
+                        now,
+                        self.config.actr_decay,
+                        self.config.context_weight,
+                        self.config.importance_weight,
+                        self.config.contradiction_penalty,
+                    );
+                    let confidence = self.compute_confidence(&record, activation);
+                    
+                    if min_confidence.map(|mc| confidence >= mc).unwrap_or(true) {
+                        cached_results.push(RecallResult {
+                            record,
+                            activation,
+                            confidence,
+                            confidence_label: confidence_label(confidence),
+                        });
+                    }
+                }
+            }
+            
+            // Sort by activation
+            cached_results.sort_by(|a, b| {
+                b.activation.partial_cmp(&a.activation).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            cached_results.truncate(limit);
+            
+            // Calculate continuity ratio
+            let probe = self.recall_from_namespace(query, 3, None, None, namespace)?;
+            let probe_ids: Vec<String> = probe.iter().map(|r| r.record.id.clone()).collect();
+            let (_, ratio) = session_wm.overlap(&probe_ids);
+            
+            // Refresh activation timestamps
+            let result_ids: Vec<String> = cached_results.iter().map(|r| r.record.id.clone()).collect();
+            session_wm.activate(&result_ids);
+            session_wm.set_query(query);
+            
+            Ok(SessionRecallResult {
+                results: cached_results,
+                full_recall: false,
+                wm_size: session_wm.len(),
+                continuity_ratio: ratio,
+            })
+        }
+    }
+    
+    /// Get a memory by ID.
+    pub fn get(&self, memory_id: &str) -> Result<Option<MemoryRecord>, Box<dyn std::error::Error>> {
+        Ok(self.storage.get(memory_id)?)
+    }
+    
+    /// List all memories (with optional limit).
+    pub fn list(&self, limit: Option<usize>) -> Result<Vec<MemoryRecord>, Box<dyn std::error::Error>> {
+        let all = self.storage.all()?;
+        match limit {
+            Some(l) => Ok(all.into_iter().take(l).collect()),
+            None => Ok(all),
+        }
+    }
+    
+    /// List all memories in a namespace.
+    pub fn list_ns(
+        &self,
+        namespace: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<MemoryRecord>, Box<dyn std::error::Error>> {
+        let all = self.storage.all_in_namespace(namespace)?;
+        match limit {
+            Some(l) => Ok(all.into_iter().take(l).collect()),
+            None => Ok(all),
+        }
+    }
 
     /// Get Hebbian links for a specific memory.
     pub fn hebbian_links(&self, memory_id: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -566,6 +1521,122 @@ impl Memory {
         namespace: Option<&str>,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         Ok(self.storage.get_hebbian_neighbors_ns(memory_id, namespace)?)
+    }
+    
+    // === Embedding Methods ===
+    
+    /// Get embedding statistics.
+    pub fn embedding_stats(&self) -> Result<EmbeddingStats, Box<dyn std::error::Error>> {
+        Ok(self.storage.embedding_stats()?)
+    }
+    
+    /// Get the embedding configuration.
+    pub fn embedding_config(&self) -> &EmbeddingConfig {
+        &self.config.embedding
+    }
+    
+    /// Check if the embedding provider is available.
+    pub fn is_embedding_available(&self) -> bool {
+        self.embedding.as_ref().map(|e| e.is_available()).unwrap_or(false)
+    }
+    
+    /// Check if embedding support is enabled (provider was created).
+    pub fn has_embedding_support(&self) -> bool {
+        self.embedding.is_some()
+    }
+    
+    /// Reindex embeddings for all memories without embeddings.
+    ///
+    /// Useful after migration or model change. Iterates all memories
+    /// that don't have embeddings and generates them.
+    ///
+    /// Returns the number of memories reindexed.
+    /// Returns an error if embedding provider is not available.
+    pub fn reindex_embeddings(&mut self) -> Result<usize, Box<dyn std::error::Error>> {
+        let embedding_provider = self.embedding.as_ref().ok_or_else(|| {
+            Box::new(EmbeddingError::OllamaNotAvailable(self.config.embedding.host.clone()))
+                as Box<dyn std::error::Error>
+        })?;
+        
+        let missing_ids = self.storage.get_memories_without_embeddings()?;
+        let total = missing_ids.len();
+        
+        if total == 0 {
+            return Ok(0);
+        }
+        
+        log::info!("Reindexing {} memories without embeddings", total);
+        
+        let mut reindexed = 0;
+        for id in missing_ids {
+            if let Some(record) = self.storage.get(&id)? {
+                match embedding_provider.embed(&record.content) {
+                    Ok(embedding) => {
+                        self.storage.store_embedding(
+                            &id,
+                            &embedding,
+                            &self.config.embedding.model,
+                            self.config.embedding.dimensions,
+                        )?;
+                        reindexed += 1;
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to generate embedding for {}: {}", id, e);
+                    }
+                }
+            }
+        }
+        
+        log::info!("Reindexed {}/{} memories", reindexed, total);
+        Ok(reindexed)
+    }
+    
+    /// Reindex embeddings with progress callback.
+    ///
+    /// The callback receives (current, total) progress updates.
+    /// Returns an error if embedding provider is not available.
+    pub fn reindex_embeddings_with_progress<F>(
+        &mut self,
+        mut progress: F,
+    ) -> Result<usize, Box<dyn std::error::Error>>
+    where
+        F: FnMut(usize, usize),
+    {
+        let embedding_provider = self.embedding.as_ref().ok_or_else(|| {
+            Box::new(EmbeddingError::OllamaNotAvailable(self.config.embedding.host.clone()))
+                as Box<dyn std::error::Error>
+        })?;
+        
+        let missing_ids = self.storage.get_memories_without_embeddings()?;
+        let total = missing_ids.len();
+        
+        if total == 0 {
+            return Ok(0);
+        }
+        
+        let mut reindexed = 0;
+        for (i, id) in missing_ids.into_iter().enumerate() {
+            progress(i + 1, total);
+            
+            if let Some(record) = self.storage.get(&id)? {
+                match embedding_provider.embed(&record.content) {
+                    Ok(embedding) => {
+                        self.storage.store_embedding(
+                            &id,
+                            &embedding,
+                            &self.config.embedding.model,
+                            self.config.embedding.dimensions,
+                        )?;
+                        reindexed += 1;
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to generate embedding for {}: {}", id, e);
+                    }
+                }
+            }
+        }
+        
+        Ok(reindexed)
     }
     
     // === ACL Methods ===

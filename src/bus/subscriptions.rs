@@ -7,9 +7,28 @@
 //! Example: CEO subscribes to all namespaces with min_importance=0.8
 //! → Gets notified of high-importance events from any service agent.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
+
+/// Convert a `DateTime<Utc>` to a Unix float (seconds since epoch).
+fn datetime_to_f64(dt: &DateTime<Utc>) -> f64 {
+    dt.timestamp() as f64 + dt.timestamp_subsec_nanos() as f64 / 1_000_000_000.0
+}
+
+/// Convert a Unix float (seconds since epoch) to `DateTime<Utc>`.
+fn f64_to_datetime(ts: f64) -> DateTime<Utc> {
+    let secs = ts.floor() as i64;
+    let nanos = ((ts - secs as f64) * 1_000_000_000.0).max(0.0) as u32;
+    Utc.timestamp_opt(secs, nanos)
+        .single()
+        .unwrap_or_else(Utc::now)
+}
+
+/// Get the current time as a Unix float (seconds since epoch).
+fn now_f64() -> f64 {
+    datetime_to_f64(&Utc::now())
+}
 
 /// A notification about a new memory that exceeded a subscription threshold.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,13 +82,13 @@ impl<'a> SubscriptionManager<'a> {
                 subscriber_id TEXT NOT NULL,
                 namespace TEXT NOT NULL,
                 min_importance REAL NOT NULL,
-                created_at TEXT NOT NULL,
+                created_at REAL NOT NULL,
                 PRIMARY KEY (subscriber_id, namespace)
             );
             
             CREATE TABLE IF NOT EXISTS notification_cursor (
                 agent_id TEXT PRIMARY KEY,
-                last_checked TEXT NOT NULL
+                last_checked REAL NOT NULL
             );
             
             CREATE INDEX IF NOT EXISTS idx_subscriptions_ns ON subscriptions(namespace);
@@ -102,7 +121,7 @@ impl<'a> SubscriptionManager<'a> {
                 agent_id,
                 namespace,
                 clamped,
-                Utc::now().to_rfc3339(),
+                now_f64(),
             ],
         )?;
         
@@ -133,14 +152,12 @@ impl<'a> SubscriptionManager<'a> {
         )?;
         
         let rows = stmt.query_map(params![agent_id], |row| {
-            let created_at_str: String = row.get(3)?;
+            let created_at_f64: f64 = row.get(3)?;
             Ok(Subscription {
                 subscriber_id: row.get(0)?,
                 namespace: row.get(1)?,
                 min_importance: row.get(2)?,
-                created_at: DateTime::parse_from_rfc3339(&created_at_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
+                created_at: f64_to_datetime(created_at_f64),
             })
         })?;
         
@@ -164,16 +181,14 @@ impl<'a> SubscriptionManager<'a> {
                      WHERE created_at > ? AND importance >= ?"
                 )?;
                 
-                let rows = stmt.query_map(params![since_dt.to_rfc3339(), sub.min_importance], |row| {
-                    let created_at_str: String = row.get(4)?;
+                let rows = stmt.query_map(params![datetime_to_f64(since_dt), sub.min_importance], |row| {
+                    let created_at_f64: f64 = row.get(4)?;
                     Ok(Notification {
                         memory_id: row.get(0)?,
                         namespace: row.get(1)?,
                         content: row.get(2)?,
                         importance: row.get(3)?,
-                        created_at: DateTime::parse_from_rfc3339(&created_at_str)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(|_| Utc::now()),
+                        created_at: f64_to_datetime(created_at_f64),
                         subscription_namespace: sub.namespace.clone(),
                         threshold: sub.min_importance,
                     })
@@ -191,15 +206,13 @@ impl<'a> SubscriptionManager<'a> {
                 )?;
                 
                 let rows = stmt.query_map(params![sub.min_importance], |row| {
-                    let created_at_str: String = row.get(4)?;
+                    let created_at_f64: f64 = row.get(4)?;
                     Ok(Notification {
                         memory_id: row.get(0)?,
                         namespace: row.get(1)?,
                         content: row.get(2)?,
                         importance: row.get(3)?,
-                        created_at: DateTime::parse_from_rfc3339(&created_at_str)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(|_| Utc::now()),
+                        created_at: f64_to_datetime(created_at_f64),
                         subscription_namespace: sub.namespace.clone(),
                         threshold: sub.min_importance,
                     })
@@ -220,17 +233,15 @@ impl<'a> SubscriptionManager<'a> {
                 )?;
                 
                 let rows = stmt.query_map(
-                    params![since_dt.to_rfc3339(), sub.min_importance, &sub.namespace],
+                    params![datetime_to_f64(since_dt), sub.min_importance, &sub.namespace],
                     |row| {
-                        let created_at_str: String = row.get(4)?;
+                        let created_at_f64: f64 = row.get(4)?;
                         Ok(Notification {
                             memory_id: row.get(0)?,
                             namespace: row.get(1)?,
                             content: row.get(2)?,
                             importance: row.get(3)?,
-                            created_at: DateTime::parse_from_rfc3339(&created_at_str)
-                                .map(|dt| dt.with_timezone(&Utc))
-                                .unwrap_or_else(|_| Utc::now()),
+                            created_at: f64_to_datetime(created_at_f64),
                             subscription_namespace: sub.namespace.clone(),
                             threshold: sub.min_importance,
                         })
@@ -251,15 +262,13 @@ impl<'a> SubscriptionManager<'a> {
                 let rows = stmt.query_map(
                     params![sub.min_importance, &sub.namespace],
                     |row| {
-                        let created_at_str: String = row.get(4)?;
+                        let created_at_f64: f64 = row.get(4)?;
                         Ok(Notification {
                             memory_id: row.get(0)?,
                             namespace: row.get(1)?,
                             content: row.get(2)?,
                             importance: row.get(3)?,
-                            created_at: DateTime::parse_from_rfc3339(&created_at_str)
-                                .map(|dt| dt.with_timezone(&Utc))
-                                .unwrap_or_else(|_| Utc::now()),
+                            created_at: f64_to_datetime(created_at_f64),
                             subscription_namespace: sub.namespace.clone(),
                             threshold: sub.min_importance,
                         })
@@ -286,7 +295,7 @@ impl<'a> SubscriptionManager<'a> {
         agent_id: &str,
     ) -> Result<Vec<Notification>, Box<dyn std::error::Error>> {
         // Get last checked timestamp
-        let last_checked: Option<String> = self.conn
+        let last_checked: Option<f64> = self.conn
             .query_row(
                 "SELECT last_checked FROM notification_cursor WHERE agent_id = ?",
                 params![agent_id],
@@ -294,9 +303,7 @@ impl<'a> SubscriptionManager<'a> {
             )
             .ok();
         
-        let last_checked_dt = last_checked
-            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|dt| dt.with_timezone(&Utc));
+        let last_checked_dt = last_checked.map(f64_to_datetime);
         
         // Get agent's subscriptions
         let subscriptions = self.list_subscriptions(agent_id)?;
@@ -306,7 +313,6 @@ impl<'a> SubscriptionManager<'a> {
         }
         
         let mut notifications = Vec::new();
-        let now = Utc::now();
         
         for sub in &subscriptions {
             let sub_notifs = self.query_notifications_for_sub(sub, last_checked_dt.as_ref())?;
@@ -316,7 +322,7 @@ impl<'a> SubscriptionManager<'a> {
         // Update cursor
         self.conn.execute(
             "INSERT OR REPLACE INTO notification_cursor (agent_id, last_checked) VALUES (?, ?)",
-            params![agent_id, now.to_rfc3339()],
+            params![agent_id, now_f64()],
         )?;
         
         // Deduplicate by memory_id (in case multiple subscriptions match same memory)
@@ -335,7 +341,7 @@ impl<'a> SubscriptionManager<'a> {
         agent_id: &str,
     ) -> Result<Vec<Notification>, Box<dyn std::error::Error>> {
         // Get last checked timestamp
-        let last_checked: Option<String> = self.conn
+        let last_checked: Option<f64> = self.conn
             .query_row(
                 "SELECT last_checked FROM notification_cursor WHERE agent_id = ?",
                 params![agent_id],
@@ -343,9 +349,7 @@ impl<'a> SubscriptionManager<'a> {
             )
             .ok();
         
-        let last_checked_dt = last_checked
-            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|dt| dt.with_timezone(&Utc));
+        let last_checked_dt = last_checked.map(f64_to_datetime);
         
         let subscriptions = self.list_subscriptions(agent_id)?;
         
@@ -392,13 +396,13 @@ mod tests {
                 content TEXT NOT NULL,
                 memory_type TEXT NOT NULL,
                 layer TEXT NOT NULL,
-                created_at TEXT NOT NULL,
+                created_at REAL NOT NULL,
                 working_strength REAL NOT NULL DEFAULT 1.0,
                 core_strength REAL NOT NULL DEFAULT 0.0,
                 importance REAL NOT NULL DEFAULT 0.3,
                 pinned INTEGER NOT NULL DEFAULT 0,
                 consolidation_count INTEGER NOT NULL DEFAULT 0,
-                last_consolidated TEXT,
+                last_consolidated REAL,
                 source TEXT DEFAULT '',
                 contradicts TEXT DEFAULT '',
                 contradicted_by TEXT DEFAULT '',
@@ -455,7 +459,7 @@ mod tests {
         // Add a high-importance memory
         conn.execute(
             "INSERT INTO memories (id, content, memory_type, layer, created_at, importance, namespace)
-             VALUES ('m1', 'Oil price spike', 'factual', 'working', datetime('now'), 0.9, 'trading')",
+             VALUES ('m1', 'Oil price spike', 'factual', 'working', strftime('%s','now'), 0.9, 'trading')",
             [],
         ).unwrap();
         
@@ -480,7 +484,7 @@ mod tests {
         // Add low-importance memory
         conn.execute(
             "INSERT INTO memories (id, content, memory_type, layer, created_at, importance, namespace)
-             VALUES ('m1', 'Minor update', 'factual', 'working', datetime('now'), 0.3, 'trading')",
+             VALUES ('m1', 'Minor update', 'factual', 'working', strftime('%s','now'), 0.3, 'trading')",
             [],
         ).unwrap();
         
@@ -500,13 +504,13 @@ mod tests {
         // Add memories to different namespaces
         conn.execute(
             "INSERT INTO memories (id, content, memory_type, layer, created_at, importance, namespace)
-             VALUES ('m1', 'Trading alert', 'factual', 'working', datetime('now'), 0.9, 'trading')",
+             VALUES ('m1', 'Trading alert', 'factual', 'working', strftime('%s','now'), 0.9, 'trading')",
             [],
         ).unwrap();
         
         conn.execute(
             "INSERT INTO memories (id, content, memory_type, layer, created_at, importance, namespace)
-             VALUES ('m2', 'Engine alert', 'factual', 'working', datetime('now'), 0.85, 'engine')",
+             VALUES ('m2', 'Engine alert', 'factual', 'working', strftime('%s','now'), 0.85, 'engine')",
             [],
         ).unwrap();
         
@@ -523,7 +527,7 @@ mod tests {
         
         conn.execute(
             "INSERT INTO memories (id, content, memory_type, layer, created_at, importance, namespace)
-             VALUES ('m1', 'Test', 'factual', 'working', datetime('now'), 0.9, 'trading')",
+             VALUES ('m1', 'Test', 'factual', 'working', strftime('%s','now'), 0.9, 'trading')",
             [],
         ).unwrap();
         

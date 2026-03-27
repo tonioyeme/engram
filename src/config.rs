@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::embeddings::EmbeddingConfig;
+
 /// All tunable parameters for the Engram memory system.
 ///
 /// Default values come from neuroscience literature (ACT-R, Memory Chain Model,
@@ -68,6 +70,14 @@ pub struct MemoryConfig {
     pub stdp_causal_threshold: f64,
     /// Minimum observations before STDP inference
     pub stdp_min_observations: i32,
+    
+    // === Embedding ===
+    /// Embedding provider configuration
+    pub embedding: EmbeddingConfig,
+    /// Weight for embedding similarity in recall scoring (0.0-1.0)
+    pub embedding_weight: f64,
+    /// Weight for ACT-R activation in recall scoring (0.0-1.0)
+    pub actr_weight: f64,
 }
 
 impl Default for MemoryConfig {
@@ -98,6 +108,9 @@ impl Default for MemoryConfig {
             stdp_enabled: true,
             stdp_causal_threshold: 2.0,
             stdp_min_observations: 3,
+            embedding: EmbeddingConfig::default(),
+            embedding_weight: 0.7,
+            actr_weight: 0.3,
         }
     }
 }

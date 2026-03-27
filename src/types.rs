@@ -214,7 +214,7 @@ impl MemoryRecord {
 }
 
 /// Search result with activation score and confidence.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallResult {
     pub record: MemoryRecord,
     pub activation: f64,

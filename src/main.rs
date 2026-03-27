@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use engramai::{Memory, MemoryConfig, MemoryType, Permission, EmotionalBus};
+use engramai::{Memory, MemoryConfig, MemoryType, Permission, EmotionalBus, EmbeddingConfig, AnthropicExtractor, OllamaExtractor};
 
 /// Engram — Neuroscience-grounded memory system for AI agents.
 #[derive(Parser)]
@@ -33,12 +33,27 @@ struct Cli {
     #[arg(short, long, env = "ENGRAM_WORKSPACE")]
     workspace: Option<PathBuf>,
     
+    /// Ollama embedding model (default: nomic-embed-text)
+    #[arg(long, env = "ENGRAM_EMBEDDING_MODEL")]
+    embedding_model: Option<String>,
+    
+    /// Ollama host URL (default: http://localhost:11434)
+    #[arg(long, env = "ENGRAM_EMBEDDING_HOST")]
+    embedding_host: Option<String>,
+    
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize config file (~/.config/engram/config.json)
+    Init {
+        /// Force overwrite existing config
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
+    
     /// Store a new memory
     Store {
         /// Memory content
@@ -67,6 +82,22 @@ enum Commands {
         /// Domain for emotional tracking
         #[arg(long)]
         domain: Option<String>,
+        
+        /// Use LLM extractor to extract facts (ollama, anthropic)
+        #[arg(long, env = "ENGRAM_EXTRACTOR")]
+        extractor: Option<ExtractorArg>,
+        
+        /// Ollama model for extraction (default: llama3.2:3b)
+        #[arg(long, env = "ENGRAM_EXTRACTOR_MODEL")]
+        extractor_model: Option<String>,
+        
+        /// Anthropic auth token (API key or OAuth token)
+        #[arg(long, env = "ANTHROPIC_API_KEY")]
+        auth_token: Option<String>,
+        
+        /// Use OAuth mode for Anthropic (Claude Max)
+        #[arg(long)]
+        oauth: bool,
     },
     
     /// Recall memories by query
@@ -165,6 +196,76 @@ enum Commands {
         memory_id: String,
     },
     
+    /// Update an existing memory's content
+    Update {
+        /// Memory ID to update
+        memory_id: String,
+        
+        /// New content
+        new_content: String,
+        
+        /// Reason for update (stored in metadata)
+        #[arg(long, short = 'r', default_value = "manual update")]
+        reason: String,
+    },
+    
+    /// Export memories to JSON file
+    Export {
+        /// Output file path
+        path: String,
+        
+        /// Namespace to export (omit for all)
+        #[arg(long, short = 'n')]
+        ns: Option<String>,
+    },
+    
+    /// Recall associated memories
+    RecallAssociated {
+        /// Optional query to filter associated memories
+        query: Option<String>,
+        
+        /// Maximum number of results
+        #[arg(long, short = 'l', default_value = "5")]
+        limit: usize,
+        
+        /// Minimum confidence threshold
+        #[arg(long, short = 'c', default_value = "0.0")]
+        min_confidence: f64,
+        
+        /// Namespace to search
+        #[arg(long, short = 'n')]
+        ns: Option<String>,
+        
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+    
+    /// Get a specific memory by ID
+    Get {
+        /// Memory ID
+        memory_id: String,
+        
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+    
+    /// List all memories
+    List {
+        /// Maximum number of results
+        #[arg(long, short = 'l', default_value = "20")]
+        limit: usize,
+        
+        /// Namespace to list
+        #[arg(long, short = 'n')]
+        ns: Option<String>,
+        
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+    
     /// Apply reward signal to recent memories
     Reward {
         /// Feedback text (positive/negative sentiment detected)
@@ -259,6 +360,22 @@ enum Commands {
         /// Agent ID to list subscriptions for
         agent_id: String,
         
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+    
+    // === Embedding Commands ===
+    
+    /// Reindex embeddings for all memories without embeddings
+    Reindex {
+        /// Show progress during reindexing
+        #[arg(long, short = 'p')]
+        progress: bool,
+    },
+    
+    /// Show embedding status
+    EmbeddingStatus {
         /// Output as JSON
         #[arg(long, short = 'j')]
         json: bool,
@@ -365,17 +482,42 @@ impl From<PermissionArg> for Permission {
     }
 }
 
+/// LLM extractor backend for memory extraction.
+#[derive(Clone, ValueEnum)]
+enum ExtractorArg {
+    /// Use local Ollama for extraction (default model: llama3.2:3b)
+    Ollama,
+    /// Use Anthropic Claude API for extraction (default model: claude-haiku-4-5-20251001)
+    Anthropic,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logger
+    env_logger::init();
+    
     let cli = Cli::parse();
     
     let db_path = cli.database.to_str().ok_or("invalid database path")?;
     
+    // Build embedding config from CLI args
+    let mut embedding_config = EmbeddingConfig::default();
+    if let Some(ref model) = cli.embedding_model {
+        embedding_config.model = model.clone();
+    }
+    if let Some(ref host) = cli.embedding_host {
+        embedding_config.host = host.clone();
+    }
+    
+    // Build memory config with embedding settings
+    let mut mem_config = MemoryConfig::default();
+    mem_config.embedding = embedding_config;
+    
     // Create Memory with or without Emotional Bus
     let mut mem = if let Some(ref workspace) = cli.workspace {
         let ws_path = workspace.to_str().ok_or("invalid workspace path")?;
-        Memory::with_emotional_bus(db_path, ws_path, Some(MemoryConfig::default()))?
+        Memory::with_emotional_bus(db_path, ws_path, Some(mem_config))?
     } else {
-        Memory::new(db_path, Some(MemoryConfig::default()))?
+        Memory::new(db_path, Some(mem_config))?
     };
     
     if let Some(agent_id) = &cli.agent_id {
@@ -383,7 +525,129 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     match cli.command {
-        Commands::Store { content, ns, r#type, importance, source, emotion, domain } => {
+        Commands::Init { force } => {
+            // Create config directory
+            let config_dir = dirs::config_dir()
+                .ok_or("Could not determine config directory")?
+                .join("engram");
+            
+            std::fs::create_dir_all(&config_dir)?;
+            
+            let config_path = config_dir.join("config.json");
+            
+            // Check if config already exists
+            if config_path.exists() && !force {
+                eprintln!("Config file already exists at: {}", config_path.display());
+                eprintln!("Use --force to overwrite.");
+                std::process::exit(1);
+            }
+            
+            // Interactive prompts
+            use std::io::{self, Write};
+            
+            fn prompt(question: &str, default: &str) -> String {
+                print!("{} [{}]: ", question, default);
+                io::stdout().flush().unwrap();
+                let mut input = String::new();
+                io::stdin().read_line(&mut input).unwrap();
+                let trimmed = input.trim();
+                if trimmed.is_empty() {
+                    default.to_string()
+                } else {
+                    trimmed.to_string()
+                }
+            }
+            
+            println!("Engram Configuration Setup");
+            println!("==========================\n");
+            
+            // Embedding provider
+            let embedding_provider = prompt("Embedding provider (ollama/none)", "ollama");
+            
+            // Extractor provider
+            let extractor_provider = prompt("Extractor provider (anthropic/ollama/none)", "anthropic");
+            
+            // Build config JSON
+            let mut config = serde_json::json!({});
+            
+            if embedding_provider != "none" {
+                let embedding_model = if embedding_provider == "ollama" {
+                    prompt("Embedding model", "nomic-embed-text")
+                } else {
+                    "nomic-embed-text".to_string()
+                };
+                let embedding_host = if embedding_provider == "ollama" {
+                    prompt("Ollama host", "http://localhost:11434")
+                } else {
+                    "http://localhost:11434".to_string()
+                };
+                
+                config["embedding"] = serde_json::json!({
+                    "provider": embedding_provider,
+                    "model": embedding_model,
+                    "host": embedding_host
+                });
+            }
+            
+            if extractor_provider != "none" {
+                let extractor_model = match extractor_provider.as_str() {
+                    "anthropic" => prompt("Extractor model", "claude-haiku-4-5-20251001"),
+                    "ollama" => prompt("Extractor model", "llama3.2:3b"),
+                    _ => "claude-haiku-4-5-20251001".to_string()
+                };
+                
+                let mut extractor_config = serde_json::json!({
+                    "provider": extractor_provider,
+                    "model": extractor_model
+                });
+                
+                if extractor_provider == "ollama" {
+                    let ollama_host = prompt("Ollama host for extraction", "http://localhost:11434");
+                    extractor_config["host"] = serde_json::json!(ollama_host);
+                }
+                
+                config["extractor"] = extractor_config;
+            }
+            
+            // Write config file
+            let config_str = serde_json::to_string_pretty(&config)?;
+            std::fs::write(&config_path, &config_str)?;
+            
+            println!("\n✅ Config written to: {}", config_path.display());
+            println!("\nConfig contents:");
+            println!("{}", config_str);
+            
+            // Remind about auth
+            if extractor_provider == "anthropic" {
+                println!("\n⚠️  Remember to set your Anthropic auth token:");
+                println!("   export ANTHROPIC_API_KEY=sk-ant-...");
+                println!("   # or for Claude Max:");
+                println!("   export ANTHROPIC_AUTH_TOKEN=sk-ant-oat01-...");
+            }
+            
+            return Ok(());
+        }
+        
+        Commands::Store { content, ns, r#type, importance, source, emotion, domain, extractor, extractor_model, auth_token, oauth } => {
+            // Set up extractor if requested
+            if let Some(ext) = extractor {
+                match ext {
+                    ExtractorArg::Ollama => {
+                        let model = extractor_model.as_deref().unwrap_or("llama3.2:3b");
+                        let host = cli.embedding_host.as_deref().unwrap_or("http://localhost:11434");
+                        let ollama_extractor = OllamaExtractor::with_host(model, host);
+                        mem.set_extractor(Box::new(ollama_extractor));
+                        log::info!("Using Ollama extractor with model: {}", model);
+                    }
+                    ExtractorArg::Anthropic => {
+                        let token = auth_token.ok_or("Anthropic extractor requires --auth-token or ANTHROPIC_API_KEY")?;
+                        let anthropic_extractor = AnthropicExtractor::new(&token, oauth);
+                        mem.set_extractor(Box::new(anthropic_extractor));
+                        log::info!("Using Anthropic extractor (oauth: {})", oauth);
+                    }
+                }
+            }
+            
             // If emotion is provided, use add_with_emotion
             let id = if let (Some(em), Some(dom)) = (emotion, domain.as_ref()) {
                 mem.add_with_emotion(
@@ -406,7 +670,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(&ns),
                 )?
             };
-            println!("{}", id);
+            
+            // Handle empty ID (extractor found nothing worth storing)
+            if id.is_empty() {
+                println!("(no facts extracted)");
+            } else {
+                println!("{}", id);
+            }
         }
         
         Commands::Recall { query, ns, limit, min_confidence, json } => {
@@ -507,6 +777,99 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Reward { feedback, recent } => {
             mem.reward(&feedback, recent)?;
             println!("Applied reward signal to {} recent memories", recent);
+        }
+        
+        Commands::Update { memory_id, new_content, reason } => {
+            mem.update_memory(&memory_id, &new_content, &reason)?;
+            println!("Updated memory {}", memory_id);
+        }
+        
+        Commands::Export { path, ns } => {
+            let count = mem.export_namespace(&path, ns.as_deref())?;
+            println!("Exported {} memories to {}", count, path);
+        }
+        
+        Commands::RecallAssociated { query, limit, min_confidence, ns, json } => {
+            let results = mem.recall_associated_ns(
+                query.as_deref(),
+                limit,
+                min_confidence,
+                ns.as_deref(),
+            )?;
+            
+            if json {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                if results.is_empty() {
+                    println!("No associated memories found.");
+                } else {
+                    println!("Associated memories ({}):", results.len());
+                    for r in &results {
+                        println!("[{}] ({:.2}) {}", r.record.id, r.confidence, r.record.content);
+                        if let Some(ref meta) = r.record.metadata {
+                            if let Some(cause) = meta.get("cause_id") {
+                                println!("    cause: {}", cause);
+                            }
+                            if let Some(effect) = meta.get("effect_id") {
+                                println!("    effect: {}", effect);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Commands::Get { memory_id, json } => {
+            match mem.get(&memory_id)? {
+                Some(record) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&record)?);
+                    } else {
+                        println!("ID: {}", record.id);
+                        println!("Content: {}", record.content);
+                        println!("Type: {}", record.memory_type);
+                        println!("Layer: {}", record.layer);
+                        println!("Importance: {:.2}", record.importance);
+                        println!("Pinned: {}", record.pinned);
+                        println!("Working strength: {:.3}", record.working_strength);
+                        println!("Core strength: {:.3}", record.core_strength);
+                        println!("Created: {}", record.created_at);
+                        println!("Access count: {}", record.access_times.len());
+                        if !record.source.is_empty() {
+                            println!("Source: {}", record.source);
+                        }
+                        if let Some(ref meta) = record.metadata {
+                            println!("Metadata: {}", serde_json::to_string_pretty(meta)?);
+                        }
+                    }
+                }
+                None => {
+                    eprintln!("Memory {} not found", memory_id);
+                    std::process::exit(1);
+                }
+            }
+        }
+        
+        Commands::List { limit, ns, json } => {
+            let memories = mem.list_ns(ns.as_deref(), Some(limit))?;
+            
+            if json {
+                println!("{}", serde_json::to_string_pretty(&memories)?);
+            } else {
+                if memories.is_empty() {
+                    println!("No memories found.");
+                } else {
+                    println!("Memories ({}):", memories.len());
+                    for m in &memories {
+                        let content_preview = if m.content.len() > 60 {
+                            format!("{}...", &m.content[..60])
+                        } else {
+                            m.content.clone()
+                        };
+                        println!("[{}] ({}) {}", m.id, m.memory_type, content_preview);
+                    }
+                }
+            }
         }
         
         Commands::Bus { action } => {
@@ -744,6 +1107,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("  {} (min_importance: {:.2}, since: {})",
                             sub.namespace, sub.min_importance, sub.created_at.format("%Y-%m-%d %H:%M"));
                     }
+                }
+            }
+        }
+        
+        // === Embedding Commands ===
+        
+        Commands::Reindex { progress } => {
+            if !mem.has_embedding_support() {
+                eprintln!("Error: Ollama not available. Cannot reindex embeddings.");
+                eprintln!("Make sure Ollama is running at {}", mem.embedding_config().host);
+                std::process::exit(1);
+            }
+            
+            if progress {
+                let count = mem.reindex_embeddings_with_progress(|current, total| {
+                    eprint!("\rReindexing: {}/{}", current, total);
+                })?;
+                eprintln!();
+                println!("Reindexed {} memories", count);
+            } else {
+                let count = mem.reindex_embeddings()?;
+                println!("Reindexed {} memories", count);
+            }
+        }
+        
+        Commands::EmbeddingStatus { json } => {
+            let stats = mem.embedding_stats()?;
+            let config = mem.embedding_config();
+            let enabled = mem.has_embedding_support();
+            let available = mem.is_embedding_available();
+            
+            if json {
+                let result = serde_json::json!({
+                    "enabled": enabled,
+                    "available": available,
+                    "provider": config.provider,
+                    "model": config.model,
+                    "host": config.host,
+                    "dimensions": config.dimensions,
+                    "total_memories": stats.total_memories,
+                    "embedded_count": stats.embedded_count,
+                    "pending_count": stats.total_memories - stats.embedded_count,
+                });
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("Embedding Status:");
+                println!("  Provider: {}", config.provider);
+                println!("  Model: {}", config.model);
+                println!("  Host: {}", config.host);
+                println!("  Dimensions: {}", config.dimensions);
+                println!("  Enabled: {}", if enabled { "yes" } else { "no (Ollama not found at startup)" });
+                println!("  Ollama available now: {}", if available { "yes" } else { "no" });
+                println!();
+                println!("Memory Coverage:");
+                println!("  Total memories: {}", stats.total_memories);
+                println!("  With embeddings: {}", stats.embedded_count);
+                println!("  Pending: {}", stats.total_memories - stats.embedded_count);
+                
+                if stats.total_memories > 0 {
+                    let coverage = stats.embedded_count as f64 / stats.total_memories as f64 * 100.0;
+                    println!("  Coverage: {:.1}%", coverage);
+                }
+                
+                if !enabled {
+                    println!();
+                    println!("Note: Embedding is disabled because Ollama was not available when the");
+                    println!("      memory system was initialized. Start Ollama and restart to enable.");
                 }
             }
         }

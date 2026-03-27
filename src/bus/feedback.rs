@@ -2,9 +2,24 @@
 //!
 //! Monitors which actions succeed or fail over time, suggesting behavioral adjustments.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+
+/// Convert a Unix float (seconds since epoch) to `DateTime<Utc>`.
+fn f64_to_datetime(ts: f64) -> DateTime<Utc> {
+    let secs = ts.floor() as i64;
+    let nanos = ((ts - secs as f64) * 1_000_000_000.0).max(0.0) as u32;
+    Utc.timestamp_opt(secs, nanos)
+        .single()
+        .unwrap_or_else(Utc::now)
+}
+
+/// Get the current time as a Unix float (seconds since epoch).
+fn now_f64() -> f64 {
+    let now = Utc::now();
+    now.timestamp() as f64 + now.timestamp_subsec_nanos() as f64 / 1_000_000_000.0
+}
 
 /// Default window size for action scoring (recent N attempts).
 pub const DEFAULT_SCORE_WINDOW: usize = 20;
@@ -84,7 +99,7 @@ impl<'a> BehaviorFeedback<'a> {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 action TEXT NOT NULL,
                 outcome INTEGER NOT NULL,
-                timestamp TEXT NOT NULL
+                timestamp REAL NOT NULL
             );
             
             CREATE INDEX IF NOT EXISTS idx_behavior_action ON behavior_log(action);
@@ -101,10 +116,9 @@ impl<'a> BehaviorFeedback<'a> {
     /// * `action` - Name of the action (e.g., "check_email", "run_consolidation")
     /// * `positive` - Whether the outcome was positive
     pub fn log_outcome(&self, action: &str, positive: bool) -> Result<(), rusqlite::Error> {
-        let now = Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO behavior_log (action, outcome, timestamp) VALUES (?, ?, ?)",
-            params![action, positive as i32, now],
+            params![action, positive as i32, now_f64()],
         )?;
         Ok(())
     }
@@ -215,14 +229,12 @@ impl<'a> BehaviorFeedback<'a> {
         )?;
         
         let rows = stmt.query_map(params![action, limit as i64], |row| {
-            let timestamp_str: String = row.get(2)?;
+            let timestamp_f64: f64 = row.get(2)?;
             let outcome: i32 = row.get(1)?;
             Ok(BehaviorLog {
                 action: row.get(0)?,
                 outcome: outcome != 0,
-                timestamp: DateTime::parse_from_rfc3339(&timestamp_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
+                timestamp: f64_to_datetime(timestamp_f64),
             })
         })?;
         

@@ -158,9 +158,18 @@ fn test_namespace_isolation() {
     assert_eq!(results_a.len(), 1);
     assert!(results_a[0].record.content.contains("trading"));
 
-    // Recall from namespace B should NOT find trading memory
+    // Recall from namespace B should NOT find the trading namespace memory
+    // Note: With embedding-based search, there may be semantic matches to the 
+    // hackathon memory, but the trading memory should never appear here.
     let results_b = mem.recall_from_namespace("strategy", 10, None, None, Some("hackathon")).unwrap();
-    assert!(results_b.is_empty());
+    
+    // Verify namespace isolation: trading content must NOT leak into hackathon results
+    for r in &results_b {
+        assert!(!r.record.content.contains("trading"), 
+            "Namespace leak: trading content appeared in hackathon namespace results");
+        assert!(!r.record.content.contains("oil"),
+            "Namespace leak: trading content appeared in hackathon namespace results");
+    }
 }
 
 #[test]

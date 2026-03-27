@@ -6,6 +6,59 @@ use std::path::Path;
 
 use crate::types::{AclEntry, CrossLink, HebbianLink, MemoryLayer, MemoryRecord, MemoryType, Permission};
 
+use std::sync::OnceLock;
+
+/// Global jieba instance (loaded once, ~150ms first use, then instant).
+fn jieba() -> &'static jieba_rs::Jieba {
+    static JIEBA: OnceLock<jieba_rs::Jieba> = OnceLock::new();
+    JIEBA.get_or_init(jieba_rs::Jieba::new)
+}
+
+/// Tokenize text for FTS5 indexing.
+/// Uses jieba for Chinese word segmentation + CJK/ASCII boundary splitting.
+/// e.g. "RustClaw是一个记忆系统" → "RustClaw 是 一个 记忆 系统"
+/// e.g. "用Rust写agent框架" → "用 Rust 写 agent 框架"
+fn tokenize_cjk_boundaries(text: &str) -> String {
+    if !text.chars().any(is_cjk_char) {
+        return text.to_string(); // Fast path: no CJK, skip jieba
+    }
+    
+    // Use jieba to segment Chinese text
+    let words = jieba().cut(text, true); // true = HMM mode for better accuracy
+    
+    // Join with spaces, then ensure CJK/ASCII boundaries have spaces
+    let joined = words.join(" ");
+    
+    // Clean up: remove duplicate spaces
+    let mut result = String::with_capacity(joined.len());
+    let mut prev_space = false;
+    for ch in joined.chars() {
+        if ch == ' ' {
+            if !prev_space {
+                result.push(ch);
+            }
+            prev_space = true;
+        } else {
+            result.push(ch);
+            prev_space = false;
+        }
+    }
+    result
+}
+
+/// Check if a character is CJK (Chinese/Japanese/Korean).
+fn is_cjk_char(ch: char) -> bool {
+    matches!(ch,
+        '\u{4E00}'..='\u{9FFF}'   // CJK Unified Ideographs
+        | '\u{3400}'..='\u{4DBF}' // CJK Extension A
+        | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+        | '\u{3000}'..='\u{303F}' // CJK Symbols and Punctuation
+        | '\u{3040}'..='\u{309F}' // Hiragana
+        | '\u{30A0}'..='\u{30FF}' // Katakana
+        | '\u{AC00}'..='\u{D7AF}' // Hangul
+    )
+}
+
 /// Convert a `DateTime<Utc>` to a Unix float (seconds since epoch).
 fn datetime_to_f64(dt: &DateTime<Utc>) -> f64 {
     dt.timestamp() as f64 + dt.timestamp_subsec_nanos() as f64 / 1_000_000_000.0
@@ -175,24 +228,11 @@ impl Storage {
             CREATE INDEX IF NOT EXISTS idx_memory_entities_memory ON memory_entities(memory_id);
             CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity_id);
 
-            -- FTS5 for full-text search
+            -- FTS5 for full-text search (manually managed, not via triggers,
+            -- so we can pre-process content for CJK/ASCII boundary tokenization)
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                content, content=memories, content_rowid=rowid
+                content
             );
-
-            -- FTS triggers to keep index in sync
-            CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-                INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-                INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-                INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
-                INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
-            END;
             "#,
         )?;
         Ok(())
@@ -311,6 +351,18 @@ impl Storage {
             params![record.id, datetime_to_f64(&record.created_at)],
         )?;
         
+        // Insert into FTS with CJK/ASCII boundary tokenization
+        let tokenized = tokenize_cjk_boundaries(&record.content);
+        let rowid: i64 = tx.query_row(
+            "SELECT rowid FROM memories WHERE id = ?",
+            params![record.id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
+            params![rowid, tokenized],
+        )?;
+        
         tx.commit()?;
         Ok(())
     }
@@ -344,6 +396,13 @@ impl Storage {
     pub fn update(&mut self, record: &MemoryRecord) -> Result<(), rusqlite::Error> {
         let metadata_json = record.metadata.as_ref().map(|m| serde_json::to_string(m).ok()).flatten();
         
+        // Get rowid for FTS update
+        let rowid: i64 = self.conn.query_row(
+            "SELECT rowid FROM memories WHERE id = ?",
+            params![record.id],
+            |row| row.get(0),
+        )?;
+        
         self.conn.execute(
             r#"
             UPDATE memories SET
@@ -370,11 +429,32 @@ impl Storage {
                 record.id,
             ],
         )?;
+        
+        // Update FTS with CJK tokenization
+        let _ = self.conn.execute("DELETE FROM memories_fts WHERE rowid = ?", params![rowid]);
+        let tokenized = tokenize_cjk_boundaries(&record.content);
+        let _ = self.conn.execute(
+            "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
+            params![rowid, tokenized],
+        );
+        
         Ok(())
     }
 
     /// Delete a memory by ID.
     pub fn delete(&mut self, id: &str) -> Result<(), rusqlite::Error> {
+        // Delete FTS entry (standalone table, delete by rowid)
+        let rowid: Result<i64, _> = self.conn.query_row(
+            "SELECT rowid FROM memories WHERE id = ?",
+            params![id],
+            |row| row.get(0),
+        );
+        if let Ok(rowid) = rowid {
+            let _ = self.conn.execute(
+                "DELETE FROM memories_fts WHERE rowid = ?",
+                params![rowid],
+            );
+        }
         self.conn.execute("DELETE FROM memories WHERE id = ?", params![id])?;
         Ok(())
     }
@@ -390,12 +470,25 @@ impl Storage {
     ) -> Result<(), rusqlite::Error> {
         let metadata_json = metadata.map(|m| serde_json::to_string(&m).ok()).flatten();
         
+        // Get rowid before updating
+        let rowid: i64 = self.conn.query_row(
+            "SELECT rowid FROM memories WHERE id = ?",
+            params![id],
+            |row| row.get(0),
+        )?;
+        
         self.conn.execute(
             "UPDATE memories SET content = ?, metadata = ? WHERE id = ?",
             params![new_content, metadata_json, id],
         )?;
         
-        // Update FTS index is handled automatically by trigger
+        // Update FTS index manually (no triggers, need CJK tokenization)
+        let _ = self.conn.execute("DELETE FROM memories_fts WHERE rowid = ?", params![rowid]);
+        let tokenized = tokenize_cjk_boundaries(new_content);
+        let _ = self.conn.execute(
+            "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
+            params![rowid, tokenized],
+        );
         
         Ok(())
     }
@@ -461,8 +554,9 @@ impl Storage {
 
     /// Full-text search using FTS5.
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
-        // Clean query: remove FTS5 special characters and punctuation
-        let cleaned: String = query
+        // Tokenize CJK boundaries, then clean
+        let tokenized = tokenize_cjk_boundaries(query);
+        let cleaned: String = tokenized
             .chars()
             .filter(|c| c.is_alphanumeric() || c.is_whitespace())
             .collect();
@@ -683,8 +777,9 @@ impl Storage {
         limit: usize,
         namespace: Option<&str>,
     ) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
-        // Clean query: remove FTS5 special characters and punctuation
-        let cleaned: String = query
+        // Tokenize CJK boundaries, then clean
+        let tokenized = tokenize_cjk_boundaries(query);
+        let cleaned: String = tokenized
             .chars()
             .filter(|c| c.is_alphanumeric() || c.is_whitespace())
             .collect();

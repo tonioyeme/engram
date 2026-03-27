@@ -709,9 +709,10 @@ impl Memory {
             }
             
             // Score each candidate with combined FTS + embedding + ACT-R
-            let fts_weight = 0.15; // 15% FTS for exact matching
-            let emb_adj_weight = self.config.embedding_weight * 0.85; // Scale down embedding
-            let actr_adj_weight = self.config.actr_weight;
+            // Weights are configurable via MemoryConfig (default: 15% FTS, 60% embedding, 25% ACT-R)
+            let fts_weight = self.config.fts_weight;
+            let emb_weight = self.config.embedding_weight;
+            let actr_weight = self.config.actr_weight;
             
             let mut scored: Vec<_> = candidates
                 .into_iter()
@@ -742,8 +743,8 @@ impl Memory {
                     
                     // Combined: FTS + embedding + ACT-R
                     let combined_score = (fts_weight * fts_score)
-                        + (emb_adj_weight * embedding_score as f64)
-                        + (actr_adj_weight * activation_normalized);
+                        + (emb_weight * embedding_score as f64)
+                        + (actr_weight * activation_normalized);
                     
                     (record, combined_score, activation)
                 })

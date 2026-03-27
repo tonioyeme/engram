@@ -74,9 +74,15 @@ pub struct MemoryConfig {
     // === Embedding ===
     /// Embedding provider configuration
     pub embedding: EmbeddingConfig,
+    /// Weight for FTS exact matching in hybrid recall (0.0-1.0)
+    /// Recommended: 0.15 for 15% FTS contribution
+    pub fts_weight: f64,
     /// Weight for embedding similarity in recall scoring (0.0-1.0)
+    /// Recommended: 0.60 for 60% semantic similarity contribution
     pub embedding_weight: f64,
     /// Weight for ACT-R activation in recall scoring (0.0-1.0)
+    /// Recommended: 0.25 for 25% recency/frequency contribution
+    /// Note: fts_weight + embedding_weight + actr_weight should sum to ~1.0
     pub actr_weight: f64,
 }
 
@@ -109,8 +115,9 @@ impl Default for MemoryConfig {
             stdp_causal_threshold: 2.0,
             stdp_min_observations: 3,
             embedding: EmbeddingConfig::default(),
-            embedding_weight: 0.7,
-            actr_weight: 0.3,
+            fts_weight: 0.15,        // 15% exact matching
+            embedding_weight: 0.60,   // 60% semantic similarity
+            actr_weight: 0.25,        // 25% recency/frequency/importance
         }
     }
 }

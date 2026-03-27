@@ -16,7 +16,8 @@ Ebbinghaus forgetting, cognitive consolidation, vector embeddings, and LLM extra
 | EmotionBus | Emotional valence tracking, drive alignment, behavior feedback |
 | Session Working Memory | Miller's Law 7±2, topic continuity detection |
 | Confidence Calibration | Two-dimensional metacognitive monitoring |
-| Hybrid Search | Adaptive vector + FTS with auto weight adjustment |
+| Hybrid Search | Adaptive vector + FTS with configurable weights (15% FTS + 60% embedding + 25% ACT-R) |
+| CJK Tokenization | jieba-based Chinese/Japanese word segmentation for precise FTS matching |
 | Multi-Agent | Namespaces, ACL permissions, subscriptions |
 | Hebbian Learning | Associative links from co-activation |
 | Ebbinghaus Forgetting | Exponential decay with spaced repetition |
@@ -132,6 +133,53 @@ Create config interactively:
 ```bash
 engram init
 ```
+
+### Search Weights (Hybrid Recall)
+
+Control how `recall()` balances FTS exact matching, semantic similarity, and temporal activation:
+
+```rust
+use engramai::MemoryConfig;
+
+let mut config = MemoryConfig::default();
+config.fts_weight = 0.15;        // 15% exact term matching (via FTS)
+config.embedding_weight = 0.60;   // 60% semantic similarity (via embeddings)
+config.actr_weight = 0.25;        // 25% recency/frequency (via ACT-R)
+
+let mut mem = Memory::new("./agent.db", Some(config))?;
+```
+
+**Recommended presets:**
+
+| Use case | FTS | Embedding | ACT-R | Description |
+|----------|-----|-----------|-------|-------------|
+| **Default** (balanced) | 0.15 | 0.60 | 0.25 | Good for most agents |
+| **Keyword-focused** | 0.30 | 0.50 | 0.20 | Project names, exact terms matter |
+| **Semantic-heavy** | 0.10 | 0.70 | 0.20 | Concept search, less exact matching |
+| **Recency-biased** | 0.10 | 0.50 | 0.40 | Recent events most important |
+
+> 💡 **Tip**: Weights should sum to ~1.0 for intuitive percentage interpretation.
+
+### CJK Tokenization
+
+For Chinese/Japanese/Korean text, Engram uses **jieba** for intelligent word segmentation:
+
+```
+❌ Without jieba:
+   "engram是认知记忆系统" → "engram" "是" "认" "知" "记" "忆" "系" "统"
+   Search "记忆系统" matches poorly (3 separate characters)
+
+✅ With jieba:
+   "engram是认知记忆系统" → "engram" "是" "认知" "记忆系统"
+   Search "记忆系统" matches precisely (as a complete term)
+```
+
+**Performance:**
+- First jieba load: ~220ms (once per process)
+- Per-memory tokenization: <0.02ms (negligible overhead)
+- Applies to FTS path only (15% of recall weight)
+
+**No configuration needed** — jieba auto-activates for CJK text.
 
 ## Architecture
 

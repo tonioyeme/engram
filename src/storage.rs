@@ -296,41 +296,234 @@ impl Storage {
         Ok(())
     }
     
-    /// Migrate to add embeddings table.
+    /// Migrate to embeddings table — supports v1 → v2 protocol migration.
+    ///
+    /// Protocol v2 changes:
+    /// - PK: (memory_id) → (memory_id, model) for multi-model support
+    /// - Embedding format: BLOB only (little-endian f32 array)
+    /// - Model naming: `{provider}/{model_name}` convention
     fn migrate_embeddings(conn: &Connection) -> SqlResult<()> {
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS memory_embeddings (
-                memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
-                embedding BLOB NOT NULL,
-                model TEXT NOT NULL,
-                dimensions INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            "#,
-        )?;
+        // Check if we already have v2 schema
+        let protocol_version = Self::get_meta(conn, "embedding_protocol_version")
+            .unwrap_or(None)
+            .unwrap_or_else(|| "0".to_string());
         
-        // Migrate old schema: add missing columns if table was created with only (memory_id, embedding)
+        if protocol_version == "2" {
+            // Already at v2, just ensure table exists
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS memory_embeddings (
+                    memory_id   TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                    model       TEXT NOT NULL,
+                    embedding   BLOB NOT NULL,
+                    dimensions  INTEGER NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    PRIMARY KEY (memory_id, model)
+                );
+                CREATE INDEX IF NOT EXISTS idx_embeddings_model ON memory_embeddings(model);
+                "#,
+            )?;
+            return Ok(());
+        }
+        
+        // Check if old table exists
+        let table_exists: bool = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_embeddings'",
+            [],
+            |row| row.get::<_, i64>(0),
+        ).map(|c| c > 0).unwrap_or(false);
+        
+        if !table_exists {
+            // Fresh install — create v2 schema directly
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS memory_embeddings (
+                    memory_id   TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                    model       TEXT NOT NULL,
+                    embedding   BLOB NOT NULL,
+                    dimensions  INTEGER NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    PRIMARY KEY (memory_id, model)
+                );
+                CREATE INDEX IF NOT EXISTS idx_embeddings_model ON memory_embeddings(model);
+                "#,
+            )?;
+            Self::set_meta(conn, "embedding_protocol_version", "2")?;
+            return Ok(());
+        }
+        
+        // Migrate from v1 → v2
+        eprintln!("[engram] Migrating memory_embeddings to protocol v2 (multi-model support)...");
+        
+        // Check what columns exist in old table
         let cols: Vec<String> = conn
             .prepare("PRAGMA table_info(memory_embeddings)")?
             .query_map([], |row| row.get::<_, String>(1))?
             .filter_map(|r| r.ok())
             .collect();
         
-        if !cols.contains(&"model".to_string()) {
-            conn.execute_batch(
-                r#"
-                ALTER TABLE memory_embeddings ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown';
-                ALTER TABLE memory_embeddings ADD COLUMN dimensions INTEGER NOT NULL DEFAULT 0;
-                ALTER TABLE memory_embeddings ADD COLUMN created_at TEXT NOT NULL DEFAULT '';
-                "#,
-            )?;
-            eprintln!("[engram] Migrated memory_embeddings: added model, dimensions, created_at columns");
+        let has_model = cols.contains(&"model".to_string());
+        let has_dimensions = cols.contains(&"dimensions".to_string());
+        let has_created_at = cols.contains(&"created_at".to_string());
+        
+        // Step 1: Create v2 table
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS memory_embeddings_v2 (
+                memory_id   TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                model       TEXT NOT NULL,
+                embedding   BLOB NOT NULL,
+                dimensions  INTEGER NOT NULL,
+                created_at  TEXT NOT NULL,
+                PRIMARY KEY (memory_id, model)
+            );
+            "#,
+        )?;
+        
+        // Step 2: Migrate BLOB rows
+        let mut migrated = 0;
+        let mut skipped = 0;
+        
+        {
+            let select_sql = if has_model && has_dimensions && has_created_at {
+                "SELECT memory_id, embedding, model, dimensions, created_at FROM memory_embeddings"
+            } else if has_model {
+                "SELECT memory_id, embedding, model, 0, '' FROM memory_embeddings"
+            } else {
+                "SELECT memory_id, embedding, 'unknown/legacy', 0, '' FROM memory_embeddings"
+            };
+            
+            let mut stmt = conn.prepare(select_sql)?;
+            let rows: Vec<(String, Vec<u8>, String, i64, String)> = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?.filter_map(|r| r.ok()).collect();
+            
+            for (memory_id, blob_or_text, mut model, mut dims, created_at) in rows {
+                // Determine if this is BLOB or TEXT (JSON)
+                let final_blob: Vec<u8>;
+                
+                if blob_or_text.len() % 4 == 0 && !blob_or_text.is_empty() {
+                    // Likely BLOB — check if it looks like valid f32 bytes
+                    // A simple heuristic: valid f32 embeddings won't start with `[` (0x5B)
+                    if blob_or_text.first() == Some(&0x5B) || blob_or_text.first() == Some(&0x2D) {
+                        // Starts with `[` or `-` — probably JSON text
+                        match Self::json_text_to_blob(&blob_or_text) {
+                            Some((blob, d)) => {
+                                final_blob = blob;
+                                if dims == 0 { dims = d as i64; }
+                            }
+                            None => {
+                                eprintln!("[engram] Skipping corrupt embedding for memory {}", memory_id);
+                                skipped += 1;
+                                continue;
+                            }
+                        }
+                    } else {
+                        // Assume valid BLOB
+                        final_blob = blob_or_text;
+                        if dims == 0 { dims = final_blob.len() as i64 / 4; }
+                    }
+                } else if !blob_or_text.is_empty() {
+                    // Not aligned to 4 bytes — must be TEXT/JSON
+                    match Self::json_text_to_blob(&blob_or_text) {
+                        Some((blob, d)) => {
+                            final_blob = blob;
+                            if dims == 0 { dims = d as i64; }
+                        }
+                        None => {
+                            eprintln!("[engram] Skipping corrupt embedding for memory {}", memory_id);
+                            skipped += 1;
+                            continue;
+                        }
+                    }
+                } else {
+                    skipped += 1;
+                    continue;
+                }
+                
+                // Fix model name: add provider prefix if missing
+                if !model.contains('/') {
+                    if model == "unknown" || model.is_empty() {
+                        model = "unknown/legacy".to_string();
+                    } else {
+                        // Try to guess provider from model name
+                        model = if model.starts_with("text-embedding") {
+                            format!("openai/{}", model)
+                        } else {
+                            format!("ollama/{}", model)
+                        };
+                    }
+                }
+                
+                let ts = if created_at.is_empty() {
+                    chrono::Utc::now().to_rfc3339()
+                } else {
+                    created_at
+                };
+                
+                conn.execute(
+                    "INSERT OR REPLACE INTO memory_embeddings_v2 (memory_id, model, embedding, dimensions, created_at) VALUES (?, ?, ?, ?, ?)",
+                    params![memory_id, model, final_blob, dims, ts],
+                )?;
+                migrated += 1;
+            }
         }
         
-        // Also fix: old schema had embedding as TEXT, new schema needs BLOB
-        // SQLite doesn't enforce column types strictly, so existing TEXT data works as-is
+        // Step 3: Replace old table
+        conn.execute_batch(
+            r#"
+            DROP TABLE memory_embeddings;
+            ALTER TABLE memory_embeddings_v2 RENAME TO memory_embeddings;
+            CREATE INDEX IF NOT EXISTS idx_embeddings_model ON memory_embeddings(model);
+            "#,
+        )?;
         
+        // Step 4: Set protocol version
+        Self::set_meta(conn, "embedding_protocol_version", "2")?;
+        
+        eprintln!("[engram] Migration complete: {} migrated, {} skipped", migrated, skipped);
+        
+        Ok(())
+    }
+    
+    /// Helper: convert JSON text embedding to BLOB format.
+    fn json_text_to_blob(data: &[u8]) -> Option<(Vec<u8>, usize)> {
+        let text = std::str::from_utf8(data).ok()?;
+        let values: Vec<f64> = serde_json::from_str(text).ok()?;
+        let dims = values.len();
+        let blob: Vec<u8> = values.iter()
+            .flat_map(|v| (*v as f32).to_le_bytes())
+            .collect();
+        Some((blob, dims))
+    }
+    
+    /// Get a metadata value from engram_meta table.
+    fn get_meta(conn: &Connection, key: &str) -> SqlResult<Option<String>> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS engram_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+        )?;
+        conn.query_row(
+            "SELECT value FROM engram_meta WHERE key = ?",
+            params![key],
+            |row| row.get(0),
+        ).optional()
+    }
+    
+    /// Set a metadata value in engram_meta table.
+    fn set_meta(conn: &Connection, key: &str, value: &str) -> SqlResult<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS engram_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO engram_meta (key, value) VALUES (?, ?)",
+            params![key, value],
+        )?;
         Ok(())
     }
 
@@ -506,8 +699,21 @@ impl Storage {
             ],
         )?;
         
-        // Update FTS with CJK tokenization
-        let _ = self.conn.execute("DELETE FROM memories_fts WHERE rowid = ?", params![rowid]);
+        // Update FTS with CJK tokenization (with malformed recovery)
+        match self.conn.execute("DELETE FROM memories_fts WHERE rowid = ?", params![rowid]) {
+            Ok(_) => {},
+            Err(e) if e.to_string().contains("malformed") => {
+                // FTS corrupted, rebuild the index
+                eprintln!("[engram] FTS corruption detected during update, rebuilding index...");
+                let _ = self.conn.execute(
+                    "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", []
+                );
+                // Retry delete after rebuild
+                let _ = self.conn.execute("DELETE FROM memories_fts WHERE rowid = ?", params![rowid]);
+            }
+            Err(_) => {} // Other errors are non-critical for FTS
+        }
+        
         let tokenized = tokenize_cjk_boundaries(&record.content);
         let _ = self.conn.execute(
             "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
@@ -927,11 +1133,35 @@ impl Storage {
         rows.collect()
     }
     
-    // === Embedding Methods ===
+    // === Embedding Methods (Protocol v2) ===
+    //
+    // See EMBEDDING_PROTOCOL.md for the full specification.
+    // PK: (memory_id, model) — supports multiple embedding models per memory.
+    // BLOB format: raw little-endian f32 array, no header.
     
-    /// Store embedding for a memory.
+    /// Validate an embedding vector before storage.
     ///
-    /// Serializes the embedding as raw f32 bytes (little-endian) for compact storage.
+    /// Returns Err if the embedding is empty or contains non-finite values.
+    fn validate_embedding(embedding: &[f32]) -> Result<(), rusqlite::Error> {
+        if embedding.is_empty() {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "Empty embedding".to_string(),
+            ));
+        }
+        if !embedding.iter().all(|f| f.is_finite()) {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "Non-finite value in embedding (NaN or Inf)".to_string(),
+            ));
+        }
+        Ok(())
+    }
+    
+    /// Store embedding for a memory with a specific model.
+    ///
+    /// Protocol v2: PK is (memory_id, model), so the same memory can have
+    /// embeddings from multiple models simultaneously.
+    ///
+    /// Serializes the embedding as raw f32 bytes (little-endian) per spec.
     pub fn store_embedding(
         &mut self,
         memory_id: &str,
@@ -939,33 +1169,38 @@ impl Storage {
         model: &str,
         dimensions: usize,
     ) -> Result<(), rusqlite::Error> {
+        Self::validate_embedding(embedding)?;
+        
         // Serialize Vec<f32> as raw bytes (4 bytes per f32, little-endian)
         let bytes: Vec<u8> = embedding
             .iter()
             .flat_map(|f| f.to_le_bytes())
             .collect();
         
+        debug_assert_eq!(bytes.len(), dimensions * 4,
+            "Blob size mismatch: {} bytes for {} dimensions", bytes.len(), dimensions);
+        
         let now = chrono::Utc::now().to_rfc3339();
         
         self.conn.execute(
             r#"
-            INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding, model, dimensions, created_at)
+            INSERT OR REPLACE INTO memory_embeddings (memory_id, model, embedding, dimensions, created_at)
             VALUES (?, ?, ?, ?, ?)
             "#,
-            params![memory_id, bytes, model, dimensions as i64, now],
+            params![memory_id, model, bytes, dimensions as i64, now],
         )?;
         
         Ok(())
     }
     
-    /// Get embedding for a memory.
+    /// Get embedding for a memory using a specific model.
     ///
-    /// Deserializes raw f32 bytes back to Vec<f32>.
-    pub fn get_embedding(&self, memory_id: &str) -> Result<Option<Vec<f32>>, rusqlite::Error> {
+    /// Returns None if no embedding exists for this (memory_id, model) pair.
+    pub fn get_embedding(&self, memory_id: &str, model: &str) -> Result<Option<Vec<f32>>, rusqlite::Error> {
         let result: Option<Vec<u8>> = self.conn
             .query_row(
-                "SELECT embedding FROM memory_embeddings WHERE memory_id = ?",
-                params![memory_id],
+                "SELECT embedding FROM memory_embeddings WHERE memory_id = ? AND model = ?",
+                params![memory_id, model],
                 |row| row.get(0),
             )
             .optional()?;
@@ -973,15 +1208,16 @@ impl Storage {
         Ok(result.map(|bytes| bytes_to_f32_vec(&bytes)))
     }
     
-    /// Get all embeddings for similarity search.
+    /// Get all embeddings for a specific model.
     ///
-    /// Returns (memory_id, embedding) pairs.
-    pub fn get_all_embeddings(&self) -> Result<Vec<(String, Vec<f32>)>, rusqlite::Error> {
+    /// Returns (memory_id, embedding) pairs for the given model only.
+    /// Cross-model comparison is undefined behavior per protocol.
+    pub fn get_all_embeddings(&self, model: &str) -> Result<Vec<(String, Vec<f32>)>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT memory_id, embedding FROM memory_embeddings"
+            "SELECT memory_id, embedding FROM memory_embeddings WHERE model = ?"
         )?;
         
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![model], |row| {
             let memory_id: String = row.get(0)?;
             let bytes: Vec<u8> = row.get(1)?;
             Ok((memory_id, bytes_to_f32_vec(&bytes)))
@@ -990,26 +1226,30 @@ impl Storage {
         rows.collect()
     }
     
-    /// Get embeddings for a specific namespace.
+    /// Get embeddings for a specific namespace and model.
+    ///
+    /// Only returns embeddings from the specified model to ensure
+    /// cosine similarity is computed within the same vector space.
     pub fn get_embeddings_in_namespace(
         &self,
         namespace: Option<&str>,
+        model: &str,
     ) -> Result<Vec<(String, Vec<f32>)>, rusqlite::Error> {
         let ns = namespace.unwrap_or("default");
         
         if ns == "*" {
-            return self.get_all_embeddings();
+            return self.get_all_embeddings(model);
         }
         
         let mut stmt = self.conn.prepare(
             r#"
             SELECT e.memory_id, e.embedding FROM memory_embeddings e
             JOIN memories m ON e.memory_id = m.id
-            WHERE m.namespace = ?
+            WHERE m.namespace = ? AND e.model = ?
             "#
         )?;
         
-        let rows = stmt.query_map(params![ns], |row| {
+        let rows = stmt.query_map(params![ns, model], |row| {
             let memory_id: String = row.get(0)?;
             let bytes: Vec<u8> = row.get(1)?;
             Ok((memory_id, bytes_to_f32_vec(&bytes)))
@@ -1018,8 +1258,17 @@ impl Storage {
         rows.collect()
     }
     
-    /// Delete embedding for a memory.
-    pub fn delete_embedding(&mut self, memory_id: &str) -> Result<(), rusqlite::Error> {
+    /// Delete embedding for a specific (memory_id, model) pair.
+    pub fn delete_embedding(&mut self, memory_id: &str, model: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM memory_embeddings WHERE memory_id = ? AND model = ?",
+            params![memory_id, model],
+        )?;
+        Ok(())
+    }
+    
+    /// Delete all embeddings for a memory (all models).
+    pub fn delete_all_embeddings(&mut self, memory_id: &str) -> Result<(), rusqlite::Error> {
         self.conn.execute(
             "DELETE FROM memory_embeddings WHERE memory_id = ?",
             params![memory_id],
@@ -1027,21 +1276,24 @@ impl Storage {
         Ok(())
     }
     
-    /// Get memory IDs that don't have embeddings yet.
-    pub fn get_memories_without_embeddings(&self) -> Result<Vec<String>, rusqlite::Error> {
+    /// Get memory IDs that don't have embeddings for a specific model.
+    ///
+    /// Used to find memories that need (re)embedding when switching models
+    /// or during backfill operations.
+    pub fn get_memories_without_embeddings(&self, model: &str) -> Result<Vec<String>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT m.id FROM memories m
-            LEFT JOIN memory_embeddings e ON m.id = e.memory_id
+            LEFT JOIN memory_embeddings e ON m.id = e.memory_id AND e.model = ?
             WHERE e.memory_id IS NULL
             "#
         )?;
         
-        let rows = stmt.query_map([], |row| row.get(0))?;
+        let rows = stmt.query_map(params![model], |row| row.get(0))?;
         rows.collect()
     }
     
-    /// Get embedding statistics.
+    /// Get embedding statistics, optionally filtered by model.
     pub fn embedding_stats(&self) -> Result<EmbeddingStats, rusqlite::Error> {
         let total_memories: usize = self.conn.query_row(
             "SELECT COUNT(*) FROM memories",
@@ -1049,14 +1301,16 @@ impl Storage {
             |row| row.get(0),
         )?;
         
+        // Count distinct memory_ids with any embedding
         let embedded_count: usize = self.conn.query_row(
-            "SELECT COUNT(*) FROM memory_embeddings",
+            "SELECT COUNT(DISTINCT memory_id) FROM memory_embeddings",
             [],
             |row| row.get(0),
         )?;
         
+        // Get the most common model
         let model: Option<String> = self.conn.query_row(
-            "SELECT model FROM memory_embeddings LIMIT 1",
+            "SELECT model FROM memory_embeddings GROUP BY model ORDER BY COUNT(*) DESC LIMIT 1",
             [],
             |row| row.get(0),
         ).optional()?;
@@ -1486,5 +1740,46 @@ impl Storage {
         })?;
         
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+    
+    // Transaction support for bulk operations (ISS-001 fix)
+    
+    /// Begin an IMMEDIATE transaction.
+    ///
+    /// IMMEDIATE locks the DB immediately to prevent write conflicts.
+    /// This is critical for consolidation cycles that do bulk updates.
+    pub fn begin_transaction(&mut self) -> Result<(), rusqlite::Error> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(())
+    }
+    
+    /// Commit the current transaction.
+    pub fn commit_transaction(&mut self) -> Result<(), rusqlite::Error> {
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+    
+    /// Rollback the current transaction.
+    pub fn rollback_transaction(&mut self) -> Result<(), rusqlite::Error> {
+        self.conn.execute_batch("ROLLBACK")?;
+        Ok(())
+    }
+    
+    /// Rebuild the FTS5 index from scratch.
+    ///
+    /// Use this to recover from FTS corruption. This will re-index all memories.
+    pub fn rebuild_fts(&mut self) -> Result<(), rusqlite::Error> {
+        self.conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", [])?;
+        Ok(())
+    }
+    
+    /// Check database integrity.
+    ///
+    /// Returns true if integrity check passes, false otherwise.
+    pub fn integrity_check(&self) -> Result<bool, rusqlite::Error> {
+        let result: String = self.conn.query_row(
+            "PRAGMA integrity_check", [], |row| row.get(0)
+        )?;
+        Ok(result == "ok")
     }
 }

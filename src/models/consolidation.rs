@@ -117,9 +117,24 @@ pub fn run_consolidation_cycle(
     // Step 4: Layer rebalancing
     rebalance_layers(&mut all_memories, config);
 
-    // Write all updates back to storage
-    for record in all_memories {
-        storage.update(&record)?;
+    // Write all updates back to storage (in a transaction for atomicity - ISS-001 fix)
+    storage.begin_transaction()?;
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        for record in all_memories {
+            storage.update(&record)?;
+        }
+        Ok(())
+    })();
+    
+    match result {
+        Ok(()) => storage.commit_transaction()?,
+        Err(e) => {
+            let _ = storage.rollback_transaction();
+            // Try FTS rebuild in case of corruption
+            eprintln!("[engram] Consolidation failed, attempting FTS rebuild: {}", e);
+            let _ = storage.rebuild_fts();
+            return Err(e);
+        }
     }
 
     Ok(())

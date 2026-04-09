@@ -1,6 +1,6 @@
 {
   "id": "r-804a9f",
-  "phase": "Implementing",
+  "phase": "Done",
   "task": "Implement Entity Indexing (B1) for engramai. Design at .gid/features/entity-indexing/design.md. 7 tasks in graph: entity-types → entity-storage → entity-add-raw → entity-recall → entity-backfill → entity-integration-tests, with entity-unit-tests parallel after entity-types. Creates src/entities.rs (~350 lines), modifies storage.rs (+120), memory.rs (+80), config.rs (+20), lib.rs (+2), main.rs (+40), adds tests (~250 lines). Total ~860 lines. Key deps: aho-corasick crate. Workspace: /Users/potato/clawd/projects/engram-ai-rust\nProject location: /Users/potato/clawd/projects/engram-ai-rust",
   "target_root": "/Users/potato/clawd/projects/engram-ai-rust",
   "project": {
@@ -21,9 +21,10 @@
   "review_target": "tasks",
   "triage_size": "large",
   "phase_tokens": {
-    "reviewing": 4592,
+    "implement": 32262,
     "triage": 637,
     "graph": 23522,
+    "reviewing": 4592,
     "planning": 295
   },
   "review_round": 0,
@@ -81,8 +82,20 @@
       "to": "Implementing",
       "event": "WaitingApproval → Implementing",
       "timestamp": "2026-04-09T18:43:10.952241Z"
+    },
+    {
+      "from": "Implementing",
+      "to": "Verifying",
+      "event": "Implementing → Verifying",
+      "timestamp": "2026-04-09T18:51:02.389890Z"
+    },
+    {
+      "from": "Verifying",
+      "to": "Done",
+      "event": "Verifying → Done",
+      "timestamp": "2026-04-09T18:51:12.727793Z"
     }
   ],
   "started_at": "2026-04-09T18:28:00.799068Z",
-  "updated_at": "2026-04-09T18:43:10.952242Z"
+  "updated_at": "2026-04-09T18:51:12.727793Z"
 }

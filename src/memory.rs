@@ -515,6 +515,14 @@ impl Memory {
     ///
     /// This is the raw storage path used when no extractor is configured
     /// or when extractor fails.
+    ///
+    /// Flow (with dedup):
+    /// 1. Generate embedding (if provider available)
+    /// 2. If dedup enabled + have embedding → check for duplicates
+    /// 3. If duplicate found → merge_memory_into + return existing_id
+    /// 4. If no duplicate → storage.add() the new record
+    /// 5. Store the pre-computed embedding (don't re-embed)
+    /// 6. Extract entities
     fn add_raw(
         &mut self,
         content: &str,
@@ -536,6 +544,55 @@ impl Memory {
             base_importance
         };
 
+        // Step 1: Generate embedding up front (if provider available)
+        // We need it before storage for dedup check, and reuse it after storage.
+        let pre_embedding = if let Some(ref embedding_provider) = self.embedding {
+            match embedding_provider.embed(content) {
+                Ok(emb) => Some(emb),
+                Err(e) => {
+                    log::warn!("Failed to generate embedding for dedup/storage: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Step 2: Dedup check — if we have an embedding, check for near-duplicates
+        if self.config.dedup_enabled {
+            if let Some(ref embedding) = pre_embedding {
+                let model_id = self.config.embedding.model_id();
+                if let Ok(Some((existing_id, similarity))) = self.storage.find_nearest_embedding(
+                    embedding,
+                    &model_id,
+                    Some(ns),
+                    self.config.dedup_threshold,
+                ) {
+                    // Found a near-duplicate — merge instead of creating new
+                    log::info!(
+                        "Dedup: merging into existing memory {} (similarity: {:.4})",
+                        existing_id, similarity
+                    );
+                    self.storage.merge_memory_into(&existing_id, importance)?;
+                    
+                    // Also update entity links for the existing memory
+                    if self.config.entity_config.enabled {
+                        let entities = self.entity_extractor.extract(content);
+                        for entity in &entities {
+                            if let Ok(eid) = self.storage.upsert_entity(
+                                &entity.normalized, entity.entity_type.as_str(), ns, None,
+                            ) {
+                                let _ = self.storage.link_memory_entity(&existing_id, &eid, "mention");
+                            }
+                        }
+                    }
+                    
+                    return Ok(existing_id);
+                }
+            }
+        }
+
+        // Step 3: No duplicate found — create new memory record
         let record = MemoryRecord {
             id: id.clone(),
             content: content.to_string(),
@@ -557,25 +614,17 @@ impl Memory {
 
         self.storage.add(&record, ns)?;
         
-        // Generate and store embedding if provider is available
-        if let Some(ref embedding_provider) = self.embedding {
-            match embedding_provider.embed(content) {
-                Ok(embedding) => {
-                    self.storage.store_embedding(
-                        &id,
-                        &embedding,
-                        &self.config.embedding.model_id(),
-                        self.config.embedding.dimensions,
-                    )?;
-                }
-                Err(e) => {
-                    // Log warning but don't fail — memory is stored, just not embedded
-                    log::warn!("Failed to generate embedding for memory {}: {}", id, e);
-                }
-            }
+        // Step 4: Store pre-computed embedding (avoid double-embed)
+        if let Some(embedding) = pre_embedding {
+            self.storage.store_embedding(
+                &id,
+                &embedding,
+                &self.config.embedding.model_id(),
+                self.config.embedding.dimensions,
+            )?;
         }
         
-        // Entity extraction
+        // Step 5: Entity extraction
         if self.config.entity_config.enabled {
             let entities = self.entity_extractor.extract(content);
             let mut entity_ids = Vec::new();

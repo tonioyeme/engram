@@ -2164,6 +2164,84 @@ impl Storage {
         Ok((entity_count as usize, relation_count as usize, link_count as usize))
     }
 
+    /// Find the most similar memory to the given embedding vector.
+    /// Returns (memory_id, cosine_similarity) if any memory exceeds the threshold.
+    /// Only searches within the specified namespace and model.
+    pub fn find_nearest_embedding(
+        &self,
+        embedding: &[f32],
+        model: &str,
+        namespace: Option<&str>,
+        threshold: f64,
+    ) -> Result<Option<(String, f32)>, rusqlite::Error> {
+        use crate::embeddings::EmbeddingProvider;
+        
+        let start = std::time::Instant::now();
+        let stored = self.get_embeddings_in_namespace(namespace, model)?;
+        
+        let mut best: Option<(String, f32)> = None;
+        for (mid, stored_emb) in &stored {
+            let sim = EmbeddingProvider::cosine_similarity(embedding, stored_emb);
+            if (sim as f64) >= threshold {
+                match best {
+                    Some((_, best_sim)) if sim > best_sim => {
+                        best = Some((mid.clone(), sim));
+                    }
+                    None => {
+                        best = Some((mid.clone(), sim));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        
+        let elapsed = start.elapsed();
+        if elapsed.as_millis() > 100 {
+            log::warn!(
+                "Dedup scan took {}ms over {} embeddings",
+                elapsed.as_millis(),
+                stored.len()
+            );
+        }
+        
+        Ok(best)
+    }
+    
+    /// Merge a duplicate memory's metadata into an existing memory.
+    ///
+    /// Strategy (from ISS-003):
+    /// - access_count: add new access to existing memory's access log
+    /// - importance: max(existing, new)
+    /// - created_at: keep existing (older)
+    /// - content: keep existing (already stored, presumably equivalent)
+    ///
+    /// Does NOT create a new memory — just boosts the existing one.
+    pub fn merge_memory_into(
+        &mut self,
+        existing_id: &str,
+        new_importance: f64,
+    ) -> Result<(), rusqlite::Error> {
+        // Insert a new access_log entry for the existing memory (now)
+        self.conn.execute(
+            "INSERT INTO access_log (memory_id, accessed_at) VALUES (?, ?)",
+            params![existing_id, now_f64()],
+        )?;
+        
+        // Update importance = MAX(existing, new)
+        self.conn.execute(
+            "UPDATE memories SET importance = MAX(importance, ?) WHERE id = ?",
+            params![new_importance, existing_id],
+        )?;
+        
+        log::info!(
+            "Merged duplicate into memory {}: boosted access + importance(max {})",
+            existing_id,
+            new_importance
+        );
+        
+        Ok(())
+    }
+
     /// Get memories that have no entity links (for backfill/extraction).
     ///
     /// Returns `(memory_id, content, namespace)` triples.

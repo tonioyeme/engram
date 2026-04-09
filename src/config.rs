@@ -93,10 +93,26 @@ pub struct MemoryConfig {
     /// Weight for entity matches in hybrid recall scoring (0.0-1.0)
     #[serde(default = "default_entity_weight")]
     pub entity_weight: f64,
+    
+    // === Dedup on write ===
+    /// Enable dedup checking on write (default: true)
+    #[serde(default = "default_dedup_enabled")]
+    pub dedup_enabled: bool,
+    /// Cosine similarity threshold for considering memories as duplicates (default: 0.95)
+    #[serde(default = "default_dedup_threshold")]
+    pub dedup_threshold: f64,
 }
 
 fn default_entity_weight() -> f64 {
     0.15
+}
+
+fn default_dedup_enabled() -> bool {
+    true
+}
+
+fn default_dedup_threshold() -> f64 {
+    0.95
 }
 
 impl Default for MemoryConfig {
@@ -133,6 +149,8 @@ impl Default for MemoryConfig {
             actr_weight: 0.25,        // 25% recency/frequency/importance
             entity_config: EntityConfig::default(),
             entity_weight: default_entity_weight(),
+            dedup_enabled: default_dedup_enabled(),
+            dedup_threshold: default_dedup_threshold(),
         }
     }
 }

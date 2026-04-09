@@ -5,7 +5,10 @@ use std::time::Instant;
 fn test_bulk_store_and_recall() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("stress.db");
-    let mut mem = Memory::new(db_path.to_str().unwrap(), None).unwrap();
+    // Disable dedup for bulk stress test — content templates are intentionally similar
+    let mut config = engramai::MemoryConfig::default();
+    config.dedup_enabled = false;
+    let mut mem = Memory::new(db_path.to_str().unwrap(), Some(config)).unwrap();
     
     // Check if embedding is enabled (affects timing)
     let has_embedding = mem.has_embedding_support();

@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::embeddings::EmbeddingConfig;
+use crate::entities::EntityConfig;
 
 /// All tunable parameters for the Engram memory system.
 ///
@@ -84,6 +85,18 @@ pub struct MemoryConfig {
     /// Recommended: 0.25 for 25% recency/frequency contribution
     /// Note: fts_weight + embedding_weight + actr_weight should sum to ~1.0
     pub actr_weight: f64,
+    
+    // === Entity extraction ===
+    /// Entity extraction configuration
+    #[serde(default)]
+    pub entity_config: EntityConfig,
+    /// Weight for entity matches in hybrid recall scoring (0.0-1.0)
+    #[serde(default = "default_entity_weight")]
+    pub entity_weight: f64,
+}
+
+fn default_entity_weight() -> f64 {
+    0.15
 }
 
 impl Default for MemoryConfig {
@@ -118,6 +131,8 @@ impl Default for MemoryConfig {
             fts_weight: 0.15,        // 15% exact matching
             embedding_weight: 0.60,   // 60% semantic similarity
             actr_weight: 0.25,        // 25% recency/frequency/importance
+            entity_config: EntityConfig::default(),
+            entity_weight: default_entity_weight(),
         }
     }
 }

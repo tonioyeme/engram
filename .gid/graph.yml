@@ -1,0 +1,414 @@
+project: null
+nodes:
+- id: phase-a
+  title: 'Phase A: 止血 — 堵住上游污染源'
+  status: todo
+  description: RustClaw 侧过滤 + extractor 改进 + 存量清理。不改 engramai crate 核心逻辑。
+  tags:
+  - engram
+  - memory-quality
+  priority: 10
+- id: a1-hook-filter
+  title: 'A1: EngramStoreHook 加过滤 — 不存垃圾内容'
+  status: done
+  description: |
+    在 rustclaw/src/engram_hooks.rs 的 EngramStoreHook 加 content-level 过滤：
+    - HEARTBEAT_OK → 直接跳过
+    - NO_REPLY → 直接跳过
+    - 系统指令特征检测（"你是 RustClaw"、"Read SOUL.md"、tool call 格式等）→ 跳过
+    - Heartbeat 有实质内容的响应 → 保留让 extractor 正常处理
+    约 30 行改动。不需要 ritual。
+  tags:
+  - engram
+  - rustclaw
+  - filter
+  priority: 10
+  metadata:
+    project: rustclaw
+    file: rustclaw/src/engram_hooks.rs
+- id: a2-extractor-negatives
+  title: 'A2: Extractor prompt 加 negative examples'
+  status: done
+  description: |
+    在 engramai/src/extractor.rs 的 EXTRACTION_PROMPT 加 negative examples：
+    - 不提取系统指令（"你是 XX agent"、"Read SOUL.md"、"Follow AGENTS.md"）
+    - 不提取工具调用格式描述
+    - 不提取 agent 身份/角色描述
+    - 不提取模板化状态报告（"所有系统正常"、"无新 commit"）
+    约 20 行改动。不需要 ritual。
+  tags:
+  - engram
+  - engramai
+  - extractor
+  priority: 10
+  metadata:
+    project: engramai
+    file: engramai/src/extractor.rs
+- id: a3-sql-cleanup
+  title: 'A3: SQL 一次性清理 — 删存量重复 + 系统指令垃圾'
+  status: todo
+  description: |
+    跑 SQL 脚本清理存量垃圾：
+    1. 删精确重复（105 条 content hash 相同）— 保留 access_count 最高的
+    2. 删系统指令垃圾（匹配 "你是 RustClaw"、"Read SOUL.md" 等 pattern）
+    3. 清理前先 backup DB
+    4. 清理后 PRAGMA integrity_check + 验证 recall 质量
+    必须先完成 A1+A2 堵住污染源，否则清理完又会写入新垃圾。
+  tags:
+  - engram
+  - cleanup
+  - one-time
+  priority: 15
+  metadata:
+    project: engramai
+- id: phase-b
+  title: 'Phase B: 提质 — engramai crate 核心改进'
+  status: todo
+  description: 改 engramai crate 核心：entity 索引、dedup、confidence、recency。需要 ritual 流程。
+  tags:
+  - engram
+  - memory-quality
+  priority: 20
+- id: b1-entity-index
+  title: 'B1: Entity 索引实现 — extraction + storage + recall (ISS-009)'
+  status: todo
+  description: |
+    ISS-009 最大改动，需要 ritual 流程。
+    1. Entity extraction on write — extractor 返回 entities（人名/项目名/概念/工具名）
+    2. Entity storage — 写入 entities + memory_entities + entity_relations 三张表
+    3. Entity-aware recall — 第 4 路检索：query→entity→related memories
+    4. Entity dedup — 同名 entity 合并（fuzzy match）
+    估计 500-800 行新代码，跨 extractor.rs、storage.rs、memory.rs、hybrid_search.rs
+    
+    分解为 7 个子任务（见 entity-types → entity-integration-tests）
+  tags:
+  - engram
+  - engramai
+  - entity
+  - recall-quality
+  priority: 20
+  metadata:
+    project: engramai
+    ritual: true
+    iss: ISS-009
+- id: entity-types
+  title: 'B1.1: Entity types & config structs'
+  status: todo
+  description: |
+    Create src/entities.rs with foundational types (~80 lines):
+    - EntityType enum (Project, Person, Technology, Concept, File, Url, Organization, Other)
+    - ExtractedEntity struct (name, normalized, entity_type)
+    - EntityRecord struct (DB representation)
+    - EntityConfig struct in config.rs (known_projects, known_people, known_technologies, enabled, recall_weight)
+    - normalize_entity_name() function
+    - Add aho-corasick dependency to Cargo.toml
+    - Add pub mod entities; to lib.rs
+    
+    Files: src/entities.rs (new), src/config.rs (+20 lines), Cargo.toml (+1 dep), lib.rs (+2 lines)
+  tags:
+  - engram
+  - engramai
+  - entity
+  - types
+  priority: 20
+  metadata:
+    project: engramai
+    iss: ISS-009
+    files:
+      - src/entities.rs
+      - src/config.rs
+      - Cargo.toml
+      - src/lib.rs
+- id: entity-unit-tests
+  title: 'B1.2: EntityExtractor unit tests'
+  status: todo
+  description: |
+    Write unit tests for entity extraction (~100 lines):
+    - Test known entity extraction (Aho-Corasick path)
+    - Test regex patterns (ISS-XXX, file paths, URLs, @mentions)
+    - Test normalization (case, trailing slashes, @-prefix stripping)
+    - Test dedup within same content
+    - Test empty/no-entity content
+    
+    Files: src/entities.rs (#[cfg(test)] mod tests)
+  tags:
+  - engram
+  - engramai
+  - entity
+  - tests
+  priority: 20
+  metadata:
+    project: engramai
+    iss: ISS-009
+    files:
+      - src/entities.rs
+- id: entity-storage
+  title: 'B1.3: Storage entity CRUD methods'
+  status: todo
+  description: |
+    Add entity methods to Storage (~120 lines in storage.rs):
+    - upsert_entity() — deterministic ID generation (sha256), INSERT OR REPLACE
+    - link_memory_entity() — memory_entities junction table
+    - upsert_entity_relation() — entity_relations with co-occurrence counter
+    - find_entities() — exact name match lookup
+    - get_entity_memories() — get memory IDs for entity
+    - get_related_entities() — 1-hop relations
+    - get_entity() — fetch by ID
+    - count_entities() — namespace stats
+    
+    Files: src/storage.rs (+120 lines)
+  tags:
+  - engram
+  - engramai
+  - entity
+  - storage
+  priority: 20
+  metadata:
+    project: engramai
+    iss: ISS-009
+    files:
+      - src/storage.rs
+- id: entity-add-raw
+  title: 'B1.4: Integrate entity extraction into add_raw()'
+  status: todo
+  description: |
+    Hook entity extraction into memory write path (~80 lines):
+    - Initialize EntityExtractor in MemorySystem::new()
+    - In add_raw(), after embedding storage:
+      * Extract entities from content
+      * Upsert each entity
+      * Link memory to entities
+      * Build co-occurrence relations (capped at 10 entities to avoid O(n²))
+    - Add entity_config field to MemoryConfig
+    - Add entity_extractor field to MemorySystem
+    
+    Files: src/memory.rs (+80 lines), src/config.rs (EntityConfig integration)
+  tags:
+  - engram
+  - engramai
+  - entity
+  - write-path
+  priority: 20
+  metadata:
+    project: engramai
+    iss: ISS-009
+    files:
+      - src/memory.rs
+      - src/config.rs
+- id: entity-recall
+  title: 'B1.5: Entity-aware recall channel'
+  status: todo
+  description: |
+    Add entity recall as 4th hybrid search channel (~150 lines):
+    - entity_recall() function in entities.rs:
+      * Extract entities from query
+      * Find matching entities in DB (exact name match)
+      * Get memory IDs for entities + related entities (1-hop)
+      * Score memories by entity relevance (primary entity match = 1.0, related = 0.5, multi-entity boost)
+    - Integrate into recall_from_namespace() in memory.rs
+    - Add entity channel weight to hybrid search scoring (default 0.15)
+    
+    Files: src/entities.rs (+150 lines), src/memory.rs (+20 lines)
+  tags:
+  - engram
+  - engramai
+  - entity
+  - recall
+  priority: 20
+  metadata:
+    project: engramai
+    iss: ISS-009
+    files:
+      - src/entities.rs
+      - src/memory.rs
+- id: entity-backfill
+  title: 'B1.6: Backfill CLI command for existing memories'
+  status: todo
+  description: |
+    Add backfill_entities() to process existing memories (~40 lines in main.rs):
+    - New CLI subcommand: engram backfill-entities [--namespace NS]
+    - backfill_entities(&memory_system, namespace: Option<&str>):
+      * Get all memories in namespace
+      * For each memory: extract entities, upsert, link, build relations
+      * Progress logging every 100 memories
+      * Stats: total processed, entities created, links created
+    - Idempotent — safe to re-run
+    
+    Files: src/main.rs (+40 lines)
+  tags:
+  - engram
+  - engramai
+  - entity
+  - cli
+  priority: 20
+  metadata:
+    project: engramai
+    iss: ISS-009
+    files:
+      - src/main.rs
+- id: entity-integration-tests
+  title: 'B1.7: Entity indexing integration tests'
+  status: todo
+  description: |
+    End-to-end tests for entity indexing (~150 lines):
+    - Test entity extraction + storage in add_raw()
+    - Test entity-aware recall finds memories via entity match
+    - Test co-occurrence relations are built correctly
+    - Test backfill on existing memories
+    - Test entity dedup (same normalized name → same ID)
+    - Test recall boost for multi-entity match
+    - Test namespace isolation for entities
+    
+    Files: tests/entity_integration_test.rs (new, ~150 lines)
+  tags:
+  - engram
+  - engramai
+  - entity
+  - tests
+  priority: 20
+  metadata:
+    project: engramai
+    iss: ISS-009
+    files:
+      - tests/entity_integration_test.rs
+- id: b2-dedup
+  title: 'B2: Dedup on write — embedding similarity + merge (ISS-003)'
+  status: todo
+  description: |
+    ISS-003。add_raw() 前做 embedding similarity check：
+    - cosine > 0.95 → 合并（不新增）
+    - 合并策略：access_count=sum, importance=max, created_at=min, content=最新版
+    - Hebbian links 去重合并
+    - 可选：content hash 精确 dedup 作为快速路径
+    约 200 行改动，主要在 memory.rs + storage.rs
+  tags:
+  - engram
+  - engramai
+  - dedup
+  priority: 25
+  metadata:
+    project: engramai
+    iss: ISS-003
+- id: b3-confidence
+  title: 'B3: Confidence score — 多信号融合 recall confidence (ISS-007)'
+  status: todo
+  description: |
+    ISS-007。confidence.rs 已有框架，需要：
+    1. 从 hybrid search 多路分数融合 confidence（embedding sim + FTS score + ACT-R activation + entity match）
+    2. 归一化到 0.0-1.0
+    3. recall 返回每个结果的 confidence
+    4. RustClaw auto-recall hook 按阈值过滤低 confidence 结果
+    约 100 行改动
+  tags:
+  - engram
+  - engramai
+  - confidence
+  priority: 30
+  metadata:
+    project: engramai
+    iss: ISS-007
+- id: b4-recency
+  title: 'B4: Recency 调参 — ACT-R decay analysis + tuning (ISS-002)'
+  status: todo
+  description: |
+    ISS-002。需要先量化当前 ACT-R 分布：
+    1. 分析当前 decay parameter d 值及其效果
+    2. 对比新旧记忆的 activation 分布
+    3. 调整 d 值让 recency 权重更高
+    4. 或在 scoring 中加 recency bonus factor
+    约 20 行代码 + 分析工作
+  tags:
+  - engram
+  - engramai
+  - recency
+  priority: 35
+  metadata:
+    iss: ISS-002
+    project: engramai
+edges:
+- from: a1-hook-filter
+  to: phase-a
+  relation: subtask_of
+- from: a2-extractor-negatives
+  to: phase-a
+  relation: subtask_of
+- from: a3-sql-cleanup
+  to: phase-a
+  relation: subtask_of
+- from: b1-entity-index
+  to: phase-b
+  relation: subtask_of
+- from: b2-dedup
+  to: phase-b
+  relation: subtask_of
+- from: b3-confidence
+  to: phase-b
+  relation: subtask_of
+- from: b4-recency
+  to: phase-b
+  relation: subtask_of
+- from: a3-sql-cleanup
+  to: a1-hook-filter
+  relation: depends_on
+- from: a3-sql-cleanup
+  to: a2-extractor-negatives
+  relation: depends_on
+- from: phase-b
+  to: phase-a
+  relation: depends_on
+- from: b1-entity-index
+  to: a3-sql-cleanup
+  relation: depends_on
+- from: b2-dedup
+  to: a3-sql-cleanup
+  relation: depends_on
+- from: b3-confidence
+  to: b1-entity-index
+  relation: depends_on
+- from: b4-recency
+  to: b3-confidence
+  relation: depends_on
+# B1 entity indexing task breakdown edges
+- from: entity-types
+  to: b1-entity-index
+  relation: subtask_of
+- from: entity-unit-tests
+  to: b1-entity-index
+  relation: subtask_of
+- from: entity-storage
+  to: b1-entity-index
+  relation: subtask_of
+- from: entity-add-raw
+  to: b1-entity-index
+  relation: subtask_of
+- from: entity-recall
+  to: b1-entity-index
+  relation: subtask_of
+- from: entity-backfill
+  to: b1-entity-index
+  relation: subtask_of
+- from: entity-integration-tests
+  to: b1-entity-index
+  relation: subtask_of
+# B1 entity indexing dependency chain
+- from: entity-storage
+  to: entity-types
+  relation: depends_on
+- from: entity-unit-tests
+  to: entity-types
+  relation: depends_on
+- from: entity-add-raw
+  to: entity-storage
+  relation: depends_on
+- from: entity-recall
+  to: entity-storage
+  relation: depends_on
+- from: entity-backfill
+  to: entity-add-raw
+  relation: depends_on
+- from: entity-backfill
+  to: entity-recall
+  relation: depends_on
+- from: entity-integration-tests
+  to: entity-backfill
+  relation: depends_on

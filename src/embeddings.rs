@@ -47,6 +47,14 @@ impl Default for EmbeddingConfig {
 }
 
 impl EmbeddingConfig {
+    /// Get the model identifier in protocol format: `{provider}/{model}`.
+    ///
+    /// This is the canonical model string used in `memory_embeddings` table
+    /// per the Engram Embedding Protocol v2.
+    pub fn model_id(&self) -> String {
+        format!("{}/{}", self.provider, self.model)
+    }
+    
     /// Create config for OpenAI embeddings.
     ///
     /// Uses text-embedding-3-small by default (1536 dimensions).

@@ -26,6 +26,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Error handling
 thiserror = "2.0"
+aho-corasick = "1"
 anyhow = "1.0"
 
 # Logging
@@ -33,6 +34,7 @@ log = "0.4"
 
 # Random for interleaved replay
 rand = "0.8"
+regex = "1"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }

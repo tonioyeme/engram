@@ -98,6 +98,34 @@ pub struct EmbeddingStats {
     pub dimensions: Option<usize>,
 }
 
+/// A record from the `entities` table.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EntityRecord {
+    pub id: String,
+    pub name: String,
+    pub entity_type: String,
+    pub namespace: String,
+    pub metadata: Option<String>,
+    pub created_at: f64,
+    pub updated_at: f64,
+}
+
+/// Generate a deterministic entity ID from (name, entity_type, namespace).
+///
+/// Uses a stable FNV-1a-inspired hash to produce a 16-char hex string.
+/// Deterministic: same inputs always produce the same ID.
+/// The UNIQUE index on `(name, entity_type, namespace)` is the real safety net.
+fn generate_entity_id(name: &str, entity_type: &str, namespace: &str) -> String {
+    let input = format!("{}|{}|{}", name.to_lowercase(), entity_type.to_lowercase(), namespace);
+    // FNV-1a 64-bit (stable, no external crate needed)
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in input.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}", hash)
+}
+
 /// SQLite-backed memory storage with FTS5 search.
 pub struct Storage {
     conn: Connection,
@@ -121,6 +149,9 @@ impl Storage {
         
         // Run migrations for embeddings
         Self::migrate_embeddings(&conn)?;
+        
+        // Run migrations for entity table constraints
+        Self::migrate_entities(&conn)?;
         
         // Rebuild FTS with CJK tokenization if needed
         Self::rebuild_fts_if_needed(&conn)?;
@@ -527,6 +558,22 @@ impl Storage {
         Ok(())
     }
 
+    /// Migrate entity tables: add unique constraints needed for upsert operations.
+    fn migrate_entities(conn: &Connection) -> SqlResult<()> {
+        // Add UNIQUE index on entities(name, entity_type, namespace) for deterministic upserts
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_unique ON entities(name, entity_type, namespace);"
+        )?;
+        
+        // entity_relations needs a UNIQUE constraint on (source_id, target_id, relation)
+        // for ON CONFLICT to work. We create a unique index.
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_relations_unique ON entity_relations(source_id, target_id, relation);"
+        )?;
+        
+        Ok(())
+    }
+    
     /// Rebuild FTS index with CJK tokenization if not already done.
     /// Uses engram_meta 'fts_cjk_version' to track migration state.
     fn rebuild_fts_if_needed(conn: &Connection) -> SqlResult<()> {
@@ -870,6 +917,40 @@ impl Storage {
     }
 
     /// Search memories by type.
+    /// Fetch the N most recently created memories, optionally filtered by namespace.
+    ///
+    /// Returns memories ordered newest-first. No query needed — pure chronological.
+    /// Used for session bootstrap: inject recent context after restart.
+    pub fn fetch_recent(
+        &self,
+        limit: usize,
+        namespace: Option<&str>,
+    ) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
+        let ns = namespace.unwrap_or("default");
+
+        if ns == "*" {
+            let mut stmt = self.conn.prepare(
+                "SELECT * FROM memories ORDER BY created_at DESC LIMIT ?"
+            )?;
+            let rows = stmt.query_map(params![limit as i64], |row| {
+                let id: String = row.get("id")?;
+                let access_times = self.get_access_times(&id).unwrap_or_default();
+                self.row_to_record(row, access_times)
+            })?;
+            rows.collect()
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT * FROM memories WHERE namespace = ? ORDER BY created_at DESC LIMIT ?"
+            )?;
+            let rows = stmt.query_map(params![ns, limit as i64], |row| {
+                let id: String = row.get("id")?;
+                let access_times = self.get_access_times(&id).unwrap_or_default();
+                self.row_to_record(row, access_times)
+            })?;
+            rows.collect()
+        }
+    }
+
     pub fn search_by_type(&self, memory_type: MemoryType) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
         let mut stmt = self
             .conn
@@ -913,7 +994,7 @@ impl Storage {
             .optional()?;
         
         match existing {
-            Some((strength, count)) if strength > 0.0 => {
+            Some((strength, _count)) if strength > 0.0 => {
                 // Link already formed, strengthen it
                 let new_strength = (strength + 0.1).min(1.0);
                 self.conn.execute(
@@ -1142,6 +1223,20 @@ impl Storage {
     /// Validate an embedding vector before storage.
     ///
     /// Returns Err if the embedding is empty or contains non-finite values.
+    /// Normalize model ID to always include provider prefix.
+    /// Bare model names (e.g. "nomic-embed-text") are auto-prefixed.
+    fn normalize_model_id(model: &str) -> String {
+        if model.contains('/') {
+            model.to_string()
+        } else if model.starts_with("text-embedding") {
+            format!("openai/{}", model)
+        } else if model.is_empty() || model == "unknown" {
+            "unknown/legacy".to_string()
+        } else {
+            format!("ollama/{}", model)
+        }
+    }
+
     fn validate_embedding(embedding: &[f32]) -> Result<(), rusqlite::Error> {
         if embedding.is_empty() {
             return Err(rusqlite::Error::InvalidParameterName(
@@ -1171,6 +1266,9 @@ impl Storage {
     ) -> Result<(), rusqlite::Error> {
         Self::validate_embedding(embedding)?;
         
+        // Normalize model ID: must have provider prefix (e.g. "ollama/nomic-embed-text")
+        let model = Self::normalize_model_id(model);
+        
         // Serialize Vec<f32> as raw bytes (4 bytes per f32, little-endian)
         let bytes: Vec<u8> = embedding
             .iter()
@@ -1197,6 +1295,7 @@ impl Storage {
     ///
     /// Returns None if no embedding exists for this (memory_id, model) pair.
     pub fn get_embedding(&self, memory_id: &str, model: &str) -> Result<Option<Vec<f32>>, rusqlite::Error> {
+        let model = Self::normalize_model_id(model);
         let result: Option<Vec<u8>> = self.conn
             .query_row(
                 "SELECT embedding FROM memory_embeddings WHERE memory_id = ? AND model = ?",
@@ -1213,6 +1312,7 @@ impl Storage {
     /// Returns (memory_id, embedding) pairs for the given model only.
     /// Cross-model comparison is undefined behavior per protocol.
     pub fn get_all_embeddings(&self, model: &str) -> Result<Vec<(String, Vec<f32>)>, rusqlite::Error> {
+        let model = Self::normalize_model_id(model);
         let mut stmt = self.conn.prepare(
             "SELECT memory_id, embedding FROM memory_embeddings WHERE model = ?"
         )?;
@@ -1235,10 +1335,11 @@ impl Storage {
         namespace: Option<&str>,
         model: &str,
     ) -> Result<Vec<(String, Vec<f32>)>, rusqlite::Error> {
+        let model = Self::normalize_model_id(model);
         let ns = namespace.unwrap_or("default");
         
         if ns == "*" {
-            return self.get_all_embeddings(model);
+            return self.get_all_embeddings(&model);
         }
         
         let mut stmt = self.conn.prepare(
@@ -1260,6 +1361,7 @@ impl Storage {
     
     /// Delete embedding for a specific (memory_id, model) pair.
     pub fn delete_embedding(&mut self, memory_id: &str, model: &str) -> Result<(), rusqlite::Error> {
+        let model = Self::normalize_model_id(model);
         self.conn.execute(
             "DELETE FROM memory_embeddings WHERE memory_id = ? AND model = ?",
             params![memory_id, model],
@@ -1491,7 +1593,7 @@ impl Storage {
             .optional()?;
         
         match existing {
-            Some((strength, count)) if strength > 0.0 => {
+            Some((strength, _count)) if strength > 0.0 => {
                 // Link already formed, strengthen it
                 let new_strength = (strength + 0.1).min(1.0);
                 self.conn.execute(
@@ -1781,5 +1883,310 @@ impl Storage {
             "PRAGMA integrity_check", [], |row| row.get(0)
         )?;
         Ok(result == "ok")
+    }
+    
+    // ── Entity CRUD ──────────────────────────────────────────────────────
+    
+    /// Upsert an entity. Returns the deterministic entity ID.
+    ///
+    /// If the entity already exists (by name+type+namespace), updates
+    /// `updated_at` and merges metadata (new metadata wins if provided).
+    pub fn upsert_entity(
+        &self,
+        name: &str,
+        entity_type: &str,
+        namespace: &str,
+        metadata: Option<&str>,
+    ) -> Result<String, rusqlite::Error> {
+        let entity_id = generate_entity_id(name, entity_type, namespace);
+        let now = now_f64();
+        self.conn.execute(
+            r#"
+            INSERT INTO entities (id, name, entity_type, namespace, metadata, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            ON CONFLICT(id) DO UPDATE SET
+                updated_at = ?6,
+                metadata = COALESCE(?5, metadata)
+            "#,
+            params![entity_id, name, entity_type, namespace, metadata, now],
+        )?;
+        Ok(entity_id)
+    }
+    
+    /// Link a memory to an entity with a given role (e.g. "mention", "subject").
+    ///
+    /// Ignores duplicates (memory_id, entity_id is the PK).
+    pub fn link_memory_entity(
+        &self,
+        memory_id: &str,
+        entity_id: &str,
+        role: &str,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, role) VALUES (?1, ?2, ?3)",
+            params![memory_id, entity_id, role],
+        )?;
+        Ok(())
+    }
+    
+    /// Upsert an entity relation. Confidence starts at 0.1 and increments
+    /// by 0.1 on each repeated observation, capped at 1.0.
+    pub fn upsert_entity_relation(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        relation: &str,
+        namespace: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let now = now_f64();
+        let id = format!("{}_{}", source_id, target_id);
+        self.conn.execute(
+            r#"
+            INSERT INTO entity_relations (id, source_id, target_id, relation, confidence, namespace, created_at)
+            VALUES (?1, ?2, ?3, ?4, 0.1, ?5, ?6)
+            ON CONFLICT(source_id, target_id, relation) DO UPDATE SET
+                confidence = MIN(confidence + 0.1, 1.0),
+                created_at = ?6
+            "#,
+            params![id, source_id, target_id, relation, namespace, now],
+        )?;
+        Ok(())
+    }
+    
+    /// Find entities by exact name match, optionally filtered by namespace.
+    pub fn find_entities(
+        &self,
+        query: &str,
+        namespace: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EntityRecord>, rusqlite::Error> {
+        match namespace {
+            Some(ns) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, name, entity_type, namespace, metadata, created_at, updated_at \
+                     FROM entities WHERE name = ?1 AND namespace = ?2 LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![query, ns, limit as i64], |row| {
+                    Ok(EntityRecord {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        entity_type: row.get(2)?,
+                        namespace: row.get(3)?,
+                        metadata: row.get(4)?,
+                        created_at: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                })?;
+                Ok(rows.filter_map(|r| r.ok()).collect())
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, name, entity_type, namespace, metadata, created_at, updated_at \
+                     FROM entities WHERE name = ?1 LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![query, limit as i64], |row| {
+                    Ok(EntityRecord {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        entity_type: row.get(2)?,
+                        namespace: row.get(3)?,
+                        metadata: row.get(4)?,
+                        created_at: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                })?;
+                Ok(rows.filter_map(|r| r.ok()).collect())
+            }
+        }
+    }
+    
+    /// Get all memory IDs linked to a given entity.
+    pub fn get_entity_memories(&self, entity_id: &str) -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT memory_id FROM memory_entities WHERE entity_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![entity_id], |row| row.get(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+    
+    /// Get entities related to a given entity (both directions).
+    ///
+    /// Returns `(entity_id, relation_type)` pairs.
+    pub fn get_related_entities(
+        &self,
+        entity_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT target_id, relation FROM entity_relations WHERE source_id = ?1
+            UNION
+            SELECT source_id, relation FROM entity_relations WHERE target_id = ?1
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt.query_map(params![entity_id, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+    
+    /// Get a single entity by ID.
+    pub fn get_entity(&self, id: &str) -> Result<Option<EntityRecord>, rusqlite::Error> {
+        self.conn
+            .query_row(
+                "SELECT id, name, entity_type, namespace, metadata, created_at, updated_at \
+                 FROM entities WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(EntityRecord {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        entity_type: row.get(2)?,
+                        namespace: row.get(3)?,
+                        metadata: row.get(4)?,
+                        created_at: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+    }
+    
+    /// Count entities, optionally filtered by namespace.
+    pub fn count_entities(&self, namespace: Option<&str>) -> Result<usize, rusqlite::Error> {
+        match namespace {
+            Some(ns) => {
+                let count: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM entities WHERE namespace = ?1",
+                    params![ns],
+                    |row| row.get(0),
+                )?;
+                Ok(count as usize)
+            }
+            None => {
+                let count: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM entities",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok(count as usize)
+            }
+        }
+    }
+    
+    /// List entities, optionally filtered by type and namespace.
+    /// Ordered by updated_at descending (most recently touched first).
+    pub fn list_entities(
+        &self,
+        entity_type: Option<&str>,
+        namespace: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(EntityRecord, usize)>, rusqlite::Error> {
+        let sql = match (entity_type, namespace) {
+            (Some(_), Some(_)) => {
+                r#"SELECT e.id, e.name, e.entity_type, e.namespace, e.metadata, e.created_at, e.updated_at,
+                          COUNT(me.memory_id) as mention_count
+                   FROM entities e
+                   LEFT JOIN memory_entities me ON e.id = me.entity_id
+                   WHERE e.entity_type = ?1 AND e.namespace = ?2
+                   GROUP BY e.id
+                   ORDER BY mention_count DESC, e.updated_at DESC
+                   LIMIT ?3"#
+            }
+            (Some(_), None) => {
+                r#"SELECT e.id, e.name, e.entity_type, e.namespace, e.metadata, e.created_at, e.updated_at,
+                          COUNT(me.memory_id) as mention_count
+                   FROM entities e
+                   LEFT JOIN memory_entities me ON e.id = me.entity_id
+                   WHERE e.entity_type = ?1
+                   GROUP BY e.id
+                   ORDER BY mention_count DESC, e.updated_at DESC
+                   LIMIT ?3"#
+            }
+            (None, Some(_)) => {
+                r#"SELECT e.id, e.name, e.entity_type, e.namespace, e.metadata, e.created_at, e.updated_at,
+                          COUNT(me.memory_id) as mention_count
+                   FROM entities e
+                   LEFT JOIN memory_entities me ON e.id = me.entity_id
+                   WHERE e.namespace = ?2
+                   GROUP BY e.id
+                   ORDER BY mention_count DESC, e.updated_at DESC
+                   LIMIT ?3"#
+            }
+            (None, None) => {
+                r#"SELECT e.id, e.name, e.entity_type, e.namespace, e.metadata, e.created_at, e.updated_at,
+                          COUNT(me.memory_id) as mention_count
+                   FROM entities e
+                   LEFT JOIN memory_entities me ON e.id = me.entity_id
+                   GROUP BY e.id
+                   ORDER BY mention_count DESC, e.updated_at DESC
+                   LIMIT ?3"#
+            }
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let et = entity_type.unwrap_or("");
+        let ns = namespace.unwrap_or("");
+        let rows = stmt.query_map(params![et, ns, limit as i64], |row| {
+            Ok((
+                EntityRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    entity_type: row.get(2)?,
+                    namespace: row.get(3)?,
+                    metadata: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                },
+                row.get::<_, i64>(7)? as usize,
+            ))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Get entity statistics: (entity_count, relation_count, link_count).
+    pub fn entity_stats(&self) -> Result<(usize, usize, usize), rusqlite::Error> {
+        let entity_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM entities",
+            [],
+            |row| row.get(0),
+        )?;
+        let relation_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM entity_relations",
+            [],
+            |row| row.get(0),
+        )?;
+        let link_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_entities",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((entity_count as usize, relation_count as usize, link_count as usize))
+    }
+
+    /// Get memories that have no entity links (for backfill/extraction).
+    ///
+    /// Returns `(memory_id, content, namespace)` triples.
+    pub fn get_memories_without_entities(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String)>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT m.id, m.content, COALESCE(m.namespace, 'default') as ns
+            FROM memories m
+            LEFT JOIN memory_entities me ON m.id = me.memory_id
+            WHERE me.entity_id IS NULL
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 }

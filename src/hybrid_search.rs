@@ -63,6 +63,7 @@ impl Default for HybridSearchOpts {
 /// * `query_vector` - Query embedding vector (if available)
 /// * `query_text` - Query text for FTS
 /// * `opts` - Search options
+/// * `model` - Embedding model identifier (e.g., "ollama/nomic-embed-text")
 ///
 /// # Returns
 ///
@@ -72,6 +73,7 @@ pub fn hybrid_search(
     query_vector: Option<&[f32]>,
     query_text: &str,
     opts: HybridSearchOpts,
+    model: &str,
 ) -> Result<Vec<HybridSearchResult>, Box<dyn std::error::Error>> {
     let ns = opts.namespace.as_deref();
     let fetch_limit = opts.limit * 3; // Fetch more to combine
@@ -93,7 +95,7 @@ pub fn hybrid_search(
     
     // Get vector results if query vector provided
     let vector_scores: HashMap<String, f64> = if let Some(qvec) = query_vector {
-        let embeddings = storage.get_embeddings_in_namespace(ns)?;
+        let embeddings = storage.get_embeddings_in_namespace(ns, model)?;
         
         embeddings
             .iter()
@@ -169,6 +171,7 @@ pub fn hybrid_search(
 /// * `query_vector` - Query embedding vector (if available)
 /// * `query_text` - Query text for FTS
 /// * `limit` - Maximum results to return
+/// * `model` - Embedding model identifier
 ///
 /// # Returns
 ///
@@ -178,6 +181,7 @@ pub fn adaptive_hybrid_search(
     query_vector: Option<&[f32]>,
     query_text: &str,
     limit: usize,
+    model: &str,
 ) -> Result<Vec<HybridSearchResult>, Box<dyn std::error::Error>> {
     let fetch_limit = limit * 3;
     
@@ -187,7 +191,7 @@ pub fn adaptive_hybrid_search(
     
     // Get vector results
     let vector_scores: HashMap<String, f64> = if let Some(qvec) = query_vector {
-        let embeddings = storage.get_embeddings_in_namespace(None)?;
+        let embeddings = storage.get_embeddings_in_namespace(None, model)?;
         
         let mut scores: Vec<(String, f64)> = embeddings
             .iter()
@@ -308,6 +312,7 @@ pub fn reciprocal_rank_fusion(
     query_text: &str,
     limit: usize,
     k: f64, // RRF constant, typically 60
+    model: &str,
 ) -> Result<Vec<HybridSearchResult>, Box<dyn std::error::Error>> {
     let fetch_limit = limit * 3;
     
@@ -321,7 +326,7 @@ pub fn reciprocal_rank_fusion(
     
     // Get vector results
     let vector_ranks: HashMap<String, usize> = if let Some(qvec) = query_vector {
-        let embeddings = storage.get_embeddings_in_namespace(None)?;
+        let embeddings = storage.get_embeddings_in_namespace(None, model)?;
         
         let mut scored: Vec<(String, f64)> = embeddings
             .iter()

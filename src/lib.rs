@@ -91,6 +91,7 @@
 pub mod anomaly;
 pub mod bus;
 pub mod confidence;
+pub mod entities;
 pub mod config;
 pub mod embeddings;
 pub mod extractor;
@@ -108,6 +109,7 @@ pub use embeddings::{EmbeddingConfig, EmbeddingProvider, EmbeddingError};
 pub use extractor::{MemoryExtractor, ExtractedFact, AnthropicExtractor, AnthropicExtractorConfig, TokenProvider, OllamaExtractor, OllamaExtractorConfig};
 pub use memory::Memory;
 pub use storage::EmbeddingStats;
+pub use storage::EntityRecord;
 pub use types::{AclEntry, CrossLink, HebbianLink, MemoryLayer, MemoryRecord, MemoryStats, MemoryType, Permission, RecallResult, RecallWithAssociationsResult};
 
 // Re-export new modules

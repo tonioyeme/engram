@@ -121,6 +121,21 @@ enum Commands {
         #[arg(long, short = 'j')]
         json: bool,
     },
+
+    /// Fetch the N most recent memories (chronological, no query needed)
+    RecallRecent {
+        /// Maximum number of results
+        #[arg(long, short = 'l', default_value = "50")]
+        limit: usize,
+
+        /// Namespace to search (use "*" for all)
+        #[arg(long, short = 'n', default_value = "default")]
+        ns: String,
+
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
     
     /// Show memory statistics
     Stats {
@@ -380,6 +395,18 @@ enum Commands {
         #[arg(long, short = 'j')]
         json: bool,
     },
+    
+    // === Entity Management ===
+    
+    /// Manage entity index
+    Entities {
+        #[command(subcommand)]
+        command: Option<EntityCommand>,
+        
+        /// Filter by entity type (project, person, technology, etc.)
+        #[arg(long, short = 't')]
+        entity_type: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -437,6 +464,27 @@ enum BusAction {
         /// Output as JSON
         #[arg(long, short = 'j')]
         json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EntityCommand {
+    /// Run backfill on existing memories
+    Backfill {
+        /// Batch size (default: 500)
+        #[arg(long, default_value = "500")]
+        batch_size: usize,
+    },
+    /// Show entity statistics
+    Stats,
+    /// List entities (default view)
+    List {
+        /// Filter by entity type
+        #[arg(long, short = 't')]
+        entity_type: Option<String>,
+        /// Max entities to show
+        #[arg(long, default_value = "20")]
+        limit: usize,
     },
 }
 
@@ -699,6 +747,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
+        Commands::RecallRecent { limit, ns, json } => {
+            let ns_opt = if ns == "default" { None } else { Some(ns.as_str()) };
+            let records = mem.recall_recent(limit, ns_opt)?;
+            
+            if json {
+                println!("{}", serde_json::to_string_pretty(&records)?);
+            } else {
+                if records.is_empty() {
+                    println!("No recent memories.");
+                } else {
+                    println!("Recent {} memories (newest first):", records.len());
+                    for r in &records {
+                        let age = chrono::Utc::now() - r.created_at;
+                        let age_str = if age.num_hours() < 1 {
+                            format!("{}m ago", age.num_minutes())
+                        } else if age.num_hours() < 24 {
+                            format!("{}h ago", age.num_hours())
+                        } else {
+                            format!("{}d ago", age.num_days())
+                        };
+                        println!("[{}] ({}) [{}] {}", age_str, r.memory_type, r.layer, r.content);
+                    }
+                }
+            }
+        }
+
         Commands::Stats { ns, json } => {
             let stats = mem.stats_ns(ns.as_deref())?;
             
@@ -1174,6 +1248,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!();
                     println!("Note: Embedding is disabled because Ollama was not available when the");
                     println!("      memory system was initialized. Start Ollama and restart to enable.");
+                }
+            }
+        }
+        
+        // === Entity Management ===
+        
+        Commands::Entities { command, entity_type } => {
+            match command {
+                Some(EntityCommand::Backfill { batch_size }) => {
+                    println!("⏳ Backfilling entities from existing memories...");
+                    let (processed, entities, relations) = mem.backfill_entities(batch_size)?;
+                    println!("✅ Processed: {} memories, {} entities, {} relations", 
+                        processed, entities, relations);
+                }
+                Some(EntityCommand::Stats) => {
+                    let (entity_count, relation_count, link_count) = mem.entity_stats()?;
+                    println!("📊 Entity Index:");
+                    println!("  Entities:  {:>5}", entity_count);
+                    println!("  Relations: {:>5}", relation_count);
+                    println!("  Links:     {:>5}", link_count);
+                }
+                Some(EntityCommand::List { entity_type: list_type, limit }) => {
+                    let filter_type = list_type.as_deref();
+                    let entities = mem.list_entities(filter_type, None, limit)?;
+                    
+                    if entities.is_empty() {
+                        println!("No entities found.");
+                    } else {
+                        let type_label = filter_type.map(|t| format!(" [{}]", t)).unwrap_or_default();
+                        println!("📊 Entities{} (top {}):", type_label, entities.len());
+                        for (entity, mentions) in &entities {
+                            println!("  {:<20} [{:<12}] {:>3} mentions", entity.name, entity.entity_type, mentions);
+                        }
+                    }
+                }
+                None => {
+                    // Default: list top 20 entities by mention count, filtered by --type if given
+                    let filter_type = entity_type.as_deref();
+                    let entities = mem.list_entities(filter_type, None, 20)?;
+                    
+                    if entities.is_empty() {
+                        println!("No entities found.");
+                    } else {
+                        let type_label = filter_type.map(|t| format!(" [{}]", t)).unwrap_or_default();
+                        println!("📊 Entities{} (top {}):", type_label, entities.len());
+                        for (entity, mentions) in &entities {
+                            println!("  {:<20} [{:<12}] {:>3} mentions", entity.name, entity.entity_type, mentions);
+                        }
+                    }
                 }
             }
         }

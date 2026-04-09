@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::bus::EmotionalBus;
 use crate::config::MemoryConfig;
 use crate::embeddings::{EmbeddingConfig, EmbeddingProvider, EmbeddingError};
+use crate::entities::EntityExtractor;
 use crate::extractor::MemoryExtractor;
 use crate::models::{effective_strength, retrieval_activation, run_consolidation_cycle};
 use crate::storage::{Storage, EmbeddingStats};
@@ -33,6 +34,8 @@ pub struct Memory {
     embedding: Option<EmbeddingProvider>,
     /// Optional LLM-based memory extractor for converting raw text to structured facts
     extractor: Option<Box<dyn MemoryExtractor>>,
+    /// Entity extractor for identifying entities in memory content
+    entity_extractor: EntityExtractor,
 }
 
 impl Memory {
@@ -61,6 +64,8 @@ impl Memory {
             None
         };
 
+        let entity_extractor = EntityExtractor::new(&config.entity_config);
+
         let mut mem = Self {
             storage,
             config,
@@ -69,6 +74,7 @@ impl Memory {
             emotional_bus: None,
             embedding,
             extractor: None,
+            entity_extractor,
         };
         
         // Auto-configure extractor from environment/config
@@ -102,6 +108,8 @@ impl Memory {
             )));
         }
 
+        let entity_extractor = EntityExtractor::new(&config.entity_config);
+
         let mut mem = Self {
             storage,
             config,
@@ -110,6 +118,7 @@ impl Memory {
             emotional_bus: None,
             embedding: Some(embedding),
             extractor: None,
+            entity_extractor,
         };
         
         // Auto-configure extractor from environment/config
@@ -144,6 +153,8 @@ impl Memory {
             None
         };
 
+        let entity_extractor = EntityExtractor::new(&config.entity_config);
+
         let mut mem = Self {
             storage,
             config,
@@ -152,6 +163,7 @@ impl Memory {
             emotional_bus: None,
             embedding,
             extractor: None,
+            entity_extractor,
         };
         
         // Auto-configure extractor from environment/config
@@ -191,6 +203,8 @@ impl Memory {
             None
         };
         
+        let entity_extractor = EntityExtractor::new(&config.entity_config);
+
         let mut mem = Self {
             storage,
             config,
@@ -199,6 +213,7 @@ impl Memory {
             emotional_bus,
             embedding,
             extractor: None,
+            entity_extractor,
         };
         
         // Auto-configure extractor from environment/config
@@ -549,13 +564,53 @@ impl Memory {
                     self.storage.store_embedding(
                         &id,
                         &embedding,
-                        &self.config.embedding.model,
+                        &self.config.embedding.model_id(),
                         self.config.embedding.dimensions,
                     )?;
                 }
                 Err(e) => {
                     // Log warning but don't fail — memory is stored, just not embedded
                     log::warn!("Failed to generate embedding for memory {}: {}", id, e);
+                }
+            }
+        }
+        
+        // Entity extraction
+        if self.config.entity_config.enabled {
+            let entities = self.entity_extractor.extract(content);
+            let mut entity_ids = Vec::new();
+            
+            for entity in &entities {
+                match self.storage.upsert_entity(
+                    &entity.normalized,
+                    entity.entity_type.as_str(),
+                    ns,
+                    None,
+                ) {
+                    Ok(eid) => {
+                        if let Err(e) = self.storage.link_memory_entity(&id, &eid, "mention") {
+                            log::warn!("Failed to link memory {} to entity {}: {}", id, eid, e);
+                        }
+                        entity_ids.push(eid);
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to upsert entity '{}': {}", entity.normalized, e);
+                    }
+                }
+            }
+            
+            // Co-occurrence relations (capped at 10 to avoid O(n²))
+            let cap = entity_ids.len().min(10);
+            for i in 0..cap {
+                for j in (i + 1)..cap {
+                    if let Err(e) = self.storage.upsert_entity_relation(
+                        &entity_ids[i],
+                        &entity_ids[j],
+                        "co_occurs",
+                        ns,
+                    ) {
+                        log::warn!("Failed to upsert entity relation: {}", e);
+                    }
                 }
             }
         }
@@ -666,8 +721,9 @@ impl Memory {
                 }
             };
             
-            // Get all embeddings for namespace
-            let stored_embeddings = self.storage.get_embeddings_in_namespace(Some(ns))?;
+            // Get all embeddings for namespace and current model
+            let model_id = self.config.embedding.model_id();
+            let stored_embeddings = self.storage.get_embeddings_in_namespace(Some(ns), &model_id)?;
             
             // If no embedded memories, fall back to FTS
             if stored_embeddings.is_empty() {
@@ -694,10 +750,21 @@ impl Memory {
                 fts_score_map.insert(record.id.clone(), score);
             }
             
-            // Merge candidate IDs from both embedding and FTS
+            // Entity-based recall (4th channel)
+            let (entity_scores, entity_w) = if self.config.entity_config.enabled {
+                let es = self.entity_recall(query, Some(ns), limit * 3)?;
+                (es, self.config.entity_weight)
+            } else {
+                (HashMap::new(), 0.0)
+            };
+            
+            // Merge candidate IDs from embedding, FTS, and entity recall
             let mut all_ids: std::collections::HashSet<String> = similarity_map.keys().cloned().collect();
             for record in &fts_results {
                 all_ids.insert(record.id.clone());
+            }
+            for id in entity_scores.keys() {
+                all_ids.insert(id.clone());
             }
             
             // Get candidate memories
@@ -708,11 +775,25 @@ impl Memory {
                 }
             }
             
-            // Score each candidate with combined FTS + embedding + ACT-R
-            // Weights are configurable via MemoryConfig (default: 15% FTS, 60% embedding, 25% ACT-R)
-            let fts_weight = self.config.fts_weight;
-            let emb_weight = self.config.embedding_weight;
-            let actr_weight = self.config.actr_weight;
+            // Score each candidate with combined FTS + embedding + ACT-R + entity
+            // Weights are configurable via MemoryConfig, runtime-normalized to sum to 1.0
+            let raw_fts_weight = self.config.fts_weight;
+            let raw_emb_weight = self.config.embedding_weight;
+            let raw_actr_weight = self.config.actr_weight;
+            let raw_entity_weight = entity_w;
+            
+            // Runtime normalization — always divide by sum (handles any user config)
+            let total_weight = raw_fts_weight + raw_emb_weight + raw_actr_weight + raw_entity_weight;
+            let (fts_weight, emb_weight, actr_weight, ent_weight) = if total_weight > 0.0 {
+                (
+                    raw_fts_weight / total_weight,
+                    raw_emb_weight / total_weight,
+                    raw_actr_weight / total_weight,
+                    raw_entity_weight / total_weight,
+                )
+            } else {
+                (0.25, 0.25, 0.25, 0.25)
+            };
             
             let mut scored: Vec<_> = candidates
                 .into_iter()
@@ -726,6 +807,9 @@ impl Memory {
                     
                     // Get FTS score (0 if not in FTS results)
                     let fts_score = fts_score_map.get(&record.id).copied().unwrap_or(0.0);
+                    
+                    // Get entity score (0 if not in entity results)
+                    let entity_score = entity_scores.get(&record.id).copied().unwrap_or(0.0);
                     
                     // Get ACT-R activation
                     let activation = retrieval_activation(
@@ -741,10 +825,11 @@ impl Memory {
                     // Normalize activation to 0..1 range (rough normalization)
                     let activation_normalized = ((activation + 10.0) / 20.0).clamp(0.0, 1.0);
                     
-                    // Combined: FTS + embedding + ACT-R
+                    // Combined: FTS + embedding + ACT-R + entity
                     let combined_score = (fts_weight * fts_score)
                         + (emb_weight * embedding_score as f64)
-                        + (actr_weight * activation_normalized);
+                        + (actr_weight * activation_normalized)
+                        + (ent_weight * entity_score);
                     
                     (record, combined_score, activation)
                 })
@@ -793,6 +878,72 @@ impl Memory {
             // No embedding provider, use FTS fallback
             self.recall_fts(query, limit, &context, min_conf, ns, now)
         }
+    }
+
+    /// Fetch the N most recently created memories, ordered newest-first.
+    ///
+    /// No query string needed — pure chronological retrieval.
+    /// Designed for session bootstrap: after restart, inject recent context
+    /// so the agent doesn't start from zero.
+    ///
+    /// # Arguments
+    ///
+    /// * `limit` - Maximum number of memories to return
+    /// * `namespace` - Namespace filter (None = "default", Some("*") = all)
+    pub fn recall_recent(
+        &self,
+        limit: usize,
+        namespace: Option<&str>,
+    ) -> Result<Vec<MemoryRecord>, Box<dyn std::error::Error>> {
+        let records = self.storage.fetch_recent(limit, namespace)?;
+        Ok(records)
+    }
+    
+    /// Entity-based recall: extract entities from query, look up matching entities,
+    /// return memory→score mapping (0.0-1.0 normalized).
+    ///
+    /// Direct entity matches get full score, 1-hop related entities get half score.
+    /// Scores are normalized to 0.0-1.0 by dividing by the maximum score.
+    fn entity_recall(
+        &self,
+        query: &str,
+        namespace: Option<&str>,
+        limit: usize,
+    ) -> Result<HashMap<String, f64>, Box<dyn std::error::Error>> {
+        let _ = limit; // limit is implicit via the number of entity matches
+        let query_entities = self.entity_extractor.extract(query);
+        let mut memory_scores: HashMap<String, f64> = HashMap::new();
+        
+        for qe in &query_entities {
+            // Direct entity match (exact name)
+            let matches = self.storage.find_entities(&qe.normalized, namespace, 5)?;
+            for entity in &matches {
+                let memory_ids = self.storage.get_entity_memories(&entity.id)?;
+                for mid in memory_ids {
+                    *memory_scores.entry(mid).or_insert(0.0) += 1.0;
+                }
+                
+                // 1-hop related entities (weaker signal)
+                let related = self.storage.get_related_entities(&entity.id, 10)?;
+                for (rel_id, _relation) in related {
+                    let rel_memories = self.storage.get_entity_memories(&rel_id)?;
+                    for mid in rel_memories {
+                        *memory_scores.entry(mid).or_insert(0.0) += 0.5;
+                    }
+                }
+            }
+        }
+        
+        // Normalize scores to 0.0-1.0
+        if let Some(&max_score) = memory_scores.values().max_by(|a, b| a.partial_cmp(b).unwrap()) {
+            if max_score > 0.0 {
+                for score in memory_scores.values_mut() {
+                    *score /= max_score;
+                }
+            }
+        }
+        
+        Ok(memory_scores)
     }
     
     /// FTS-based recall fallback when embeddings are not available.
@@ -1124,12 +1275,12 @@ impl Memory {
         if let Some(ref embedding_provider) = self.embedding {
             match embedding_provider.embed(new_content) {
                 Ok(embedding) => {
-                    // Delete old embedding and store new one
-                    self.storage.delete_embedding(memory_id)?;
+                    // Delete old embedding for this model and store new one
+                    self.storage.delete_embedding(memory_id, &self.config.embedding.model_id())?;
                     self.storage.store_embedding(
                         memory_id,
                         &embedding,
-                        &self.config.embedding.model,
+                        &self.config.embedding.model_id(),
                         self.config.embedding.dimensions,
                     )?;
                 }
@@ -1230,6 +1381,7 @@ impl Memory {
             query_vector.as_deref(),
             query,
             opts,
+            &self.config.embedding.model_id(),
         )?;
         
         // Convert HybridSearchResult to RecallResult
@@ -1564,14 +1716,15 @@ impl Memory {
                 as Box<dyn std::error::Error>
         })?;
         
-        let missing_ids = self.storage.get_memories_without_embeddings()?;
+        let model_id = self.config.embedding.model_id();
+        let missing_ids = self.storage.get_memories_without_embeddings(&model_id)?;
         let total = missing_ids.len();
         
         if total == 0 {
             return Ok(0);
         }
         
-        log::info!("Reindexing {} memories without embeddings", total);
+        log::info!("Reindexing {} memories without embeddings for model {}", total, model_id);
         
         let mut reindexed = 0;
         for id in missing_ids {
@@ -1581,7 +1734,7 @@ impl Memory {
                         self.storage.store_embedding(
                             &id,
                             &embedding,
-                            &self.config.embedding.model,
+                            &model_id,
                             self.config.embedding.dimensions,
                         )?;
                         reindexed += 1;
@@ -1613,7 +1766,8 @@ impl Memory {
                 as Box<dyn std::error::Error>
         })?;
         
-        let missing_ids = self.storage.get_memories_without_embeddings()?;
+        let model_id = self.config.embedding.model_id();
+        let missing_ids = self.storage.get_memories_without_embeddings(&model_id)?;
         let total = missing_ids.len();
         
         if total == 0 {
@@ -1630,7 +1784,7 @@ impl Memory {
                         self.storage.store_embedding(
                             &id,
                             &embedding,
-                            &self.config.embedding.model,
+                            &model_id,
                             self.config.embedding.dimensions,
                         )?;
                         reindexed += 1;
@@ -1956,6 +2110,70 @@ impl Memory {
     ) -> Result<Vec<Notification>, Box<dyn std::error::Error>> {
         let mgr = SubscriptionManager::new(self.storage.connection())?;
         Ok(mgr.peek_notifications(agent_id)?)
+    }
+
+    /// Extract entities from existing memories that don't have entity links yet.
+    /// Returns (processed_count, entity_count, relation_count).
+    pub fn backfill_entities(&self, batch_size: usize) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
+        let unlinked = self.storage.get_memories_without_entities(batch_size)?;
+        let mut entity_count = 0;
+        let mut relation_count = 0;
+        let processed = unlinked.len();
+
+        for (memory_id, content, ns) in &unlinked {
+            let entities = self.entity_extractor.extract(content);
+            let mut entity_ids = Vec::new();
+
+            for entity in &entities {
+                match self.storage.upsert_entity(
+                    &entity.normalized,
+                    entity.entity_type.as_str(),
+                    ns,
+                    None,
+                ) {
+                    Ok(eid) => {
+                        let _ = self.storage.link_memory_entity(memory_id, &eid, "mention");
+                        entity_ids.push(eid);
+                        entity_count += 1;
+                    }
+                    Err(e) => {
+                        log::warn!("Entity upsert failed during backfill: {}", e);
+                    }
+                }
+            }
+
+            // Co-occurrence (capped at 10)
+            let cap = entity_ids.len().min(10);
+            for i in 0..cap {
+                for j in (i + 1)..cap {
+                    if self
+                        .storage
+                        .upsert_entity_relation(&entity_ids[i], &entity_ids[j], "co_occurs", ns)
+                        .is_ok()
+                    {
+                        relation_count += 1;
+                    }
+                }
+            }
+        }
+
+        Ok((processed, entity_count, relation_count))
+    }
+
+    /// Get entity statistics: (entity_count, relation_count, link_count).
+    pub fn entity_stats(&self) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
+        Ok(self.storage.entity_stats()?)
+    }
+
+    /// List entities, optionally filtered by type and namespace.
+    /// Returns (EntityRecord, mention_count) pairs ordered by mention count descending.
+    pub fn list_entities(
+        &self,
+        entity_type: Option<&str>,
+        namespace: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(crate::storage::EntityRecord, usize)>, Box<dyn std::error::Error>> {
+        Ok(self.storage.list_entities(entity_type, namespace, limit)?)
     }
 
     fn compute_confidence(&self, record: &MemoryRecord, activation: f64) -> f64 {

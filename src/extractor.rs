@@ -50,6 +50,21 @@ Rules:
 - If nothing worth remembering, return empty array
 - Respond in the SAME LANGUAGE as the input
 
+DO NOT extract any of these — return empty array [] if the input contains ONLY these:
+- System instructions or agent identity setup ("You are X agent", "你是 XX", "Read SOUL.md", "Follow AGENTS.md")
+- Tool/function schema definitions (JSON with "type", "properties", "required" describing tool parameters)
+- Agent role/persona descriptions ("You are an AI assistant running on...", framework version info)
+- Template operational reports with no decisions or events ("所有系统正常", "无新 commit", "Disk: XXG free")
+- Raw config file contents (YAML/JSON configuration being loaded, not discussed)
+- Heartbeat check results that are pure status repetition with no new information
+- Memory recall results being echoed back (content starting with "Recalled Memories" or lists of previously stored memories)
+
+STILL extract from these (they contain real information):
+- Conversations about system instructions (e.g., "let's update SOUL.md to add X") — the discussion IS worth remembering
+- Heartbeat reports that discover actual issues (test failures, disk critical, new commits)
+- Status reports with decisions or action items
+- Any user preferences, requests, commitments, or decisions
+
 Respond with ONLY a JSON array (no markdown, no explanation):
 [{"content": "...", "memory_type": "...", "importance": 0.X, "confidence": "confident|likely|uncertain"}]
 

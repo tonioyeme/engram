@@ -267,9 +267,11 @@ Engram 的用户（potato + RustClaw）中英混用。embedding-based recall 缓
 
 ---
 
-## ISS-007 [improvement] [P1] [open]
+## ISS-007 [improvement] [P1] [closed]
 **标题**: Recall 结果缺少 confidence score — 无法区分高相关与噪声
 **发现日期**: 2026-04-05
+**关闭日期**: 2026-04-09
+**修复 commit**: `c03a339`
 **发现者**: RustClaw
 **组件**: recall (confidence scoring)
 **跨项目引用**: rustclaw (auto-recall hook 需要 confidence 做过滤)

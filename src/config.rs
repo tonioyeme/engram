@@ -86,6 +86,19 @@ pub struct MemoryConfig {
     /// Note: fts_weight + embedding_weight + actr_weight should sum to ~1.0
     pub actr_weight: f64,
     
+    /// Sigmoid center for ACT-R activation normalization.
+    /// Controls the "midpoint age" — memories with activation near this value
+    /// get normalized to ~0.5. Default -5.5 ≈ 1-day-old single-access memory.
+    /// Lower values shift the curve to favor older memories.
+    #[serde(default = "default_actr_sigmoid_center")]
+    pub actr_sigmoid_center: f64,
+    
+    /// Sigmoid scale for ACT-R activation normalization.
+    /// Controls steepness: smaller = sharper transition, larger = gentler.
+    /// Default 1.5 gives good discrimination across the 1min–30day range.
+    #[serde(default = "default_actr_sigmoid_scale")]
+    pub actr_sigmoid_scale: f64,
+    
     // === Entity extraction ===
     /// Entity extraction configuration
     #[serde(default)]
@@ -105,6 +118,14 @@ pub struct MemoryConfig {
 
 fn default_entity_weight() -> f64 {
     0.15
+}
+
+fn default_actr_sigmoid_center() -> f64 {
+    -5.5
+}
+
+fn default_actr_sigmoid_scale() -> f64 {
+    1.5
 }
 
 fn default_dedup_enabled() -> bool {
@@ -147,6 +168,8 @@ impl Default for MemoryConfig {
             fts_weight: 0.15,        // 15% exact matching
             embedding_weight: 0.60,   // 60% semantic similarity
             actr_weight: 0.25,        // 25% recency/frequency/importance
+            actr_sigmoid_center: default_actr_sigmoid_center(),
+            actr_sigmoid_scale: default_actr_sigmoid_scale(),
             entity_config: EntityConfig::default(),
             entity_weight: default_entity_weight(),
             dedup_enabled: default_dedup_enabled(),

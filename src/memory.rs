@@ -871,8 +871,12 @@ impl Memory {
                         self.config.contradiction_penalty,
                     );
                     
-                    // Normalize activation to 0..1 range (rough normalization)
-                    let activation_normalized = ((activation + 10.0) / 20.0).clamp(0.0, 1.0);
+                    // Normalize activation to 0..1 range (sigmoid — much better discrimination than linear)
+                    let activation_normalized = crate::models::actr::normalize_activation(
+                        activation,
+                        self.config.actr_sigmoid_center,
+                        self.config.actr_sigmoid_scale,
+                    );
                     
                     // Combined: FTS + embedding + ACT-R + entity
                     let combined_score = (fts_weight * fts_score)

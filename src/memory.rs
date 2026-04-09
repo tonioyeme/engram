@@ -891,9 +891,15 @@ impl Memory {
             let results: Vec<_> = scored
                 .into_iter()
                 .take(limit)
-                .map(|(record, combined_score, activation)| {
-                    // Use combined score as confidence
-                    let confidence = combined_score.clamp(0.0, 1.0);
+                .map(|(record, _combined_score, activation)| {
+                    // Compute confidence from individual signals (not combined_score)
+                    let age_hours = (now - record.created_at).num_seconds() as f64 / 3600.0;
+                    let confidence = compute_query_confidence(
+                        similarity_map.get(&record.id).copied(),
+                        fts_score_map.contains_key(&record.id),
+                        entity_scores.get(&record.id).copied().unwrap_or(0.0),
+                        age_hours,
+                    );
                     let confidence_label = confidence_label(confidence);
 
                     RecallResult {
@@ -1030,7 +1036,13 @@ impl Memory {
             .into_iter()
             .take(limit)
             .map(|(record, activation)| {
-                let confidence = self.compute_confidence(&record, activation);
+                let age_hours = (now - record.created_at).num_seconds() as f64 / 3600.0;
+                let confidence = compute_query_confidence(
+                    None,       // no embedding available in FTS path
+                    true,       // it's an FTS result by definition
+                    0.0,        // no entity score in FTS path
+                    age_hours,
+                );
                 let confidence_label = confidence_label(confidence);
 
                 RecallResult {
@@ -1518,7 +1530,13 @@ impl Memory {
                         self.config.importance_weight,
                         self.config.contradiction_penalty,
                     );
-                    let confidence = self.compute_confidence(&record, activation);
+                    let age_hours = (now - record.created_at).num_seconds() as f64 / 3600.0;
+                    let confidence = compute_query_confidence(
+                        None,   // no embedding in causal recall path
+                        false,  // not an FTS query match
+                        0.0,    // no entity score
+                        age_hours,
+                    );
                     (record, activation, confidence)
                 })
                 .filter(|(_, _, conf)| *conf >= min_confidence)
@@ -1646,7 +1664,13 @@ impl Memory {
                         self.config.importance_weight,
                         self.config.contradiction_penalty,
                     );
-                    let confidence = self.compute_confidence(&record, activation);
+                    let age_hours = (now - record.created_at).num_seconds() as f64 / 3600.0;
+                    let confidence = compute_query_confidence(
+                        None,   // no embedding in session WM path
+                        false,  // not an FTS query match
+                        0.0,    // no entity score
+                        age_hours,
+                    );
                     
                     if min_confidence.map(|mc| confidence >= mc).unwrap_or(true) {
                         cached_results.push(RecallResult {
@@ -2009,7 +2033,13 @@ impl Memory {
             .into_iter()
             .take(limit)
             .map(|(record, activation)| {
-                let confidence = self.compute_confidence(&record, activation);
+                let age_hours = (now - record.created_at).num_seconds() as f64 / 3600.0;
+                let confidence = compute_query_confidence(
+                    None,   // no embedding in associations path
+                    false,  // not an FTS query match
+                    0.0,    // no entity score
+                    age_hours,
+                );
                 let confidence_label = confidence_label(confidence);
                 
                 RecallResult {
@@ -2225,11 +2255,64 @@ impl Memory {
         Ok(self.storage.list_entities(entity_type, namespace, limit)?)
     }
 
-    fn compute_confidence(&self, record: &MemoryRecord, activation: f64) -> f64 {
-        // Simple confidence heuristic: normalize activation + importance
-        let normalized_activation = (activation + 10.0) / 20.0; // Rough normalization
-        let confidence = (normalized_activation.max(0.0).min(1.0) * 0.7) + (record.importance * 0.3);
-        confidence.max(0.0).min(1.0)
+}
+
+/// Compute confidence score (0.0-1.0) for a recall result.
+///
+/// Unlike the ranking score (combined_score), confidence measures how certain
+/// we are that this memory is genuinely relevant to the query.
+///
+/// Signals:
+/// - embedding_similarity: cosine sim of query vs memory embedding (strongest signal)
+/// - in_fts_results: whether FTS found this memory (keyword overlap = confidence boost)
+/// - entity_score: entity overlap score 0-1 (topical relevance)
+/// - age_hours: memory age in hours (mild recency boost for very recent memories)
+fn compute_query_confidence(
+    embedding_similarity: Option<f32>,  // None if no embedding available
+    in_fts_results: bool,
+    entity_score: f64,  // 0.0 if no entity match or entity disabled
+    age_hours: f64,
+) -> f64 {
+    let mut confidence = 0.0;
+    let mut max_possible = 0.0;
+
+    // Signal 1: Embedding similarity (weight: 0.55)
+    if let Some(sim) = embedding_similarity {
+        let sim = sim as f64;
+        // Apply sigmoid-like curve to sharpen discrimination
+        // sim > 0.7 → strong confidence, sim < 0.3 → near zero
+        let emb_conf = if sim > 0.0 {
+            // Logistic function centered at 0.5 with steepness 10
+            1.0 / (1.0 + (-10.0 * (sim - 0.5)).exp())
+        } else {
+            0.0
+        };
+        confidence += 0.55 * emb_conf;
+        max_possible += 0.55;
+    }
+
+    // Signal 2: FTS match (weight: 0.20)
+    if in_fts_results {
+        confidence += 0.20;
+    }
+    max_possible += 0.20;
+
+    // Signal 3: Entity overlap (weight: 0.20)
+    confidence += 0.20 * entity_score;
+    max_possible += 0.20;
+
+    // Signal 4: Recency boost (weight: 0.05)
+    // Very recent memories get a small confidence boost
+    // 1 hour ago → ~1.0, 24 hours → ~0.5, 7 days → ~0.1
+    let recency = 1.0 / (1.0 + (age_hours / 24.0).ln().max(0.0));
+    confidence += 0.05 * recency.clamp(0.0, 1.0);
+    max_possible += 0.05;
+
+    // Normalize by max possible (handles case where embedding is unavailable)
+    if max_possible > 0.0 {
+        (confidence / max_possible).clamp(0.0, 1.0)
+    } else {
+        0.0
     }
 }
 
@@ -2256,5 +2339,102 @@ fn detect_feedback_polarity(feedback: &str) -> f64 {
         -1.0
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod confidence_tests {
+    use super::*;
+
+    #[test]
+    fn test_confidence_high_embedding_sim() {
+        // High embedding sim + FTS + entity → high confidence
+        let c = compute_query_confidence(Some(0.85), true, 0.8, 1.0);
+        assert!(c > 0.8, "expected high confidence, got {c}");
+        assert_eq!(confidence_label(c), "high");
+    }
+
+    #[test]
+    fn test_confidence_low_embedding_sim() {
+        // Low embedding sim, no FTS, no entity → low confidence
+        let c = compute_query_confidence(Some(0.2), false, 0.0, 720.0);
+        assert!(c < 0.3, "expected low confidence, got {c}");
+    }
+
+    #[test]
+    fn test_confidence_medium_embedding_sim() {
+        // Medium embedding sim + FTS → medium range
+        let c = compute_query_confidence(Some(0.55), true, 0.0, 24.0);
+        assert!(c > 0.3 && c < 0.8, "expected medium confidence, got {c}");
+    }
+
+    #[test]
+    fn test_confidence_no_embedding() {
+        // No embedding available, FTS=true, some entity match
+        let c = compute_query_confidence(None, true, 0.5, 2.0);
+        // Without embedding, max_possible = 0.45, confidence comes from FTS + entity + recency
+        assert!(c > 0.3, "expected reasonable confidence without embedding, got {c}");
+        assert!(c < 1.0);
+    }
+
+    #[test]
+    fn test_confidence_fts_only_boost() {
+        // No embedding, FTS only, no entity
+        let c_fts = compute_query_confidence(None, true, 0.0, 24.0);
+        let c_none = compute_query_confidence(None, false, 0.0, 24.0);
+        assert!(c_fts > c_none, "FTS should boost confidence: {c_fts} > {c_none}");
+    }
+
+    #[test]
+    fn test_confidence_entity_boost() {
+        // Same embedding sim, but different entity scores
+        let c_entity = compute_query_confidence(Some(0.5), false, 0.9, 48.0);
+        let c_no_entity = compute_query_confidence(Some(0.5), false, 0.0, 48.0);
+        assert!(c_entity > c_no_entity, "entity should boost confidence: {c_entity} > {c_no_entity}");
+    }
+
+    #[test]
+    fn test_confidence_recency_boost() {
+        // Recent (1h) vs old (30 days = 720h) — same other signals
+        let c_recent = compute_query_confidence(Some(0.6), true, 0.0, 1.0);
+        let c_old = compute_query_confidence(Some(0.6), true, 0.0, 720.0);
+        assert!(c_recent > c_old, "recent should have slightly higher confidence: {c_recent} > {c_old}");
+        // But the difference should be small (recency weight is only 0.05)
+        assert!((c_recent - c_old).abs() < 0.1, "recency difference should be small");
+    }
+
+    #[test]
+    fn test_confidence_all_zero() {
+        // All signals at worst values
+        let c = compute_query_confidence(Some(0.0), false, 0.0, 8760.0); // 1 year old
+        assert!(c < 0.1, "all-zero signals should give near-zero confidence, got {c}");
+    }
+
+    #[test]
+    fn test_confidence_all_max() {
+        // All signals at best values
+        let c = compute_query_confidence(Some(0.99), true, 1.0, 0.1);
+        assert!(c > 0.9, "all-max signals should give high confidence, got {c}");
+    }
+
+    #[test]
+    fn test_confidence_label_thresholds() {
+        assert_eq!(confidence_label(0.9), "high");
+        assert_eq!(confidence_label(0.8), "high");
+        assert_eq!(confidence_label(0.79), "medium");
+        assert_eq!(confidence_label(0.5), "medium");
+        assert_eq!(confidence_label(0.49), "low");
+        assert_eq!(confidence_label(0.2), "low");
+        assert_eq!(confidence_label(0.19), "very low");
+        assert_eq!(confidence_label(0.0), "very low");
+    }
+
+    #[test]
+    fn test_confidence_sigmoid_discrimination() {
+        // The sigmoid should create clear separation between high/low sim
+        let c_high = compute_query_confidence(Some(0.8), false, 0.0, 100.0);
+        let c_low = compute_query_confidence(Some(0.3), false, 0.0, 100.0);
+        let gap = c_high - c_low;
+        assert!(gap > 0.3, "sigmoid should create large gap between 0.8 and 0.3 sim: gap={gap}");
     }
 }

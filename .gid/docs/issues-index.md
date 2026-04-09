@@ -143,7 +143,7 @@ Recall 的 recency bias 不足。ACT-R activation 的 decay parameter `d` 可能
 
 ---
 
-## ISS-003 [improvement] [P2] [open]
+## ISS-003 [improvement] [P2] [closed]
 **标题**: add() 缺少 dedup 检查 — 重复记忆导致 DB 膨胀
 **发现日期**: 2026-03-31
 **更新日期**: 2026-04-09

@@ -36,7 +36,7 @@
 
 | # | Issue | 问题 | 状态 |
 |---|-------|------|------|
-| 6 | **ISS-002** | Recency bias 不足 — ACT-R decay 让新旧记忆权重差异不够 | P1 open |
+| 6 | **ISS-002** | Recency bias 不足 — ACT-R decay 让新旧记忆权重差异不够 | ✅ closed |
 | 7 | **ISS-007** | 无 confidence score — recall 结果无法区分高相关与噪声 | P1 open |
 | 8 | **ISS-008** | Knowledge promotion — 高频记忆不自动提升到 SOUL.md/MEMORY.md | P1 open |
 
@@ -83,7 +83,7 @@
 | **B1** | Entity 索引实现 — extraction on write + entity storage + entity-aware recall | ISS-009 | ~500-800 行 | A1,A2 | todo |
 | **B2** | Dedup on write — embedding similarity check + merge 策略 | ISS-003 | ~200 行 | A3 | todo |
 | **B3** | Confidence score — 多信号融合 recall confidence 0-1 | ISS-007 | ~100 行 | B1 | todo |
-| **B4** | Recency 调参 — ACT-R decay parameter 分析 + 调整 | ISS-002 | ~20 行 + 分析 | B3 | todo |
+| **B4** | Recency 调参 — ACT-R decay parameter 分析 + 调整 | ISS-002 | ~20 行 + 分析 | B3 | ✅ done |
 
 **依赖图**：
 ```
@@ -120,7 +120,7 @@ A2 (extractor)  ───┼── A3 (SQL cleanup) ──→ B1 (entity) ──
 
 ---
 
-## ISS-002 [improvement] [P1] [open]
+## ISS-002 [improvement] [P1] [closed]
 **标题**: Recall recency bias 不足 — ACT-R decay 参数需调整
 **发现日期**: 2026-04-05
 **发现者**: RustClaw

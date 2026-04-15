@@ -4,6 +4,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
 use std::path::Path;
 
+use crate::synthesis::types::{GateScores, ProvenanceRecord};
 use crate::types::{AclEntry, CrossLink, HebbianLink, MemoryLayer, MemoryRecord, MemoryType, Permission};
 
 use std::sync::OnceLock;
@@ -44,6 +45,31 @@ fn tokenize_cjk_boundaries(text: &str) -> String {
         }
     }
     result
+}
+
+/// Tokenize a query string the same way FTS5's unicode61 tokenizer does.
+///
+/// unicode61 treats any non-alphanumeric character as a separator, splitting
+/// "2.5D" into ["2", "5D"], "v0.2.1" into ["v0", "2", "1"], etc.
+/// We must split identically so that FTS MATCH queries align with the index.
+fn tokenize_like_unicode61(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for ch in text.chars() {
+        if ch.is_alphanumeric() || is_cjk_char(ch) {
+            current.push(ch);
+        } else {
+            // Non-alphanumeric = separator (same as unicode61)
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }
 
 /// Check if a character is CJK (Chinese/Japanese/Korean).
@@ -138,8 +164,8 @@ impl Storage {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, rusqlite::Error> {
         let conn = Connection::open(path)?;
         
-        // Enable WAL mode for better concurrency
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        // Enable WAL mode for better concurrency + busy timeout for multi-process access
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
         
         // Create schema
         Self::create_schema(&conn)?;
@@ -261,6 +287,24 @@ impl Storage {
             CREATE INDEX IF NOT EXISTS idx_entity_relations_target ON entity_relations(target_id);
             CREATE INDEX IF NOT EXISTS idx_memory_entities_memory ON memory_entities(memory_id);
             CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity_id);
+
+            -- Synthesis provenance: tracks which source memories contributed to insights
+            CREATE TABLE IF NOT EXISTS synthesis_provenance (
+                id TEXT PRIMARY KEY,
+                insight_id TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                cluster_id TEXT NOT NULL,
+                synthesis_timestamp TEXT NOT NULL,
+                gate_decision TEXT NOT NULL,
+                gate_scores TEXT,
+                confidence REAL NOT NULL,
+                source_original_importance REAL,
+                FOREIGN KEY (insight_id) REFERENCES memories(id),
+                FOREIGN KEY (source_id) REFERENCES memories(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_provenance_insight ON synthesis_provenance(insight_id);
+            CREATE INDEX IF NOT EXISTS idx_provenance_source ON synthesis_provenance(source_id);
 
             -- FTS5 for full-text search (manually managed, not via triggers,
             -- so we can pre-process content for CJK/ASCII boundary tokenization)
@@ -600,7 +644,9 @@ impl Storage {
             return Ok(());
         }
         
-        // Rebuild: clear FTS and re-insert all with tokenization
+        // Rebuild: clear FTS and re-insert all with tokenization (in a transaction)
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        
         conn.execute("DELETE FROM memories_fts", [])?;
         
         let mut stmt = conn.prepare("SELECT rowid, content FROM memories")?;
@@ -621,6 +667,8 @@ impl Storage {
             "INSERT OR REPLACE INTO engram_meta VALUES ('fts_cjk_version', ?1)",
             params![FTS_CJK_VERSION],
         )?;
+        
+        conn.execute_batch("COMMIT")?;
         
         eprintln!("[engram] Rebuilt FTS index with CJK tokenization for {} memories", rows.len());
         Ok(())
@@ -709,9 +757,33 @@ impl Storage {
     }
 
     /// Update an existing memory.
+    ///
+    /// Uses an IMMEDIATE transaction to ensure atomicity of the memory update
+    /// and FTS index update, preventing corruption under multi-process access.
+    /// If already inside a transaction (e.g., called from undo_synthesis), skips
+    /// creating a new transaction to avoid "cannot start a transaction within a transaction".
     pub fn update(&mut self, record: &MemoryRecord) -> Result<(), rusqlite::Error> {
         let metadata_json = record.metadata.as_ref().map(|m| serde_json::to_string(m).ok()).flatten();
+        let needs_tx = self.conn.is_autocommit();
         
+        if needs_tx {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        
+        let result = self.update_inner(record, &metadata_json);
+        
+        if needs_tx {
+            match &result {
+                Ok(_) => self.conn.execute_batch("COMMIT")?,
+                Err(_) => { let _ = self.conn.execute_batch("ROLLBACK"); }
+            }
+        }
+        
+        result
+    }
+    
+    /// Inner update logic (always runs within a transaction context).
+    fn update_inner(&self, record: &MemoryRecord, metadata_json: &Option<String>) -> Result<(), rusqlite::Error> {
         // Get rowid for FTS update
         let rowid: i64 = self.conn.query_row(
             "SELECT rowid FROM memories WHERE id = ?",
@@ -771,7 +843,31 @@ impl Storage {
     }
 
     /// Delete a memory by ID.
+    ///
+    /// Uses an IMMEDIATE transaction to ensure atomicity of the FTS delete
+    /// and memory delete, preventing corruption under multi-process access.
+    /// If already inside a transaction, participates in the existing one.
     pub fn delete(&mut self, id: &str) -> Result<(), rusqlite::Error> {
+        let needs_tx = self.conn.is_autocommit();
+        
+        if needs_tx {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        
+        let result = self.delete_inner(id);
+        
+        if needs_tx {
+            match &result {
+                Ok(_) => self.conn.execute_batch("COMMIT")?,
+                Err(_) => { let _ = self.conn.execute_batch("ROLLBACK"); }
+            }
+        }
+        
+        result
+    }
+    
+    /// Inner delete logic (always runs within a transaction context).
+    fn delete_inner(&self, id: &str) -> Result<(), rusqlite::Error> {
         // Delete FTS entry (standalone table, delete by rowid)
         let rowid: Result<i64, _> = self.conn.query_row(
             "SELECT rowid FROM memories WHERE id = ?",
@@ -787,10 +883,12 @@ impl Storage {
         self.conn.execute("DELETE FROM memories WHERE id = ?", params![id])?;
         Ok(())
     }
-    
     /// Update just the content and metadata of a memory.
     ///
     /// Used by update_memory to change content while preserving other fields.
+    /// Uses an IMMEDIATE transaction to ensure atomicity of the memory update
+    /// and FTS index update, preventing corruption under multi-process access.
+    /// If already inside a transaction, participates in the existing one.
     pub fn update_content(
         &mut self,
         id: &str,
@@ -798,7 +896,26 @@ impl Storage {
         metadata: Option<serde_json::Value>,
     ) -> Result<(), rusqlite::Error> {
         let metadata_json = metadata.map(|m| serde_json::to_string(&m).ok()).flatten();
+        let needs_tx = self.conn.is_autocommit();
         
+        if needs_tx {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        
+        let result = self.update_content_inner(id, new_content, &metadata_json);
+        
+        if needs_tx {
+            match &result {
+                Ok(_) => self.conn.execute_batch("COMMIT")?,
+                Err(_) => { let _ = self.conn.execute_batch("ROLLBACK"); }
+            }
+        }
+        
+        result
+    }
+    
+    /// Inner update_content logic (always runs within a transaction context).
+    fn update_content_inner(&self, id: &str, new_content: &str, metadata_json: &Option<String>) -> Result<(), rusqlite::Error> {
         // Get rowid before updating
         let rowid: i64 = self.conn.query_row(
             "SELECT rowid FROM memories WHERE id = ?",
@@ -883,20 +1000,15 @@ impl Storage {
 
     /// Full-text search using FTS5.
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
-        // Tokenize CJK boundaries, then clean
+        // Tokenize CJK text first, then split like unicode61 for FTS alignment
         let tokenized = tokenize_cjk_boundaries(query);
-        let cleaned: String = tokenized
-            .chars()
-            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-            .collect();
-        
-        let words: Vec<&str> = cleaned.split_whitespace().collect();
+        let words = tokenize_like_unicode61(&tokenized);
         if words.is_empty() {
             return Ok(vec![]);
         }
         
-        // Build simple OR query for better matching
-        let fts_query = words.join(" OR ");
+        // Build OR query — each token quoted to prevent FTS5 syntax injection
+        let fts_query = words.iter().map(|w| format!("\"{}\"", w)).collect::<Vec<_>>().join(" OR ");
         
         let mut stmt = self.conn.prepare(
             r#"
@@ -972,6 +1084,18 @@ impl Storage {
         )?;
         
         let rows = stmt.query_map(params![memory_id], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// Get Hebbian neighbors with their link weights.
+    pub fn get_hebbian_links_weighted(&self, memory_id: &str) -> Result<Vec<(String, f64)>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT CASE WHEN source_id = ?1 THEN target_id ELSE source_id END, strength \
+             FROM hebbian_links WHERE (source_id = ?1 OR target_id = ?1) AND strength > 0"
+        )?;
+        let rows = stmt.query_map(params![memory_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?;
         rows.collect()
     }
 
@@ -1140,20 +1264,15 @@ impl Storage {
         limit: usize,
         namespace: Option<&str>,
     ) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
-        // Tokenize CJK boundaries, then clean
+        // Tokenize CJK text first, then split like unicode61 for FTS alignment
         let tokenized = tokenize_cjk_boundaries(query);
-        let cleaned: String = tokenized
-            .chars()
-            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-            .collect();
-        
-        let words: Vec<&str> = cleaned.split_whitespace().collect();
+        let words = tokenize_like_unicode61(&tokenized);
         if words.is_empty() {
             return Ok(vec![]);
         }
         
-        // Build simple OR query for better matching
-        let fts_query = words.join(" OR ");
+        // Build OR query — each token quoted to prevent FTS5 syntax injection
+        let fts_query = words.iter().map(|w| format!("\"{}\"", w)).collect::<Vec<_>>().join(" OR ");
         
         let ns = namespace.unwrap_or("default");
         
@@ -2000,6 +2119,15 @@ impl Storage {
         }
     }
     
+    /// Get entity IDs associated with a memory.
+    pub fn get_entity_ids_for_memory(&self, memory_id: &str) -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT entity_id FROM memory_entities WHERE memory_id = ?1"
+        )?;
+        let rows = stmt.query_map(params![memory_id], |row| row.get(0))?;
+        rows.collect()
+    }
+
     /// Get all memory IDs linked to a given entity.
     pub fn get_entity_memories(&self, entity_id: &str) -> Result<Vec<String>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
@@ -2266,5 +2394,152 @@ impl Storage {
             ))
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    // -----------------------------------------------------------------------
+    // Synthesis Provenance
+    // -----------------------------------------------------------------------
+
+    /// Record provenance for a single source memory contributing to an insight.
+    pub fn record_provenance(&self, record: &ProvenanceRecord) -> Result<(), Box<dyn std::error::Error>> {
+        self.conn.execute(
+            "INSERT INTO synthesis_provenance (id, insight_id, source_id, cluster_id, synthesis_timestamp, gate_decision, gate_scores, confidence, source_original_importance) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                record.id,
+                record.insight_id,
+                record.source_id,
+                record.cluster_id,
+                record.synthesis_timestamp.to_rfc3339(),
+                record.gate_decision,
+                record.gate_scores.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default()),
+                record.confidence,
+                record.source_original_importance,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get all source provenance records for a given insight.
+    pub fn get_insight_sources(&self, insight_id: &str) -> Result<Vec<ProvenanceRecord>, Box<dyn std::error::Error>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, insight_id, source_id, cluster_id, synthesis_timestamp, gate_decision, gate_scores, confidence, source_original_importance FROM synthesis_provenance WHERE insight_id = ?1"
+        )?;
+        let records = stmt.query_map([insight_id], |row| {
+            Self::row_to_provenance(row)
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    /// Get all insights derived from a source memory.
+    pub fn get_memory_insights(&self, source_id: &str) -> Result<Vec<ProvenanceRecord>, Box<dyn std::error::Error>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, insight_id, source_id, cluster_id, synthesis_timestamp, gate_decision, gate_scores, confidence, source_original_importance FROM synthesis_provenance WHERE source_id = ?1"
+        )?;
+        let records = stmt.query_map([source_id], |row| {
+            Self::row_to_provenance(row)
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    /// Delete all provenance records for an insight.
+    pub fn delete_provenance(&self, insight_id: &str) -> Result<usize, Box<dyn std::error::Error>> {
+        let count = self.conn.execute(
+            "DELETE FROM synthesis_provenance WHERE insight_id = ?1",
+            [insight_id],
+        )?;
+        Ok(count)
+    }
+
+    /// Check what percentage of member IDs appear as source_id in synthesis_provenance.
+    pub fn check_coverage(&self, member_ids: &[String]) -> Result<f64, Box<dyn std::error::Error>> {
+        if member_ids.is_empty() {
+            return Ok(0.0);
+        }
+        let mut covered = 0usize;
+        for id in member_ids {
+            let count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM synthesis_provenance WHERE source_id = ?1",
+                [id],
+                |row| row.get(0),
+            )?;
+            if count > 0 {
+                covered += 1;
+            }
+        }
+        Ok(covered as f64 / member_ids.len() as f64)
+    }
+
+    /// Update the importance of a memory.
+    pub fn update_importance(&self, memory_id: &str, importance: f64) -> Result<(), Box<dyn std::error::Error>> {
+        self.conn.execute(
+            "UPDATE memories SET importance = ?1 WHERE id = ?2",
+            params![importance, memory_id],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a raw memory record. Used by synthesis engine to store insights.
+    ///
+    /// **Caller must manage the transaction.** This method does NOT create its own
+    /// transaction — it is designed to be called inside an existing transaction
+    /// (e.g., from `begin_transaction()` / `commit_transaction()`).
+    /// The caller's transaction provides atomicity for the memory insert + FTS indexing.
+    pub fn store_raw(
+        &self,
+        id: &str,
+        content: &str,
+        memory_type: &str,
+        importance: f64,
+        metadata: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let now = datetime_to_f64(&Utc::now());
+        self.conn.execute(
+            r#"INSERT INTO memories (
+                id, content, memory_type, importance, layer,
+                working_strength, core_strength, source, created_at,
+                last_consolidated, consolidation_count, pinned, metadata, namespace
+            ) VALUES (?1, ?2, ?3, ?4, 'core', 0.5, 0.5, 'synthesis', ?5, NULL, 0, 0, ?6, 'default')"#,
+            params![id, content, memory_type, importance, now, metadata],
+        )?;
+        // Record initial access
+        self.conn.execute(
+            "INSERT INTO access_log (memory_id, accessed_at) VALUES (?, ?)",
+            params![id, now],
+        )?;
+        // Insert into FTS
+        let rowid: i64 = self.conn.query_row(
+            "SELECT rowid FROM memories WHERE id = ?",
+            params![id],
+            |row| row.get(0),
+        )?;
+        let tokenized = tokenize_cjk_boundaries(content);
+        self.conn.execute(
+            "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
+            params![rowid, tokenized],
+        )?;
+        Ok(())
+    }
+
+    /// Convert a database row into a ProvenanceRecord.
+    fn row_to_provenance(row: &rusqlite::Row) -> Result<ProvenanceRecord, rusqlite::Error> {
+        let gate_scores_str: Option<String> = row.get(6)?;
+        let gate_scores: Option<GateScores> = gate_scores_str.and_then(|s| serde_json::from_str(&s).ok());
+
+        let ts_str: String = row.get(4)?;
+        let synthesis_timestamp = chrono::DateTime::parse_from_rfc3339(&ts_str)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now());
+
+        Ok(ProvenanceRecord {
+            id: row.get(0)?,
+            insight_id: row.get(1)?,
+            source_id: row.get(2)?,
+            cluster_id: row.get(3)?,
+            synthesis_timestamp,
+            gate_decision: row.get(5)?,
+            gate_scores,
+            confidence: row.get(7)?,
+            source_original_importance: row.get(8)?,
+        })
     }
 }

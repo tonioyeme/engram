@@ -3,32 +3,37 @@
 [![crates.io](https://img.shields.io/crates/v/engramai.svg)](https://crates.io/crates/engramai)
 [![docs.rs](https://docs.rs/engramai/badge.svg)](https://docs.rs/engramai)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Tests](https://img.shields.io/badge/tests-309_passing-brightgreen)]()
-[![Lines of Rust](https://img.shields.io/badge/Rust-18%2C290_lines-orange)]()
-[![unsafe](https://img.shields.io/badge/unsafe-zero-blue)]()
 
 **Not a vector database with a wrapper.** Engram models how biological memory actually works — activation decay, associative strengthening, consolidation, anomaly detection, emotional tracking, and insight synthesis. Your agent doesn't just *search* — it *remembers*.
 
+18,000+ lines of Rust · 309 tests · Zero unsafe
+
 ---
 
-## How Engram Compares
+## Why Not Just a Vector DB?
 
-|  | **Engram** | **Mem0** | **Zep** | **Letta** |
-|--|-----------|---------|--------|----------|
-| **Core approach** | Cognitive science models | Vector + graph memory | Vector + knowledge graph | LLM OS / stateful agents |
-| **Forgetting** | ✅ Ebbinghaus decay curves | ❌ | ❌ | ❌ |
-| **Activation modeling** | ✅ ACT-R (frequency + recency) | ❌ | ❌ | ❌ |
-| **Associative learning** | ✅ Hebbian + STDP | ❌ | Partial (graph edges) | ❌ |
-| **Sleep consolidation** | ✅ Dual-trace transfer | ❌ | ❌ | ❌ |
-| **Insight synthesis** | ✅ Cluster → gate → prove | ❌ | ❌ | ❌ |
-| **Emotional tracking** | ✅ Per-domain valence | ❌ | ❌ | ❌ |
-| **Anomaly detection** | ✅ Z-score sliding window | ❌ | ❌ | ❌ |
-| **Search** | FTS5 + vector + ACT-R | Vector + graph | Vector + MMR | Vector |
-| **CJK support** | ✅ Built-in (jieba-rs) | Via embedding model | Via embedding model | Via embedding model |
-| **Embeddings required?** | Optional (works without) | Required | Required | Required |
-| **Infrastructure** | SQLite only, zero deps | Redis/Postgres + API | Postgres + API | Postgres + API |
-| **Language** | Rust | Python | Python | Python |
-| **Deployment** | Copy binary + .db file | Docker + services | Docker + services | Docker + services |
+Vector databases give you **store → embed → retrieve**. That's a filing cabinet, not memory.
+
+Real memory is alive:
+
+- **Memories you use often stay strong** — ACT-R activation modeling (Anderson 1993)
+- **Memories you don't use fade** — Ebbinghaus exponential forgetting curves
+- **Related memories strengthen each other** — Hebbian associative learning
+- **Temporal order implies causality** — STDP (spike-timing dependent plasticity)
+- **Sleep consolidates what matters** — dual-trace hippocampus → neocortex transfer
+- **Clusters of memories generate new insights** — synthesis engine with full provenance
+- **Emotional patterns accumulate per domain** — not just what happened, but how it felt
+
+| | **Vector DB** | **Engram** |
+|--|--------------|-----------|
+| Store | Embed + insert | Embed + insert + extract entities + type-classify |
+| Retrieve | Cosine similarity | **3-signal fusion**: FTS5 (15%) + vector (60%) + ACT-R activation (25%) |
+| Frequently used memories | Same score every time | **Stronger** — ACT-R boosts by access frequency + recency |
+| Unused memories | Same score forever | **Fade** — Ebbinghaus exponential decay |
+| Related memories | Independent | **Strengthen each other** — Hebbian links + STDP causal ordering |
+| Over time | Database grows forever | **Consolidation** — "sleep" cycle transfers important memories, prunes weak ones |
+| Patterns across memories | You write the code | **Automatic** — synthesis engine discovers clusters and generates insights |
+| Emotional context | None | **Per-domain valence tracking** |
 
 ---
 
@@ -203,6 +208,24 @@ Memory systems that only accumulate eventually choke on their own weight. Engram
 - **Synthesis pruning** — Source memories that have been synthesized into insights can be safely decayed — the insight preserves their information at higher abstraction
 
 The result: an agent running for months doesn't slow down or lose relevance. Memory stays fit.
+
+---
+
+## How Engram Compares
+
+|  | **Engram** | **Mem0** | **Zep** | **Letta** |
+|--|-----------|---------|--------|----------|
+| **Core approach** | Cognitive science models | Vector + graph | Vector + knowledge graph | LLM OS / stateful agents |
+| **Forgetting** | ✅ Ebbinghaus curves | ❌ | ❌ | ❌ |
+| **Activation modeling** | ✅ ACT-R | ❌ | ❌ | ❌ |
+| **Associative learning** | ✅ Hebbian + STDP | ❌ | Partial (graph) | ❌ |
+| **Consolidation** | ✅ Dual-trace | ❌ | ❌ | ❌ |
+| **Insight synthesis** | ✅ Cluster → gate → prove | ❌ | ❌ | ❌ |
+| **Emotional tracking** | ✅ Per-domain | ❌ | ❌ | ❌ |
+| **Search** | FTS5 + vector + ACT-R | Vector + graph | Vector + MMR | Vector |
+| **Embeddings required?** | Optional | Required | Required | Required |
+| **Infrastructure** | SQLite only | Redis/Postgres + API | Postgres + API | Postgres + API |
+| **Language** | Rust | Python | Python | Python |
 
 ---
 

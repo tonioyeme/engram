@@ -4,7 +4,9 @@
 [![docs.rs](https://docs.rs/engramai/badge.svg)](https://docs.rs/engramai)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-**Not a vector database with a wrapper.** Engram models how biological memory actually works — activation decay, associative strengthening, consolidation, anomaly detection, emotional tracking, and insight synthesis. Your agent doesn't just *search* — it *remembers*.
+Engram is a **memory system for AI agents** built on cognitive science models — not vector similarity. It implements the mechanisms that make biological memory work: activation decay (ACT-R), forgetting curves (Ebbinghaus), associative strengthening (Hebbian/STDP), sleep consolidation, and automatic insight synthesis from memory clusters.
+
+The result: an agent that *remembers* — where frequently-used knowledge stays accessible, unused memories naturally fade, related concepts strengthen each other, and patterns across experiences surface as insights. All in a single SQLite file, pure Rust, zero external dependencies.
 
 18,000+ lines of Rust · 309 tests · Zero unsafe
 
@@ -120,21 +122,6 @@ mem.undo_synthesis(insight_id)?;
 ```
 
 </details>
-
----
-
-## Why Not Just a Vector DB?
-
-| | **Vector DB** | **Engram** |
-|--|--------------|-----------|
-| Store | ✅ Embed + insert | ✅ Embed + insert + extract entities + type-classify |
-| Retrieve | Cosine similarity | **3-signal fusion**: FTS5 (15%) + vector (60%) + ACT-R activation (25%) |
-| Frequently used memories | Same score every time | **Stronger** — ACT-R boosts by access frequency + recency |
-| Unused memories | Same score forever | **Fade** — Ebbinghaus exponential decay, configurable per agent type |
-| Related memories | Independent | **Strengthen each other** — Hebbian links + STDP causal ordering |
-| Over time | Database grows forever | **Consolidation** — "sleep" cycle transfers important memories, prunes weak ones |
-| Patterns across memories | You write the code | **Automatic** — synthesis engine discovers clusters and generates insights |
-| Emotional context | None | **Per-domain valence tracking** — the agent knows which areas are going well |
 
 ---
 

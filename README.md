@@ -28,7 +28,7 @@ Ebbinghaus forgetting, cognitive consolidation, vector embeddings, and LLM extra
 
 ```toml
 [dependencies]
-engramai = "0.2.1"
+engramai = "0.2.2"
 ```
 
 ### Basic Usage
@@ -464,7 +464,7 @@ let config = MemoryConfig::researcher();         // Minimal forgetting
 
 ## Python vs Rust
 
-| Feature | Python 2.1 | TypeScript 2.1 | Rust 0.2.1 |
+| Feature | Python 2.1 | TypeScript 2.1 | Rust 0.2.2 |
 |---------|------------|----------------|------------|
 | ACT-R activation | ✅ | ✅ | ✅ |
 | Hebbian learning | ✅ | ✅ | ✅ |
@@ -495,6 +495,6 @@ AGPL-3.0-or-later — see [LICENSE](LICENSE).
   author = {Tang, Toni},
   title = {Engram AI: Neuroscience-Grounded Memory for AI Agents},
   year = {2026},
-  url = {https://github.com/tonitangpotato/engram-ai-rust}
+  url = {https://github.com/tonioyeme/engram-ai-rust}
 }
 ```

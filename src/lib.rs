@@ -100,6 +100,7 @@ pub mod memory;
 pub mod models;
 pub mod session_wm;
 pub mod storage;
+pub mod synthesis;
 pub mod types;
 
 // Re-export main types
@@ -107,7 +108,7 @@ pub use bus::{EmotionalBus, SoulUpdate, HeartbeatUpdate, Drive, HeartbeatTask, I
 pub use config::MemoryConfig;
 pub use embeddings::{EmbeddingConfig, EmbeddingProvider, EmbeddingError};
 pub use extractor::{MemoryExtractor, ExtractedFact, AnthropicExtractor, AnthropicExtractorConfig, TokenProvider, OllamaExtractor, OllamaExtractorConfig};
-pub use memory::Memory;
+pub use memory::{Memory, SleepReport, is_insight};
 pub use storage::EmbeddingStats;
 pub use storage::EntityRecord;
 pub use types::{AclEntry, CrossLink, HebbianLink, MemoryLayer, MemoryRecord, MemoryStats, MemoryType, Permission, RecallResult, RecallWithAssociationsResult};
@@ -116,4 +117,9 @@ pub use types::{AclEntry, CrossLink, HebbianLink, MemoryLayer, MemoryRecord, Mem
 pub use anomaly::{BaselineTracker, Baseline, AnomalyResult};
 pub use confidence::{confidence_score, confidence_label, confidence_detail, content_reliability, retrieval_salience, ConfidenceDetail};
 pub use hybrid_search::{hybrid_search, adaptive_hybrid_search, reciprocal_rank_fusion, HybridSearchResult, HybridSearchOpts};
-pub use session_wm::{SessionWorkingMemory, SessionRegistry, SessionRecallResult};
+pub use session_wm::{SessionWorkingMemory, SessionRegistry, SessionRecallResult, CachedScore};
+pub use synthesis::types::{
+    SynthesisSettings, SynthesisReport, SynthesisError, SynthesisEngine,
+    SynthesisLlmProvider, MemoryCluster, GateDecision, GateResult,
+    ProvenanceRecord, ProvenanceChain, UndoSynthesis,
+};

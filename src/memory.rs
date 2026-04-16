@@ -16,7 +16,27 @@ use crate::storage::{Storage, EmbeddingStats};
 use crate::bus::{SubscriptionManager, Subscription, Notification};
 use crate::models::hebbian::{MemoryWithNamespace, record_cross_namespace_coactivation};
 use crate::session_wm::{SessionWorkingMemory, SessionRecallResult};
+use crate::synthesis::types::SynthesisEngine;
 use crate::types::{AclEntry, CrossLink, HebbianLink, LayerStats, MemoryLayer, MemoryRecord, MemoryStats, MemoryType, Permission, RecallResult, RecallWithAssociationsResult, TypeStats};
+
+/// Report from a unified sleep cycle (consolidation + synthesis).
+#[derive(Debug)]
+pub struct SleepReport {
+    /// Whether the consolidation phase completed successfully.
+    pub consolidation_ok: bool,
+    /// Synthesis report (None if synthesis not enabled or failed non-fatally).
+    pub synthesis: Option<crate::synthesis::types::SynthesisReport>,
+}
+
+/// Check if a memory record is a synthesis insight.
+pub fn is_insight(record: &MemoryRecord) -> bool {
+    record
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("is_synthesis"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
 
 /// Main interface to the Engram memory system.
 ///
@@ -36,6 +56,10 @@ pub struct Memory {
     extractor: Option<Box<dyn MemoryExtractor>>,
     /// Entity extractor for identifying entities in memory content
     entity_extractor: EntityExtractor,
+    /// Optional synthesis settings (None = synthesis disabled)
+    synthesis_settings: Option<crate::synthesis::types::SynthesisSettings>,
+    /// Optional LLM provider for synthesis insight generation
+    synthesis_llm_provider: Option<Box<dyn crate::synthesis::types::SynthesisLlmProvider>>,
 }
 
 impl Memory {
@@ -75,6 +99,8 @@ impl Memory {
             embedding,
             extractor: None,
             entity_extractor,
+            synthesis_settings: None,
+            synthesis_llm_provider: None,
         };
         
         // Auto-configure extractor from environment/config
@@ -119,6 +145,8 @@ impl Memory {
             embedding: Some(embedding),
             extractor: None,
             entity_extractor,
+            synthesis_settings: None,
+            synthesis_llm_provider: None,
         };
         
         // Auto-configure extractor from environment/config
@@ -164,6 +192,8 @@ impl Memory {
             embedding,
             extractor: None,
             entity_extractor,
+            synthesis_settings: None,
+            synthesis_llm_provider: None,
         };
         
         // Auto-configure extractor from environment/config
@@ -214,6 +244,8 @@ impl Memory {
             embedding,
             extractor: None,
             entity_extractor,
+            synthesis_settings: None,
+            synthesis_llm_provider: None,
         };
         
         // Auto-configure extractor from environment/config
@@ -262,6 +294,22 @@ impl Memory {
     /// * `extractor` - The extractor implementation (e.g., AnthropicExtractor, OllamaExtractor)
     pub fn set_extractor(&mut self, extractor: Box<dyn MemoryExtractor>) {
         self.extractor = Some(extractor);
+    }
+
+    /// Set the synthesis settings. Enables knowledge synthesis during consolidation.
+    ///
+    /// Synthesis is opt-in: it only runs when settings.enabled is true.
+    /// This maintains backward compatibility (GUARD-3).
+    pub fn set_synthesis_settings(&mut self, settings: crate::synthesis::types::SynthesisSettings) {
+        self.synthesis_settings = Some(settings);
+    }
+
+    /// Set the LLM provider for synthesis insight generation.
+    ///
+    /// Without a provider, synthesis still discovers clusters and runs the gate check,
+    /// but skips LLM insight generation (graceful degradation).
+    pub fn set_synthesis_llm_provider(&mut self, provider: Box<dyn crate::synthesis::types::SynthesisLlmProvider>) {
+        self.synthesis_llm_provider = Some(provider);
     }
     
     /// Remove the memory extractor (revert to storing raw content).
@@ -1115,6 +1163,32 @@ impl Memory {
             self.storage.decay_hebbian_links(self.config.hebbian_decay)?;
         }
 
+        // Run synthesis if enabled (GUARD-3: opt-in, backward compatible)
+        let synth_settings = self.synthesis_settings.clone();
+        if let Some(ref settings) = synth_settings {
+            if settings.enabled {
+                let embedding_model = self.embedding.as_ref().map(|e| e.config().model_id());
+                let engine = self.build_synthesis_engine(embedding_model);
+                match engine.synthesize(&mut self.storage, settings) {
+                    Ok(report) => {
+                        if report.clusters_found > 0 {
+                            log::info!(
+                                "Synthesis: {} clusters found, {} synthesized, {} skipped, {} deferred",
+                                report.clusters_found,
+                                report.clusters_synthesized,
+                                report.clusters_skipped,
+                                report.clusters_deferred,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Synthesis failed (non-fatal): {e}");
+                    }
+                }
+                self.restore_llm_provider(engine.into_provider());
+            }
+        }
+
         Ok(())
     }
 
@@ -1614,9 +1688,9 @@ impl Memory {
         // Get active IDs from working memory
         let active_ids = session_wm.get_active_ids();
         
-        // Check if we need full recall
-        let need_full_recall = if active_ids.is_empty() {
-            true
+        // Check if we need full recall, capturing the initial probe ratio
+        let (need_full_recall, initial_ratio) = if active_ids.is_empty() {
+            (true, 0.0)
         } else {
             // Do lightweight probe (3 results) to check topic continuity
             let probe = self.recall_from_namespace(
@@ -1628,7 +1702,12 @@ impl Memory {
             )?;
             
             let probe_ids: Vec<String> = probe.iter().map(|r| r.record.id.clone()).collect();
-            !session_wm.is_topic_continuous(&probe_ids, CONTINUITY_THRESHOLD)
+            let (_, ratio) = session_wm.overlap(&probe_ids);
+            if ratio >= CONTINUITY_THRESHOLD {
+                (false, ratio)  // topic continuous
+            } else {
+                (true, ratio)   // topic changed
+            }
         };
         
         if need_full_recall {
@@ -1641,40 +1720,49 @@ impl Memory {
                 namespace,
             )?;
             
-            // Update working memory
-            let result_ids: Vec<String> = results.iter().map(|r| r.record.id.clone()).collect();
-            session_wm.activate(&result_ids);
+            // Update working memory with scores for future cached path
+            let entries: Vec<(String, f64, f64)> = results.iter()
+                .map(|r| (r.record.id.clone(), r.confidence, r.activation))
+                .collect();
+            session_wm.activate_with_scores(&entries);
             session_wm.set_query(query);
             
             Ok(SessionRecallResult {
                 results,
                 full_recall: true,
                 wm_size: session_wm.len(),
-                continuity_ratio: 0.0,
+                continuity_ratio: initial_ratio,
             })
         } else {
-            // Topic continuous → return cached WM items
+            // Topic continuous → return cached WM items with preserved scores
             let mut cached_results = Vec::new();
             let now = Utc::now();
             
             for id in &active_ids {
                 if let Some(record) = self.storage.get(id)? {
-                    let activation = retrieval_activation(
-                        &record,
-                        &context.clone().unwrap_or_default(),
-                        now,
-                        self.config.actr_decay,
-                        self.config.context_weight,
-                        self.config.importance_weight,
-                        self.config.contradiction_penalty,
-                    );
-                    let age_hours = (now - record.created_at).num_seconds() as f64 / 3600.0;
-                    let confidence = compute_query_confidence(
-                        None,   // no embedding in session WM path
-                        false,  // not an FTS query match
-                        0.0,    // no entity score
-                        age_hours,
-                    );
+                    // Reuse cached scores from the original full recall
+                    let (activation, confidence) = if let Some(cached) = session_wm.get_score(id) {
+                        (cached.activation, cached.confidence)
+                    } else {
+                        // Fallback: memory activated by ID only (legacy/no cached scores)
+                        let activation = retrieval_activation(
+                            &record,
+                            &context.clone().unwrap_or_default(),
+                            now,
+                            self.config.actr_decay,
+                            self.config.context_weight,
+                            self.config.importance_weight,
+                            self.config.contradiction_penalty,
+                        );
+                        let age_hours = (now - record.created_at).num_seconds() as f64 / 3600.0;
+                        let confidence = compute_query_confidence(
+                            None,
+                            false,
+                            0.0,
+                            age_hours,
+                        );
+                        (activation, confidence)
+                    };
                     
                     if min_confidence.map(|mc| confidence >= mc).unwrap_or(true) {
                         cached_results.push(RecallResult {
@@ -1693,12 +1781,7 @@ impl Memory {
             });
             cached_results.truncate(limit);
             
-            // Calculate continuity ratio
-            let probe = self.recall_from_namespace(query, 3, None, None, namespace)?;
-            let probe_ids: Vec<String> = probe.iter().map(|r| r.record.id.clone()).collect();
-            let (_, ratio) = session_wm.overlap(&probe_ids);
-            
-            // Refresh activation timestamps
+            // Refresh activation timestamps (reuse existing scores)
             let result_ids: Vec<String> = cached_results.iter().map(|r| r.record.id.clone()).collect();
             session_wm.activate(&result_ids);
             session_wm.set_query(query);
@@ -1707,7 +1790,7 @@ impl Memory {
                 results: cached_results,
                 full_recall: false,
                 wm_size: session_wm.len(),
-                continuity_ratio: ratio,
+                continuity_ratio: initial_ratio,  // reuse from initial probe
             })
         }
     }
@@ -2257,6 +2340,201 @@ impl Memory {
         limit: usize,
     ) -> Result<Vec<(crate::storage::EntityRecord, usize)>, Box<dyn std::error::Error>> {
         Ok(self.storage.list_entities(entity_type, namespace, limit)?)
+    }
+
+    // ===================================================================
+    // Knowledge Synthesis API (ISS-005)
+    // ===================================================================
+
+    /// Run a full synthesis cycle: discover clusters → gate check → generate insights → store.
+    ///
+    /// Requires `set_synthesis_settings()` to have been called with `enabled: true`.
+    /// Without an LLM provider (`set_synthesis_llm_provider()`), synthesis still
+    /// discovers clusters and runs gate checks but skips insight text generation
+    /// (graceful degradation).
+    pub fn synthesize(
+        &mut self,
+    ) -> Result<crate::synthesis::types::SynthesisReport, Box<dyn std::error::Error>> {
+        let settings = self.synthesis_settings.clone().unwrap_or_default();
+        let embedding_model = self.embedding.as_ref().map(|e| e.config().model_id());
+        let engine = self.build_synthesis_engine(embedding_model);
+        let result = engine.synthesize(&mut self.storage, &settings);
+        // Restore LLM provider (consumed by build_synthesis_engine via take())
+        self.restore_llm_provider(engine.into_provider());
+        result
+    }
+
+    /// Run a full synthesis cycle with custom settings (overrides stored settings).
+    pub fn synthesize_with(
+        &mut self,
+        settings: &crate::synthesis::types::SynthesisSettings,
+    ) -> Result<crate::synthesis::types::SynthesisReport, Box<dyn std::error::Error>> {
+        let embedding_model = self.embedding.as_ref().map(|e| e.config().model_id());
+        let engine = self.build_synthesis_engine(embedding_model);
+        let result = engine.synthesize(&mut self.storage, settings);
+        self.restore_llm_provider(engine.into_provider());
+        result
+    }
+
+    /// Dry-run synthesis: discover clusters and gate decisions without making any changes.
+    ///
+    /// Returns the report with clusters_found and gate_results populated,
+    /// but insights_created and sources_demoted will be empty.
+    pub fn synthesize_dry_run(
+        &mut self,
+    ) -> Result<crate::synthesis::types::SynthesisReport, Box<dyn std::error::Error>> {
+        use crate::synthesis::{cluster, gate};
+        let settings = self.synthesis_settings.clone().unwrap_or_default();
+        let embedding_model = self.embedding.as_ref().map(|e| e.config().model_id());
+
+        let clusters = cluster::discover_clusters(
+            &self.storage,
+            &settings.cluster_discovery,
+            embedding_model.as_deref(),
+        )?;
+
+        let mut gate_results = Vec::new();
+        for cluster_data in &clusters {
+            let all_memories = self.storage.all()?;
+            let member_set: std::collections::HashSet<&str> =
+                cluster_data.members.iter().map(|s| s.as_str()).collect();
+            let members: Vec<MemoryRecord> = all_memories
+                .into_iter()
+                .filter(|m| member_set.contains(m.id.as_str()))
+                .collect();
+
+            let covered_pct = self.storage.check_coverage(&cluster_data.members)?;
+            let gate_result = gate::check_gate(
+                cluster_data,
+                &members,
+                &settings.gate,
+                covered_pct,
+                true,  // assume changed
+                false, // not all pairs similar
+            );
+            gate_results.push(gate_result);
+        }
+
+        Ok(crate::synthesis::types::SynthesisReport {
+            clusters_found: clusters.len(),
+            clusters_synthesized: 0,
+            clusters_auto_updated: 0,
+            clusters_deferred: gate_results.iter().filter(|g| matches!(g.decision, crate::synthesis::types::GateDecision::Defer { .. })).count(),
+            clusters_skipped: gate_results.iter().filter(|g| matches!(g.decision, crate::synthesis::types::GateDecision::Skip { .. })).count(),
+            insights_created: Vec::new(),
+            sources_demoted: Vec::new(),
+            errors: Vec::new(),
+            duration: std::time::Duration::ZERO,
+            gate_results,
+        })
+    }
+
+    /// Unified sleep cycle: consolidate, then synthesize.
+    ///
+    /// This is the recommended way to run both consolidation and synthesis in sequence.
+    /// Consolidation always runs; synthesis only runs if enabled via settings.
+    pub fn sleep_cycle(
+        &mut self,
+        days: f64,
+        namespace: Option<&str>,
+    ) -> Result<SleepReport, Box<dyn std::error::Error>> {
+        // Phase 1: Synaptic consolidation (existing)
+        self.consolidate_namespace(days, namespace)?;
+
+        // Phase 2: Knowledge synthesis (if enabled)
+        let synthesis = if self.synthesis_settings.as_ref().map_or(false, |s| s.enabled) {
+            match self.synthesize() {
+                Ok(report) => Some(report),
+                Err(e) => {
+                    log::warn!("Synthesis in sleep cycle failed (non-fatal): {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(SleepReport {
+            consolidation_ok: true,
+            synthesis,
+        })
+    }
+
+    /// List all insight memories (memories with `is_synthesis: true` metadata).
+    ///
+    /// Returns insight MemoryRecords sorted by creation time (newest first).
+    pub fn list_insights(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<MemoryRecord>, Box<dyn std::error::Error>> {
+        let all = self.storage.all()?;
+        let mut insights: Vec<MemoryRecord> = all
+            .into_iter()
+            .filter(|r| is_insight(r))
+            .collect();
+        insights.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        if let Some(l) = limit {
+            insights.truncate(l);
+        }
+        Ok(insights)
+    }
+
+    /// Get source provenance records for a given insight.
+    pub fn insight_sources(
+        &self,
+        insight_id: &str,
+    ) -> Result<Vec<crate::synthesis::types::ProvenanceRecord>, Box<dyn std::error::Error>> {
+        Ok(self.storage.get_insight_sources(insight_id)?)
+    }
+
+    /// Get insights derived from a specific source memory.
+    pub fn insights_for_memory(
+        &self,
+        memory_id: &str,
+    ) -> Result<Vec<crate::synthesis::types::ProvenanceRecord>, Box<dyn std::error::Error>> {
+        Ok(self.storage.get_memory_insights(memory_id)?)
+    }
+
+    /// Reverse a synthesis: archive the insight and restore source importances.
+    ///
+    /// Does NOT delete the insight (GUARD-1: No Data Loss). Instead, archives it
+    /// with importance 0.0 and restores all source memories to their pre-demotion state.
+    pub fn reverse_synthesis(
+        &mut self,
+        insight_id: &str,
+    ) -> Result<crate::synthesis::types::UndoSynthesis, Box<dyn std::error::Error>> {
+        let embedding_model = self.embedding.as_ref().map(|e| e.config().model_id());
+        let engine = self.build_synthesis_engine(embedding_model);
+        let result = engine.undo_synthesis(&mut self.storage, insight_id);
+        self.restore_llm_provider(engine.into_provider());
+        result
+    }
+
+    /// Trace the provenance chain of a memory/insight back through its sources.
+    pub fn get_provenance(
+        &self,
+        memory_id: &str,
+        max_depth: usize,
+    ) -> Result<crate::synthesis::types::ProvenanceChain, Box<dyn std::error::Error>> {
+        // get_provenance only needs &Storage, no need to take LLM provider
+        crate::synthesis::provenance::get_provenance_chain(&self.storage, memory_id, max_depth)
+    }
+
+    /// Build a DefaultSynthesisEngine, temporarily borrowing the LLM provider.
+    ///
+    /// Uses `Option::take` to move the provider into the engine. Callers must
+    /// call `restore_llm_provider` after using the engine to put it back.
+    fn build_synthesis_engine(
+        &mut self,
+        embedding_model: Option<String>,
+    ) -> crate::synthesis::engine::DefaultSynthesisEngine {
+        let llm = self.synthesis_llm_provider.take();
+        crate::synthesis::engine::DefaultSynthesisEngine::new(llm, embedding_model)
+    }
+
+    /// Restore the LLM provider after engine use (engine returns it via `into_provider()`).
+    fn restore_llm_provider(&mut self, provider: Option<Box<dyn crate::synthesis::types::SynthesisLlmProvider>>) {
+        self.synthesis_llm_provider = provider;
     }
 
 }

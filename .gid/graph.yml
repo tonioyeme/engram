@@ -42,8 +42,8 @@ nodes:
   - extractor
   priority: 10
   metadata:
-    project: engramai
     file: engramai/src/extractor.rs
+    project: engramai
 - id: a3-sql-cleanup
   title: 'A3: SQL 一次性清理 — 删存量重复 + 系统指令垃圾'
   status: todo
@@ -79,7 +79,7 @@ nodes:
     3. Entity-aware recall — 第 4 路检索：query→entity→related memories
     4. Entity dedup — 同名 entity 合并（fuzzy match）
     估计 500-800 行新代码，跨 extractor.rs、storage.rs、memory.rs、hybrid_search.rs
-    
+
     分解为 7 个子任务（见 entity-types → entity-integration-tests）
   tags:
   - engram
@@ -89,8 +89,8 @@ nodes:
   priority: 20
   metadata:
     project: engramai
-    ritual: true
     iss: ISS-009
+    ritual: true
 - id: entity-types
   title: 'B1.1: Entity types & config structs'
   status: todo
@@ -103,7 +103,7 @@ nodes:
     - normalize_entity_name() function
     - Add aho-corasick dependency to Cargo.toml
     - Add pub mod entities; to lib.rs
-    
+
     Files: src/entities.rs (new), src/config.rs (+20 lines), Cargo.toml (+1 dep), lib.rs (+2 lines)
   tags:
   - engram
@@ -112,13 +112,13 @@ nodes:
   - types
   priority: 20
   metadata:
-    project: engramai
     iss: ISS-009
     files:
-      - src/entities.rs
-      - src/config.rs
-      - Cargo.toml
-      - src/lib.rs
+    - src/entities.rs
+    - src/config.rs
+    - Cargo.toml
+    - src/lib.rs
+    project: engramai
 - id: entity-unit-tests
   title: 'B1.2: EntityExtractor unit tests'
   status: todo
@@ -129,7 +129,7 @@ nodes:
     - Test normalization (case, trailing slashes, @-prefix stripping)
     - Test dedup within same content
     - Test empty/no-entity content
-    
+
     Files: src/entities.rs (#[cfg(test)] mod tests)
   tags:
   - engram
@@ -138,10 +138,10 @@ nodes:
   - tests
   priority: 20
   metadata:
-    project: engramai
     iss: ISS-009
+    project: engramai
     files:
-      - src/entities.rs
+    - src/entities.rs
 - id: entity-storage
   title: 'B1.3: Storage entity CRUD methods'
   status: todo
@@ -155,7 +155,7 @@ nodes:
     - get_related_entities() — 1-hop relations
     - get_entity() — fetch by ID
     - count_entities() — namespace stats
-    
+
     Files: src/storage.rs (+120 lines)
   tags:
   - engram
@@ -167,7 +167,7 @@ nodes:
     project: engramai
     iss: ISS-009
     files:
-      - src/storage.rs
+    - src/storage.rs
 - id: entity-add-raw
   title: 'B1.4: Integrate entity extraction into add_raw()'
   status: todo
@@ -181,7 +181,7 @@ nodes:
       * Build co-occurrence relations (capped at 10 entities to avoid O(n²))
     - Add entity_config field to MemoryConfig
     - Add entity_extractor field to MemorySystem
-    
+
     Files: src/memory.rs (+80 lines), src/config.rs (EntityConfig integration)
   tags:
   - engram
@@ -190,11 +190,11 @@ nodes:
   - write-path
   priority: 20
   metadata:
-    project: engramai
-    iss: ISS-009
     files:
-      - src/memory.rs
-      - src/config.rs
+    - src/memory.rs
+    - src/config.rs
+    iss: ISS-009
+    project: engramai
 - id: entity-recall
   title: 'B1.5: Entity-aware recall channel'
   status: todo
@@ -207,7 +207,7 @@ nodes:
       * Score memories by entity relevance (primary entity match = 1.0, related = 0.5, multi-entity boost)
     - Integrate into recall_from_namespace() in memory.rs
     - Add entity channel weight to hybrid search scoring (default 0.15)
-    
+
     Files: src/entities.rs (+150 lines), src/memory.rs (+20 lines)
   tags:
   - engram
@@ -217,10 +217,10 @@ nodes:
   priority: 20
   metadata:
     project: engramai
-    iss: ISS-009
     files:
-      - src/entities.rs
-      - src/memory.rs
+    - src/entities.rs
+    - src/memory.rs
+    iss: ISS-009
 - id: entity-backfill
   title: 'B1.6: Backfill CLI command for existing memories'
   status: todo
@@ -233,7 +233,7 @@ nodes:
       * Progress logging every 100 memories
       * Stats: total processed, entities created, links created
     - Idempotent — safe to re-run
-    
+
     Files: src/main.rs (+40 lines)
   tags:
   - engram
@@ -242,10 +242,10 @@ nodes:
   - cli
   priority: 20
   metadata:
+    files:
+    - src/main.rs
     project: engramai
     iss: ISS-009
-    files:
-      - src/main.rs
 - id: entity-integration-tests
   title: 'B1.7: Entity indexing integration tests'
   status: todo
@@ -258,7 +258,7 @@ nodes:
     - Test entity dedup (same normalized name → same ID)
     - Test recall boost for multi-entity match
     - Test namespace isolation for entities
-    
+
     Files: tests/entity_integration_test.rs (new, ~150 lines)
   tags:
   - engram
@@ -270,7 +270,7 @@ nodes:
     project: engramai
     iss: ISS-009
     files:
-      - tests/entity_integration_test.rs
+    - tests/entity_integration_test.rs
 - id: b2-dedup
   title: 'B2: Dedup on write — embedding similarity + merge (ISS-003)'
   status: todo
@@ -287,8 +287,8 @@ nodes:
   - dedup
   priority: 25
   metadata:
-    project: engramai
     iss: ISS-003
+    project: engramai
 - id: b3-confidence
   title: 'B3: Confidence score — 多信号融合 recall confidence (ISS-007)'
   status: todo
@@ -323,8 +323,92 @@ nodes:
   - recency
   priority: 35
   metadata:
-    iss: ISS-002
     project: engramai
+    iss: ISS-002
+- id: iss-005-synthesis
+  title: 'ISS-005: Knowledge Synthesis Engine'
+  status: todo
+  description: Complete implementation of the knowledge synthesis engine — cluster discovery, gate check, insight generation, provenance tracing. See design-1-engine.md.
+  tags:
+  - iss-005
+  - knowledge-synthesis
+- id: synth-types
+  title: Create synthesis types module (src/synthesis/types.rs)
+  status: todo
+  tags:
+  - iss-005
+  - knowledge-synthesis
+  - foundation
+- id: synth-mod
+  title: Create src/synthesis/mod.rs and wire into lib.rs
+  status: todo
+  tags:
+  - iss-005
+  - knowledge-synthesis
+  - foundation
+- id: synth-cluster
+  title: Implement cluster discovery (src/synthesis/cluster.rs)
+  status: todo
+  tags:
+  - iss-005
+  - knowledge-synthesis
+  - GOAL-1
+- id: synth-gate
+  title: Implement gate check (src/synthesis/gate.rs)
+  status: todo
+  tags:
+  - iss-005
+  - knowledge-synthesis
+  - GOAL-3
+- id: synth-insight
+  title: Implement insight generation (src/synthesis/insight.rs)
+  status: todo
+  tags:
+  - iss-005
+  - knowledge-synthesis
+  - GOAL-2
+- id: synth-provenance
+  title: Implement provenance tracing (src/synthesis/provenance.rs)
+  status: todo
+  tags:
+  - iss-005
+  - knowledge-synthesis
+  - GOAL-4
+- id: synth-engine
+  title: Implement SynthesisEngine trait (src/synthesis/engine.rs)
+  status: todo
+  tags:
+  - iss-005
+  - knowledge-synthesis
+  - integration
+- id: synth-consolidate
+  title: Integrate synthesis into consolidate() call path
+  status: todo
+  tags:
+  - iss-005
+  - knowledge-synthesis
+  - integration
+- id: synth-incremental
+  title: Implement incremental operations (cluster updates on new memory)
+  status: todo
+  tags:
+  - iss-005
+  - knowledge-synthesis
+  - incremental
+- id: synth-unit-tests
+  title: Write unit tests for all synthesis components
+  status: todo
+  tags:
+  - iss-005
+  - knowledge-synthesis
+  - tests
+- id: synth-integration-tests
+  title: Write integration tests for full synthesis pipeline
+  status: todo
+  tags:
+  - iss-005
+  - knowledge-synthesis
+  - tests
 edges:
 - from: a1-hook-filter
   to: phase-a
@@ -368,7 +452,6 @@ edges:
 - from: b4-recency
   to: b3-confidence
   relation: depends_on
-# B1 entity indexing task breakdown edges
 - from: entity-types
   to: b1-entity-index
   relation: subtask_of
@@ -390,7 +473,6 @@ edges:
 - from: entity-integration-tests
   to: b1-entity-index
   relation: subtask_of
-# B1 entity indexing dependency chain
 - from: entity-storage
   to: entity-types
   relation: depends_on
@@ -411,4 +493,109 @@ edges:
   relation: depends_on
 - from: entity-integration-tests
   to: entity-backfill
+  relation: depends_on
+- from: synth-types
+  to: iss-005-synthesis
+  relation: subtask_of
+- from: synth-mod
+  to: iss-005-synthesis
+  relation: subtask_of
+- from: synth-cluster
+  to: synth-types
+  relation: depends_on
+- from: synth-cluster
+  to: synth-mod
+  relation: depends_on
+- from: synth-gate
+  to: synth-types
+  relation: depends_on
+- from: synth-gate
+  to: synth-mod
+  relation: depends_on
+- from: synth-gate
+  to: synth-cluster
+  relation: depends_on
+- from: synth-insight
+  to: synth-types
+  relation: depends_on
+- from: synth-insight
+  to: synth-mod
+  relation: depends_on
+- from: synth-provenance
+  to: synth-types
+  relation: depends_on
+- from: synth-provenance
+  to: synth-mod
+  relation: depends_on
+- from: synth-engine
+  to: synth-cluster
+  relation: depends_on
+- from: synth-engine
+  to: synth-gate
+  relation: depends_on
+- from: synth-engine
+  to: synth-insight
+  relation: depends_on
+- from: synth-engine
+  to: synth-provenance
+  relation: depends_on
+- from: synth-consolidate
+  to: synth-engine
+  relation: depends_on
+- from: synth-incremental
+  to: synth-cluster
+  relation: depends_on
+- from: synth-incremental
+  to: synth-provenance
+  relation: depends_on
+- from: synth-unit-tests
+  to: synth-cluster
+  relation: depends_on
+- from: synth-unit-tests
+  to: synth-gate
+  relation: depends_on
+- from: synth-unit-tests
+  to: synth-insight
+  relation: depends_on
+- from: synth-unit-tests
+  to: synth-provenance
+  relation: depends_on
+- from: synth-integration-tests
+  to: synth-engine
+  relation: depends_on
+- from: synth-integration-tests
+  to: synth-consolidate
+  relation: depends_on
+- from: synth-integration-tests
+  to: synth-incremental
+  relation: depends_on
+- from: synth-cluster
+  to: iss-005-synthesis
+  relation: subtask_of
+- from: synth-gate
+  to: iss-005-synthesis
+  relation: subtask_of
+- from: synth-insight
+  to: iss-005-synthesis
+  relation: subtask_of
+- from: synth-provenance
+  to: iss-005-synthesis
+  relation: subtask_of
+- from: synth-engine
+  to: iss-005-synthesis
+  relation: subtask_of
+- from: synth-consolidate
+  to: iss-005-synthesis
+  relation: subtask_of
+- from: synth-incremental
+  to: iss-005-synthesis
+  relation: subtask_of
+- from: synth-unit-tests
+  to: iss-005-synthesis
+  relation: subtask_of
+- from: synth-integration-tests
+  to: iss-005-synthesis
+  relation: subtask_of
+- from: synth-cluster
+  to: b1-entity-index
   relation: depends_on

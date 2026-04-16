@@ -13,6 +13,13 @@ const DEFAULT_CAPACITY: usize = 7;
 /// Default decay time for working memory items (5 minutes).
 const DEFAULT_DECAY_SECS: u64 = 300;
 
+/// Scores cached from the full recall that populated a working memory item.
+#[derive(Debug, Clone)]
+pub struct CachedScore {
+    pub confidence: f64,
+    pub activation: f64,
+}
+
 /// A single session's working memory state.
 #[derive(Debug, Clone)]
 pub struct SessionWorkingMemory {
@@ -22,6 +29,8 @@ pub struct SessionWorkingMemory {
     decay_duration: Duration,
     /// Memory ID -> last activated time
     items: HashMap<String, Instant>,
+    /// Cached scores from original full recall
+    scores: HashMap<String, CachedScore>,
     /// Last topic/query for continuity check
     last_query: Option<String>,
 }
@@ -39,6 +48,7 @@ impl SessionWorkingMemory {
             capacity,
             decay_duration: Duration::from_secs(decay_secs),
             items: HashMap::new(),
+            scores: HashMap::new(),
             last_query: None,
         }
     }
@@ -60,6 +70,27 @@ impl SessionWorkingMemory {
         }
         
         self.prune();
+    }
+    
+    /// Activate memory IDs with their scores for cached recall.
+    ///
+    /// Stores confidence and activation from the full recall so the cached
+    /// path can reuse them instead of recomputing with zero signals.
+    pub fn activate_with_scores(&mut self, entries: &[(String, f64, f64)]) {
+        let now = Instant::now();
+        for (id, confidence, activation) in entries {
+            self.items.insert(id.clone(), now);
+            self.scores.insert(id.clone(), CachedScore {
+                confidence: *confidence,
+                activation: *activation,
+            });
+        }
+        self.prune();
+    }
+    
+    /// Get cached score for a memory ID.
+    pub fn get_score(&self, id: &str) -> Option<&CachedScore> {
+        self.scores.get(id)
     }
     
     /// Set the last query for topic continuity checking.
@@ -95,6 +126,9 @@ impl SessionWorkingMemory {
                 break;
             }
         }
+        
+        // Clean scores for pruned items
+        self.scores.retain(|id, _| self.items.contains_key(id));
     }
     
     /// Get currently active memory IDs (after pruning).
@@ -116,6 +150,7 @@ impl SessionWorkingMemory {
     /// Clear all items from working memory.
     pub fn clear(&mut self) {
         self.items.clear();
+        self.scores.clear();
         self.last_query = None;
     }
     

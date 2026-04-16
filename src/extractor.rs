@@ -58,12 +58,17 @@ DO NOT extract any of these — return empty array [] if the input contains ONLY
 - Raw config file contents (YAML/JSON configuration being loaded, not discussed)
 - Heartbeat check results that are pure status repetition with no new information
 - Memory recall results being echoed back (content starting with "Recalled Memories" or lists of previously stored memories)
+- Trivial Q&A: single punctuation/emoji questions ("？", "ok", "👍") with filler responses ("嗯？怎么了", "收到", "好的")
+- Already-known identity facts: username, timezone, Telegram ID — these are in config files, not memories
+- Pure acknowledgments with no new information: "好的", "收到", "了解", "ok got it"
+- Repetitive status pings: "还在跑吗" → "还在跑" (no new state change)
 
 STILL extract from these (they contain real information):
 - Conversations about system instructions (e.g., "let's update SOUL.md to add X") — the discussion IS worth remembering
 - Heartbeat reports that discover actual issues (test failures, disk critical, new commits)
 - Status reports with decisions or action items
 - Any user preferences, requests, commitments, or decisions
+- Short messages that contain actual decisions: "ok 那就用方案B" — extract the decision, not the "ok"
 
 Respond with ONLY a JSON array (no markdown, no explanation):
 [{"content": "...", "memory_type": "...", "importance": 0.X, "confidence": "confident|likely|uncertain"}]

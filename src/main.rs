@@ -407,6 +407,69 @@ enum Commands {
         #[arg(long, short = 't')]
         entity_type: Option<String>,
     },
+
+    // === Knowledge Synthesis ===
+
+    /// Run knowledge synthesis (discover clusters, gate check, generate insights)
+    Synthesize {
+        /// Dry run: show clusters and gate decisions without making changes
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+
+    /// List synthesized insights
+    Insights {
+        /// Maximum number of results
+        #[arg(long, short = 'l', default_value = "20")]
+        limit: usize,
+
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+
+    /// Show details and provenance of a specific insight
+    Insight {
+        /// Insight memory ID
+        id: String,
+
+        /// Show source memories
+        #[arg(long)]
+        sources: bool,
+
+        /// Show provenance chain
+        #[arg(long)]
+        provenance: bool,
+
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+
+    /// Run unified sleep cycle (consolidation + synthesis)
+    Sleep {
+        /// Namespace (omit for all)
+        #[arg(long, short = 'n')]
+        ns: Option<String>,
+
+        /// Simulated days of consolidation
+        #[arg(long, short = 'd', default_value = "7.0")]
+        days: f64,
+
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+
+    /// Reverse a synthesis (restore sources, archive insight)
+    Unsynthesise {
+        /// Insight memory ID to reverse
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1298,6 +1361,216 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+            }
+        }
+
+        Commands::Synthesize { dry_run, json } => {
+            // Enable synthesis with defaults for this run
+            let mut settings = engramai::SynthesisSettings::default();
+            settings.enabled = true;
+
+            if dry_run {
+                mem.set_synthesis_settings(settings);
+                let report = mem.synthesize_dry_run()?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("Cluster Discovery: found {} clusters", report.clusters_found);
+                    println!();
+                    let mut synth_count = 0;
+                    let mut skip_count = 0;
+                    let mut defer_count = 0;
+                    let mut auto_count = 0;
+                    for gr in &report.gate_results {
+                        match &gr.decision {
+                            engramai::GateDecision::Synthesize { .. } => synth_count += 1,
+                            engramai::GateDecision::Skip { .. } => skip_count += 1,
+                            engramai::GateDecision::Defer { .. } => defer_count += 1,
+                            engramai::GateDecision::AutoUpdate { .. } => auto_count += 1,
+                        }
+                    }
+                    println!("Gate Check:");
+                    println!("  SYNTHESIZE:  {} clusters (ready for LLM)", synth_count);
+                    println!("  AUTO_UPDATE: {} clusters (existing insight covers)", auto_count);
+                    println!("  SKIP:        {} clusters (near-duplicate/covered)", skip_count);
+                    println!("  DEFER:       {} clusters (too recent/small)", defer_count);
+                    println!();
+                    println!("Dry run — no changes made. Run without --dry-run to execute.");
+                }
+            } else {
+                mem.set_synthesis_settings(settings);
+                let report = mem.synthesize()?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("Synthesis Cycle");
+                    println!("  Duration:     {:.1}s", report.duration.as_secs_f64());
+                    println!("  Clusters:     {} discovered, {} synthesized, {} auto-updated, {} skipped, {} deferred",
+                        report.clusters_found, report.clusters_synthesized,
+                        report.clusters_auto_updated, report.clusters_skipped, report.clusters_deferred);
+                    println!("  Insights:     {} created", report.insights_created.len());
+                    println!("  Demotions:    {} sources demoted", report.sources_demoted.len());
+
+                    if !report.insights_created.is_empty() {
+                        println!();
+                        for (i, id) in report.insights_created.iter().enumerate() {
+                            if let Ok(Some(record)) = mem.get(id) {
+                                let preview: String = record.content.chars().take(80).collect();
+                                println!("  [{}] {} — \"{}\"", i + 1, id, preview);
+                            }
+                        }
+                    }
+
+                    if !report.errors.is_empty() {
+                        println!();
+                        println!("  Errors:");
+                        for e in &report.errors {
+                            println!("    ⚠️  {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        Commands::Insights { limit, json } => {
+            let insights = mem.list_insights(Some(limit))?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&insights)?);
+            } else {
+                if insights.is_empty() {
+                    println!("No insights found. Run `engram synthesize` first.");
+                } else {
+                    println!("{:<12} {:<8} {:<8} {:<12} {}", "ID", "Type", "Sources", "Created", "Content");
+                    for insight in &insights {
+                        let meta = insight.metadata.as_ref();
+                        let synth_type = meta
+                            .and_then(|m| m.get("insight_type"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let source_count = meta
+                            .and_then(|m| m.get("source_count"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let created = insight.created_at.format("%Y-%m-%d");
+                        let preview: String = insight.content.chars().take(60).collect();
+                        let short_id: String = insight.id.chars().take(10).collect();
+                        println!("{:<12} {:<8} {:<8} {:<12} {}",
+                            short_id, synth_type, source_count, created, preview);
+                    }
+                    println!("\nTotal: {} insights", insights.len());
+                }
+            }
+        }
+
+        Commands::Insight { id, sources, provenance, json } => {
+            // Show insight details
+            let record = mem.get(&id)?;
+            match record {
+                None => {
+                    eprintln!("Error: memory '{}' not found", id);
+                    std::process::exit(1);
+                }
+                Some(record) => {
+                    if json {
+                        let mut output = serde_json::to_value(&record)?;
+                        if sources {
+                            let src = mem.insight_sources(&id)?;
+                            output["sources"] = serde_json::to_value(&src)?;
+                        }
+                        if provenance {
+                            let chain = mem.get_provenance(&id, 5)?;
+                            output["provenance"] = serde_json::to_value(&chain)?;
+                        }
+                        println!("{}", serde_json::to_string_pretty(&output)?);
+                    } else {
+                        println!("Insight: {}", record.id);
+                        let meta = record.metadata.as_ref();
+                        let synth_type = meta
+                            .and_then(|m| m.get("insight_type"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let confidence = meta
+                            .and_then(|m| m.get("confidence"))
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        println!("Type:    {}", synth_type);
+                        println!("Conf:    {:.2}", confidence);
+                        println!("Created: {}", record.created_at.format("%Y-%m-%dT%H:%M:%SZ"));
+                        println!("Content: {}", record.content);
+
+                        if sources {
+                            let src_records = mem.insight_sources(&id)?;
+                            if src_records.is_empty() {
+                                println!("\nNo provenance records found.");
+                            } else {
+                                println!("\nSources ({}):", src_records.len());
+                                println!("  {:<12} {:<10} {:<10} {}", "ID", "Orig Imp.", "Confidence", "Content");
+                                for pr in &src_records {
+                                    if let Ok(Some(src_mem)) = mem.get(&pr.source_id) {
+                                        let preview: String = src_mem.content.chars().take(50).collect();
+                                        let short_id: String = pr.source_id.chars().take(10).collect();
+                                        let orig_imp = pr.source_original_importance.unwrap_or(0.0);
+                                        println!("  {:<12} {:<10.2} {:<10.2} {}",
+                                            short_id, orig_imp, pr.confidence, preview);
+                                    }
+                                }
+                            }
+                        }
+
+                        if provenance {
+                            let chain = mem.get_provenance(&id, 5)?;
+                            let total: usize = chain.layers.iter().map(|l| l.len()).sum();
+                            println!("\nProvenance Chain ({} records across {} layers):", total, chain.layers.len());
+                            for (depth, layer) in chain.layers.iter().enumerate() {
+                                for pr in layer {
+                                    let indent = "  ".repeat(depth + 1);
+                                    println!("{}← {} (confidence: {:.2})", indent, pr.source_id, pr.confidence);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Commands::Sleep { ns, days, json } => {
+            // Enable synthesis for the sleep cycle
+            let mut settings = engramai::SynthesisSettings::default();
+            settings.enabled = true;
+            mem.set_synthesis_settings(settings);
+
+            let report = mem.sleep_cycle(days, ns.as_deref())?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "consolidation_ok": report.consolidation_ok,
+                    "synthesis": report.synthesis,
+                }))?);
+            } else {
+                println!("Sleep Cycle Complete");
+                println!("  Consolidation: ✅ ({:.1} days)", days);
+                match report.synthesis {
+                    Some(synth) => {
+                        println!("  Synthesis:     ✅ ({} clusters, {} insights, {:.1}s)",
+                            synth.clusters_found, synth.insights_created.len(), synth.duration.as_secs_f64());
+                    }
+                    None => {
+                        println!("  Synthesis:     ⏭️  (not enabled or no clusters)");
+                    }
+                }
+            }
+        }
+
+        Commands::Unsynthesise { id } => {
+            let result = mem.reverse_synthesis(&id)?;
+            println!("✅ Reversed synthesis of insight {}", result.insight_id);
+            println!("  Sources restored: {}", result.restored_sources.len());
+            for src in &result.restored_sources {
+                println!("    {} — original importance: {:.2}, restored: {}", 
+                    src.memory_id, src.original_importance, if src.restored { "✅" } else { "❌" });
             }
         }
     }

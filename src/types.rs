@@ -73,7 +73,7 @@ pub struct AclEntry {
 }
 
 /// Memory type classification following neuroscience categories.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryType {
     /// Factual knowledge: "SaltyHall uses Supabase"

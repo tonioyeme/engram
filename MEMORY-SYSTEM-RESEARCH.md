@@ -263,5 +263,80 @@
 
 ---
 
+## 7. 状态机 + 神经元激活热图（2026-04-10 potato 提出）
+
+### 7.1 问题
+
+Agent 重启 = 完全失忆。当前的解决方案（MEMORY.md + daily log + engram recall）是"翻旧笔记"模式——agent 被动地去搜索过去，而不是主动知道"我刚才在做什么"。
+
+这跟人脑不同。人睡一觉醒来，不需要翻日记才知道昨天在做什么——大脑有持续的激活状态，相关区域仍然"亮着"。
+
+### 7.2 两个层面
+
+#### Layer A: Working Context State Machine（显式状态）
+
+类比 GID ritual 的状态机，给 engram 加一个 **working context** 层：
+
+```
+状态转移：idle → active(task) → blocked(reason) → idle
+```
+
+具体存储：
+- `current_task`: 当前正在做什么（"ISS-007 修复"、"讨论 engram 架构"）
+- `conversation_with`: 跟谁在交互
+- `topic`: 当前话题
+- `status`: working / waiting_for_user / blocked / idle
+- `last_checkpoint`: 最后一个有意义的操作（"已修复 3/4 子任务，等用户确认第 4 个"）
+
+**特点**：离散的、显式的状态转移。Session 结束时自动 save，启动时自动 load。Agent 一醒来就知道"上次在做什么、做到哪了"。
+
+不是记忆，是**工作台**。类似你关上笔记本电脑再打开，所有窗口还在那里。
+
+#### Layer B: Activation Heatmap（隐式热度）
+
+利用 engram 已有的 ACT-R activation 模型，但把它从"被动排序工具"变成"主动感知信号"。
+
+核心想法：Session 启动时，扫描所有记忆的当前 activation 值，生成一个 **Top-K 概念热图**：
+
+```
+🔴 Hot (activation > 0.8):  engram, confidence, ISS-007, memory-fix
+🟡 Warm (0.5-0.8):          consolidation, neuroscience, Hindsight
+🟢 Cool (0.3-0.5):          xinfluencer, AgentVerse, trading
+```
+
+**这就是"亮着的神经元区域"**。Agent 不需要被告知"我们最近在搞 engram 修复"——它自己能感知到，因为那片区域的 activation 最高。
+
+实现方式：
+1. 对所有记忆算 ACT-R activation（已有公式：频率 × 时近 × 重要度）
+2. 从记忆内容提取关键概念（tags / 关键词）
+3. 聚合同概念记忆的 activation，得到概念级热度
+4. Top-K 注入 system prompt，作为"当前认知焦点"
+
+**跟 Hindsight 的 Observation 不同**：Observation 是合成新知识（"potato 是 Python 死忠"），Activation Heatmap 是感知当前注意力焦点（"最近在搞 engram"）。两者互补，不冲突。
+
+### 7.3 与现有架构的关系
+
+| 机制 | 类型 | 存储 | 用途 |
+|------|------|------|------|
+| ACT-R Activation | 连续值 | 内存计算 | recall 排序（已有） |
+| Hebbian Links | 连续权重 | SQLite | 关联记忆（已有） |
+| **Working Context** | 离散状态 | SQLite 新表 | session 持续性（新增） |
+| **Activation Heatmap** | 连续聚合 | 启动时计算 | 认知焦点感知（新增） |
+
+### 7.4 跨 Agent 共享场景
+
+Working Context + Activation Heatmap 天然支持多 agent 共享：
+- Agent A 在做 engram 修复 → save working context
+- Agent B 接手（或共享 namespace）→ load working context → 立刻知道 A 在做什么、做到哪了
+- Activation Heatmap 通过共享 SQLite 自动同步——A 大量 access engram 相关记忆 → B 启动时看到 engram 区域是亮的
+
+### 7.5 优先级建议
+
+- **Working Context**: P1，实现简单（一个 key-value 表 + session hook），效果立竿见影
+- **Activation Heatmap**: P2，需要关键词提取 + 聚合逻辑，但不需要 LLM 调用
+- 两个都不依赖 Layer 3-7 的 embedding / LLM pipeline，可以独立实施
+
+---
+
 *文档地址：`/Users/potato/clawd/projects/engram-ai-rust/MEMORY-SYSTEM-RESEARCH.md`*
 *后续在此文档上继续迭代。*

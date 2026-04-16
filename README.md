@@ -10,31 +10,120 @@ The result: an agent that *remembers* — where frequently-used knowledge stays 
 
 18,000+ lines of Rust · 309 tests · Zero unsafe
 
+```
+            ·  ˚  ✦  .    ·  ˚
+         ·    ENGRAM MEMORY    ✦
+       ˚   ╭─────────────────╮  ·
+     ✦    ╱  ✦ strong memory   ╲   ˚
+    ·    │  ··· ← recalled ← ···│    ·
+        │  · · · fading · · · · ·│
+       │  ░░░░░ forgotten ░░░░░░░│
+      ╰──────────────────────────╯
+        ↑ recall       ↑ store
+        │ strengthens  │ decays
+        ╰──── ACT-R ───╯
+```
+
+---
+
+## From Neuroscience to Code
+
+Engram isn't "inspired by" neuroscience — it implements specific, published models. Each mechanism maps directly to a biological counterpart:
+
+```
+┌──────────────────────────┐         ┌────────────────────────────────┐
+│      🧠 THE BRAIN        │         │       ⚙️ ENGRAM                │
+├──────────────────────────┤         ├────────────────────────────────┤
+│                          │         │                                │
+│ Prefrontal cortex        │ ──────▶ │ ACT-R activation model         │
+│ "What's relevant now?"   │         │ frequency × recency scoring    │
+│                          │         │                                │
+│ Hippocampal decay        │ ──────▶ │ Ebbinghaus forgetting curves   │
+│ "Use it or lose it"      │         │ exponential decay + spaced rep │
+│                          │         │                                │
+│ Synaptic plasticity      │ ──────▶ │ Hebbian learning               │
+│ "Fire together, wire     │         │ co-recall builds bidirectional │
+│  together"               │         │ associative links              │
+│                          │         │                                │
+│ Spike-timing dependent   │ ──────▶ │ STDP temporal ordering         │
+│ plasticity               │         │ A before B → A causes B?       │
+│ "Order encodes causality"│         │ directional link strengthening │
+│                          │         │                                │
+│ Sleep consolidation      │ ──────▶ │ Dual-trace consolidation       │
+│ Hippocampus → Neocortex  │         │ "sleep" cycle: replay strong   │
+│ "Replay to remember"     │         │ memories, decay weak ones      │
+│                          │         │                                │
+│ Synaptic homeostasis     │ ──────▶ │ Homeostatic scaling            │
+│ (Turrigiano 2008)        │         │ bounded link strength,         │
+│ "Keep the network stable"│         │ adaptive thresholds            │
+│                          │         │                                │
+│ Emotional tagging        │ ──────▶ │ Emotional bus                  │
+│ Amygdala modulation      │         │ per-domain valence tracking,   │
+│ "Feelings color memory"  │         │ drive alignment scoring        │
+│                          │         │                                │
+│ Insight / "Aha!" moments │ ──────▶ │ Synthesis engine               │
+│ Default mode network     │         │ cluster → gate → generate →    │
+│ "Connections emerge"     │         │ provenance-tracked insights    │
+└──────────────────────────┘         └────────────────────────────────┘
+```
+
+---
+
+## The Life of a Memory
+
+```
+                        ┌──────────┐
+                        │  Input   │    "Rust 1.75 added async traits"
+                        └────┬─────┘
+                             │
+                    ┌────────▼────────┐
+                    │  Store & Index  │    embed + FTS5 + entity extract
+                    └────────┬────────┘    + type classify (factual)
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+     ┌────────────┐  ┌────────────┐  ┌────────────┐
+     │  Activate  │  │   Forget   │  │   Link     │
+     │  (ACT-R)   │  │(Ebbinghaus)│  │ (Hebbian)  │
+     │            │  │            │  │            │
+     │ recalled   │  │ not used   │  │ co-recalled│
+     │ 3x today → │  │ for weeks →│  │ with "Rust │
+     │ activation │  │ activation │  │ async" →   │
+     │ ▲▲▲        │  │ ▽▽▽        │  │ link ▲▲    │
+     └──────┬─────┘  └──────┬─────┘  └──────┬─────┘
+            │               │               │
+            └───────────────┼───────────────┘
+                            │
+                   ┌────────▼────────┐
+                   │  Consolidation  │    "sleep" cycle
+                   │  (dual-trace)   │    strong → long-term ✓
+                   │                 │    weak → decay further ✗
+                   └────────┬────────┘
+                            │
+              ┌─────────────┼─────────────┐
+              ▼                           ▼
+     ┌────────────────┐          ┌────────────────┐
+     │  Long-term     │          │  Synthesize    │
+     │  Memory        │          │                │
+     │  survives      │          │  cluster with  │
+     │  indefinitely  │          │  related →     │
+     └────────────────┘          │  "Aha!" insight│
+                                 └────────────────┘
+```
+
 ---
 
 ## Why Not Just a Vector DB?
 
-Vector databases give you **store → embed → retrieve**. That's a filing cabinet, not memory.
-
-Real memory is alive:
-
-- **Memories you use often stay strong** — ACT-R activation modeling (Anderson 1993)
-- **Memories you don't use fade** — Ebbinghaus exponential forgetting curves
-- **Related memories strengthen each other** — Hebbian associative learning
-- **Temporal order implies causality** — STDP (spike-timing dependent plasticity)
-- **Sleep consolidates what matters** — dual-trace hippocampus → neocortex transfer
-- **Clusters of memories generate new insights** — synthesis engine with full provenance
-- **Emotional patterns accumulate per domain** — not just what happened, but how it felt
-
 | | **Vector DB** | **Engram** |
 |--|--------------|-----------|
 | Store | Embed + insert | Embed + insert + extract entities + type-classify |
-| Retrieve | Cosine similarity | **3-signal fusion**: FTS5 (15%) + vector (60%) + ACT-R activation (25%) |
-| Frequently used memories | Same score every time | **Stronger** — ACT-R boosts by access frequency + recency |
+| Retrieve | Cosine similarity | **3-signal fusion**: FTS5 + vector + ACT-R activation |
+| Frequently used memories | Same score every time | **Stronger** — ACT-R boosts by access pattern |
 | Unused memories | Same score forever | **Fade** — Ebbinghaus exponential decay |
-| Related memories | Independent | **Strengthen each other** — Hebbian links + STDP causal ordering |
-| Over time | Database grows forever | **Consolidation** — "sleep" cycle transfers important memories, prunes weak ones |
-| Patterns across memories | You write the code | **Automatic** — synthesis engine discovers clusters and generates insights |
+| Related memories | Independent | **Strengthen each other** — Hebbian + STDP |
+| Over time | Database grows forever | **Consolidation** — "sleep" prunes weak, keeps strong |
+| Patterns across memories | You write the code | **Automatic** — synthesis engine with provenance |
 | Emotional context | None | **Per-domain valence tracking** |
 
 ---
@@ -125,19 +214,8 @@ mem.undo_synthesis(insight_id)?;
 
 ---
 
-## 🧠 Cognitive Science Modules
-
-### 🔬 Core Memory Models
-
-- **ACT-R Activation** — Base-level activation from frequency + recency (Anderson 1993). Memories accessed more often and more recently have higher retrieval probability. Spreading activation from contextually related memories.
-
-- **Ebbinghaus Forgetting** — Exponential decay curves with spaced repetition (Ebbinghaus 1885). Each successful recall resets the decay clock and extends retention. Configurable decay rates per agent type.
-
-- **Hebbian Learning** — "Neurons that fire together wire together" (Hebb 1949). Co-recalled memories form bidirectional associative links with strength that grows on repeated co-activation.
-
-- **STDP** — Spike-Timing Dependent Plasticity (Markram 1997). Temporal ordering matters: if memory A is consistently recalled *before* B, the A→B link strengthens while B→A weakens. Infers causal relationships from access patterns.
-
-- **Consolidation** — Dual-trace theory (McClelland 1995). "Sleep" cycle transfers high-activation short-term memories to long-term storage. Weakly-activated memories decay further. Configurable replay count and threshold.
+<details>
+<summary><b>🧠 Implementation Details — Cognitive Science Modules</b></summary>
 
 ### 🔍 Hybrid Search
 
@@ -152,49 +230,41 @@ Final Score = w_fts × FTS5_score + w_vec × cosine_sim + w_actr × activation
 - **Vector**: Cosine similarity via Nomic, Ollama, or any OpenAI-compatible endpoint
 - **ACT-R**: Biases toward memories that are *currently relevant*, not just semantically similar
 
-Adaptive mode auto-adjusts weights based on query characteristics.
-
 ### 🎯 Confidence Scoring
 
-Two-dimensional assessment — "how relevant?" and "how reliable?" are different questions:
+Two-dimensional: "how relevant?" and "how reliable?" are different questions:
 
 - **Retrieval Salience**: Search score + activation + recency
-- **Content Reliability**: Access count + corroboration by other memories + consistency
-- **Labels**: `high` / `medium` / `low` / `uncertain` — human-readable for LLM consumption
+- **Content Reliability**: Access count + corroboration + consistency
+- **Labels**: `high` / `medium` / `low` / `uncertain`
 
 ### 🧩 Synthesis Engine (3,500+ lines)
-
-Automatic insight generation from memory clusters:
 
 ```
 Memories → Cluster Discovery → Gate Check → LLM Insight → Provenance → Store
               (4-signal)       (quality)    (templated)    (auditable)
 ```
 
-1. **Clustering** — Groups related memories using 4 signals: Hebbian weight, entity overlap (Jaccard), embedding cosine similarity, temporal proximity
-2. **Gate** — Quality check: minimum cluster size, diversity, information density, temporal spread
+1. **Clustering** — 4 signals: Hebbian weight, entity Jaccard, embedding cosine, temporal proximity
+2. **Gate** — Minimum cluster size, diversity, density, temporal spread
 3. **Insight Generation** — Type-aware LLM prompts (factual patterns, episodic threads, causal chains)
-4. **Provenance** — Full audit trail: which memories contributed, cluster source, gate criteria met. Insights are reversible (`UndoSynthesis`)
+4. **Provenance** — Full audit trail. Insights are reversible (`UndoSynthesis`)
 
 ### 💚 Emotional Bus (2,500+ lines)
 
-Cognitive bus for agent self-awareness:
-
-- **Emotional Accumulator** — Per-domain valence tracking over time. Detects persistent negative trends → suggests SOUL.md updates
-- **Drive Alignment** — Scores how well new memories align with the agent's core drives. Embedding-based, handles cross-language naturally (Chinese SOUL + English content)
-- **Behavior Feedback** — Tracks action success/failure rates. Surfaces patterns for self-correction
-- **Subscriptions** — Cross-agent intelligence: agents subscribe to namespaces, get notified of high-importance memories
+- **Emotional Accumulator** — Per-domain valence over time. Detects negative trends → suggests SOUL.md updates
+- **Drive Alignment** — Cross-language embedding scoring (Chinese SOUL + English content)
+- **Behavior Feedback** — Action success/failure rate tracking
+- **Subscriptions** — Cross-agent notification on high-importance memories
 
 ### ⚖️ Synaptic Homeostasis
 
-Memory systems that only accumulate eventually choke on their own weight. Engram implements homeostatic mechanisms inspired by synaptic scaling (Turrigiano 2008):
+- **Forgetting as feature** — Ebbinghaus decay = garbage collection
+- **Consolidation threshold** — Rising bar as memory count grows
+- **Hebbian normalization** — Bounded link strength prevents runaway reinforcement
+- **Synthesis pruning** — Insight preserves information; sources can safely decay
 
-- **Forgetting as feature** — Ebbinghaus decay isn't a bug, it's garbage collection. Low-value memories fade naturally without manual pruning
-- **Consolidation threshold** — Only memories above activation threshold survive "sleep" cycles. The bar automatically rises as total memory count grows
-- **Hebbian normalization** — Link strengths are bounded to prevent runaway reinforcement. The strongest link in a neighborhood can't exceed a configurable ceiling
-- **Synthesis pruning** — Source memories that have been synthesized into insights can be safely decayed — the insight preserves their information at higher abstraction
-
-The result: an agent running for months doesn't slow down or lose relevance. Memory stays fit.
+</details>
 
 ---
 

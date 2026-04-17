@@ -73,7 +73,7 @@
 | C4 | **LLM Reconciler** | 矛盾记忆 → LLM 决定保留哪个/如何合并 | 无 | 高 |
 | C5 | **Observation Consolidation** | 多条观察 → 合成为一条知识（"见过5次X→X是事实"） | synthesis 部分覆盖 | 中 |
 | C6 | **Entity Graph** | 实体关系网络（Person→worksAt→Company） | schema 有，代码零（ISS-009） | 高 |
-| C7 | **Multi-Retrieval Fusion** | TEMPR 级检索（时间+实体+语义+元数据+图多路融合） | 无 | 高 |
+| C7 | **Multi-Retrieval Fusion** | TEMPR 级检索（时间+实体+语义+元数据+图多路融合） | ✅ 已实现 | 高 |
 | C8 | **Working Context State Machine** | 对话上下文的状态管理（不只是最近N条） | 无 | 中 |
 | C9 | **Activation Heatmap** | 可视化记忆激活分布，调试 + 洞察 | 无 | 低 |
 

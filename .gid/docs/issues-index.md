@@ -607,7 +607,7 @@ F1-P1 (信号格式) → F1-P2 (Hub 核心) → F1-P3 (GWT 广播)
 | **F3-C4** | LLM Reconciler | 矛盾记忆 → LLM 决定保留/合并 | ISS-005 扩展 | todo |
 | **F3-C5** | Observation Consolidation | 多条观察 → 合成一条知识 | ISS-005 | todo |
 | **F3-C6** | Entity Graph | 实体关系网络 | **ISS-009** | todo |
-| **F3-C7** | Multi-Retrieval Fusion | TEMPR 级多路融合检索 | ISS-006 扩展 | todo |
+| **F3-C7** | Multi-Retrieval Fusion | TEMPR 级多路融合检索 | ISS-006 扩展 | ✅ done |
 | **F3-C8** | Working Context State Machine | 对话上下文状态管理 | — | todo |
 | **F3-C9** | Activation Heatmap | 记忆激活分布可视化 | — | todo |
 

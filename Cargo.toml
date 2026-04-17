@@ -52,6 +52,10 @@ jieba-rs = "0.8.1"
 [dev-dependencies]
 tempfile = "3.13"
 
+[features]
+default = []
+kc = []  # Knowledge Compiler — topic compilation, maintenance, and platform
+
 [[example]]
 name = "basic_usage"
 path = "examples/basic_usage.rs"

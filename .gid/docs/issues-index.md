@@ -656,6 +656,55 @@ F1-P1 (信号格式) → F1-P2 (Hub 核心) → F1-P3 (GWT 广播)
 
 ---
 
+## ISS-014 [improvement] [P2] [open]
+**标题**: Storage Trait 抽象 — 解耦算法层与 SQLite 后端
+**发现日期**: 2026-04-16
+**发现者**: potato
+**组件**: storage.rs
+**跨项目引用**: —
+
+**描述**:
+当前 `storage.rs` (~2545 行) 直接调用 `rusqlite`，算法层（ACT-R、Hebbian、Infomap）与存储后端紧耦合。需要抽取 `MemoryStore` trait，让算法代码只依赖接口，不依赖具体存储实现。
+
+**动机**:
+- 多 agent 共享记忆是未来方向 — SQLite 单写者模型在 10+ agent 并发写入时扛不住
+- 算法代码（ACT-R decay、Hebbian learning、Infomap clustering）只需要"给我节点"和"给我边"，不应关心数据存在哪
+- 当前无法换后端而不重写 2500+ 行代码
+
+**设计草案**:
+```rust
+trait MemoryStore {
+    fn store(&self, memory: &Memory) -> Result<()>;
+    fn recall(&self, query: &str, limit: usize) -> Result<Vec<Memory>>;
+    fn update_hebbian(&self, a: &str, b: &str, delta: f64) -> Result<()>;
+    fn get_hebbian_edges(&self) -> Result<Vec<(String, String, f64)>>;
+    fn search_hybrid(&self, query: &str, embedding: &[f32]) -> Result<Vec<Memory>>;
+    fn prune_weak(&self, threshold: f64) -> Result<usize>;
+    // ... full interface TBD during implementation
+}
+
+struct SqliteStore { ... }     // 现有代码包装，零行为变更
+// Future:
+// struct PgStore { ... }       // PostgreSQL + pgvector
+// struct SurrealStore { ... }  // SurrealDB
+```
+
+**范围**:
+- 从 `storage.rs` 公开 API 提取 trait 接口
+- 实现 `SqliteStore`（搬现有代码，零行为变更）
+- 所有调用方改为依赖 trait 而非具体类型
+- 所有现有测试必须通过，无修改
+
+**优先级**: P2 — 当前不阻塞任何工作。在多 agent 记忆共享之前完成即可。
+
+**上下文**:
+2026-04-16 讨论：potato 问 SQLite 能否支持未来多 agent 并发写入。结论：SQLite 现阶段够用（2-3 agent），但算法层应与存储解耦，以便未来迁移无痛。
+
+**相关**:
+- ISS-009 (Infomap 集成) — 聚类算法不关心存储，但需要通过 trait 获取边列表
+- Knowledge Compiler 产品 — 首个大规模记忆消费者
+- 多 agent engram 共享 — 触发实际换后端的时机
+
 ---
 
 # 全局实现路线建议 (2026-04-16)
@@ -667,6 +716,7 @@ F1-P1 (信号格式) → F1-P2 (Hub 核心) → F1-P3 (GWT 广播)
 - ISS-011 (P2) Recall 结果去重
 - ISS-012 (P2) Importance 校准
 - ISS-013 (P3) STDP 审计
+- ISS-014 (P2) Storage Trait 抽象 — 解耦算法层与存储后端
 
 **Feature 推荐顺序：**
 1. **ISS-009 + ISS-011 + ISS-012** — 操作性修复，直接提升 recall 质量

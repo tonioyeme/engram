@@ -1,3 +1,4 @@
+# KC graph complete: 23 tasks across 7 layers (types→config→platform→discovery→pipeline→cli→api). All subtask_of and depends_on edges wired.
 project: null
 nodes:
 - id: phase-a
@@ -89,8 +90,8 @@ nodes:
   priority: 20
   metadata:
     iss: ISS-009
-    ritual: true
     project: engramai
+    ritual: true
 - id: entity-types
   title: 'B1.1: Entity types & config structs'
   status: todo
@@ -113,12 +114,12 @@ nodes:
   priority: 20
   metadata:
     iss: ISS-009
+    project: engramai
     files:
     - src/entities.rs
     - src/config.rs
     - Cargo.toml
     - src/lib.rs
-    project: engramai
 - id: entity-unit-tests
   title: 'B1.2: EntityExtractor unit tests'
   status: todo
@@ -164,10 +165,10 @@ nodes:
   - storage
   priority: 20
   metadata:
-    project: engramai
     iss: ISS-009
     files:
     - src/storage.rs
+    project: engramai
 - id: entity-add-raw
   title: 'B1.4: Integrate entity extraction into add_raw()'
   status: todo
@@ -190,10 +191,10 @@ nodes:
   - write-path
   priority: 20
   metadata:
+    iss: ISS-009
     files:
     - src/memory.rs
     - src/config.rs
-    iss: ISS-009
     project: engramai
 - id: entity-recall
   title: 'B1.5: Entity-aware recall channel'
@@ -216,11 +217,11 @@ nodes:
   - recall
   priority: 20
   metadata:
-    iss: ISS-009
-    project: engramai
     files:
     - src/entities.rs
     - src/memory.rs
+    project: engramai
+    iss: ISS-009
 - id: entity-backfill
   title: 'B1.6: Backfill CLI command for existing memories'
   status: todo
@@ -267,10 +268,10 @@ nodes:
   - tests
   priority: 20
   metadata:
-    files:
-    - tests/entity_integration_test.rs
     project: engramai
     iss: ISS-009
+    files:
+    - tests/entity_integration_test.rs
 - id: b2-dedup
   title: 'B2: Dedup on write — embedding similarity + merge (ISS-003)'
   status: done
@@ -288,8 +289,8 @@ nodes:
   - dedup
   priority: 25
   metadata:
-    project: engramai
     iss: ISS-003
+    project: engramai
 - id: b3-confidence
   title: 'B3: Confidence score — 多信号融合 recall confidence (ISS-007)'
   status: todo
@@ -421,7 +422,7 @@ nodes:
   type: component
 - id: kc-compilation
   title: 'KC: Topic Compilation & Feedback'
-  status: done
+  status: todo
   description: 'Topic discovery → compilation → incremental recompilation → merge/split → feedback loop. Design: .gid/features/knowledge-compiler/compilation/design.md'
   tags:
   - kc
@@ -448,7 +449,7 @@ nodes:
   type: feature
 - id: kc-topic-discovery
   title: Topic Discovery (clustering + LLM labeling)
-  status: done
+  status: todo
   description: §3.1 TopicDiscovery — discover topic candidates from memory clusters via 4-signal clustering + LLM labeling. Reuses synthesis::cluster. GOAL-comp.1, GOAL-comp.2
   tags:
   - kc
@@ -459,10 +460,10 @@ nodes:
   metadata:
     design_ref: compilation/design.md §3.1
     file: src/compiler/discovery.rs
-    goals: GOAL-comp.1
+    goals: GOAL-comp.1, GOAL-comp.2
 - id: kc-compilation-pipeline
   title: Compilation Pipeline (compile + provenance + failure handling)
-  status: done
+  status: todo
   description: §3.2 CompilationPipeline — compile topic pages from candidates with provenance tracking. compile_new, recompile_full, recompile_partial. Citation parsing + ProvenanceRecord. GOAL-comp.1 (page generation), GOAL-comp.3 (provenance), GOAL-comp.10 (failure handling)
   tags:
   - kc
@@ -471,12 +472,12 @@ nodes:
   priority: 10
   type: task
   metadata:
-    goals: GOAL-comp.2, GOAL-comp.3, GOAL-comp.6
+    design_ref: compilation/design.md §3.2
+    goals: GOAL-comp.1, GOAL-comp.3, GOAL-comp.10
     file: src/compiler/pipeline.rs
-    design_ref: compilation/design.md §3.2, §3.5
 - id: kc-incremental-trigger
   title: Incremental Trigger (change detection + recompile decision)
-  status: done
+  status: todo
   description: §3.3 IncrementalTrigger — detect when recompilation needed, decide skip/partial/full. ChangeSet diffing + content hash dedup. GOAL-comp.3 (incremental), GOAL-comp.10 (cost awareness)
   tags:
   - kc
@@ -485,12 +486,12 @@ nodes:
   priority: 10
   type: task
   metadata:
+    goals: GOAL-comp.3, GOAL-comp.4, GOAL-comp.5
     design_ref: compilation/design.md §3.3
-    goals: GOAL-comp.4, GOAL-comp.5
     file: src/compiler/trigger.rs
 - id: kc-topic-lifecycle
   title: Topic Lifecycle (merge + split)
-  status: done
+  status: todo
   description: §3.4 TopicLifecycle — merge overlapping topics, split divergent ones. Overlap detection, re-clustering, provenance preservation. GOAL-comp.4, GOAL-comp.5
   tags:
   - kc
@@ -500,25 +501,25 @@ nodes:
   type: task
   metadata:
     design_ref: compilation/design.md §3.4
-    file: src/compiler/lifecycle.rs
     goals: GOAL-comp.4, GOAL-comp.5
+    file: src/compiler/lifecycle.rs
 - id: kc-feedback-processor
-  title: 'KC Feedback: Point Feedback + Dry Run (src/compiler/feedback.rs)'
-  status: done
+  title: Feedback Processor (user corrections + prompt context)
+  status: todo
   description: §3.5 FeedbackProcessor — record user feedback, build prompt context for recompilation, trigger recompile on corrections. GOAL-comp.7 (manual edit), GOAL-comp.8 (point feedback)
   tags:
-  - knowledge-compiler
-  - p1
+  - kc
   - compilation
+  - p0-p1
   priority: 30
   type: task
   metadata:
     design_ref: compilation/design.md §3.5
-    goals: GOAL-comp.8, GOAL-comp.9
     file: src/compiler/feedback.rs
+    goals: GOAL-comp.7, GOAL-comp.8, GOAL-comp.9
 - id: kc-quality-scorer
   title: Quality Scorer (coherence + coverage + freshness)
-  status: done
+  status: todo
   description: §3.6 QualityScorer — multi-dimensional quality assessment (coherence, coverage, freshness). Heuristic scoring, suggestions gen. GOAL-comp.9 (dry run preview uses quality info), GOAL-comp.10
   tags:
   - kc
@@ -528,11 +529,11 @@ nodes:
   type: task
   metadata:
     goals: GOAL-comp.10
-    file: src/compiler/quality.rs
     design_ref: compilation/design.md §3.6
+    file: src/compiler/quality.rs
 - id: kc-decay-engine
   title: Decay Engine (time + access decay)
-  status: done
+  status: todo
   description: §2.1 DecayEngine — time-based + access-based decay with configurable half-lives. evaluate_topic, evaluate_all, apply_decay. GOAL-maint.1
   tags:
   - kc
@@ -546,7 +547,7 @@ nodes:
     design_ref: maintenance/design.md §2.1
 - id: kc-conflict-detector
   title: Conflict Detector (contradictions + duplicates)
-  status: done
+  status: todo
   description: '§2.2 ConflictDetector — contradiction detection + near-duplicate detection. Two-phase: candidate selection (embedding/overlap) → LLM check. GOAL-maint.2, GOAL-maint.4'
   tags:
   - kc
@@ -556,8 +557,8 @@ nodes:
   type: task
   metadata:
     file: src/compiler/conflict.rs
-    goals: GOAL-maint.2, GOAL-maint.4
     design_ref: maintenance/design.md §2.2
+    goals: GOAL-maint.2, GOAL-maint.4
 - id: kc-health-auditor
   title: Health Auditor (link integrity + health reports)
   status: todo
@@ -569,12 +570,12 @@ nodes:
   priority: 30
   type: task
   metadata:
+    design_ref: maintenance/design.md §2.3
     goals: GOAL-maint.3, GOAL-maint.5, GOAL-maint.5b
     file: src/compiler/health.rs
-    design_ref: maintenance/design.md §2.3
 - id: kc-export-engine
   title: Export Engine (JSON/Markdown/SQLite + privacy filter)
-  status: done
+  status: todo
   description: §2.4 ExportEngine — export to JSON/Markdown/SQLite, import with dedup. Privacy enforcement on export. GOAL-maint.6 (knowledge-aware recall), GOAL-maint.7 (markdown export)
   tags:
   - kc
@@ -583,9 +584,9 @@ nodes:
   priority: 10
   type: task
   metadata:
-    file: src/compiler/export.rs
     goals: GOAL-maint.6, GOAL-maint.7
     design_ref: maintenance/design.md §2.4
+    file: src/compiler/export.rs
 - id: kc-cli
   title: CLI Interface (knowledge subcommands)
   status: todo
@@ -597,9 +598,9 @@ nodes:
   priority: 10
   type: task
   metadata:
-    file: src/compiler/cli.rs
-    goals: GOAL-maint.8
     design_ref: maintenance/design.md §2.5
+    goals: GOAL-maint.8
+    file: src/compiler/cli.rs
 - id: kc-api
   title: Programmatic API (MaintenanceApi)
   status: todo
@@ -612,11 +613,11 @@ nodes:
   type: task
   metadata:
     file: src/compiler/api.rs
-    design_ref: maintenance/design.md §2.6
     goals: GOAL-maint.9
+    design_ref: maintenance/design.md §2.6
 - id: kc-privacy-guard
   title: Privacy Guard (levels + redaction + audit log)
-  status: done
+  status: todo
   description: §2.7 PrivacyGuard — privacy levels (public/sensitive/private), redaction pipeline, audit logging. GOAL-maint.10, GOAL-maint.11
   tags:
   - kc
@@ -625,12 +626,12 @@ nodes:
   priority: 10
   type: task
   metadata:
-    file: src/compiler/privacy.rs
-    design_ref: maintenance/design.md §2.7
     goals: GOAL-maint.10, GOAL-maint.11
+    design_ref: maintenance/design.md §2.7
+    file: src/compiler/privacy.rs
 - id: kc-maintenance-lock
   title: Maintenance Lock (multi-process safety)
-  status: done
+  status: todo
   description: §3 MaintenanceLock — file-based leader election for multi-process safety. Stale lock recovery. GOAL-maint.12
   tags:
   - kc
@@ -639,12 +640,12 @@ nodes:
   priority: 30
   type: task
   metadata:
-    file: src/compiler/lock.rs
     goals: GOAL-maint.12
     design_ref: maintenance/design.md §3
+    file: src/compiler/lock.rs
 - id: kc-llm-provider
   title: LLM Provider (multi-provider + model router + token budget)
-  status: done
+  status: todo
   description: §2.1 LlmProvider trait + OpenAI/Anthropic/Local impls + ModelRouter (task-based model selection) + token budget enforcement. GOAL-plat.1, GOAL-plat.2, GOAL-plat.3
   tags:
   - kc
@@ -658,7 +659,7 @@ nodes:
     goals: GOAL-plat.1, GOAL-plat.2, GOAL-plat.3
 - id: kc-config
   title: Configuration Management (zero-config + TOML + resolution)
-  status: done
+  status: todo
   description: §2.2 ConfigManagement — zero-config defaults, TOML config file, 4-layer resolution (CLI > env > project > user > default). GOAL-plat.2 (config file), GOAL-plat.7 (zero-config), GOAL-plat.8 (progressive disclosure)
   tags:
   - kc
@@ -667,12 +668,12 @@ nodes:
   priority: 5
   type: task
   metadata:
-    file: src/compiler/config.rs
     design_ref: platform/design.md §2.2
     goals: GOAL-plat.2, GOAL-plat.7, GOAL-plat.8
+    file: src/compiler/config.rs
 - id: kc-embedding-pipeline
   title: Embedding Pipeline (auto-download + cache + model mgmt)
-  status: done
+  status: todo
   description: §2.3 EmbeddingPipeline — auto-download models, model management (list/remove/switch), per-memory embedding cache with model tagging. GOAL-plat.4, GOAL-plat.5, GOAL-plat.6
   tags:
   - kc
@@ -681,12 +682,12 @@ nodes:
   priority: 5
   type: task
   metadata:
-    goals: GOAL-plat.4, GOAL-plat.5, GOAL-plat.6
     design_ref: platform/design.md §2.3
     file: src/compiler/embedding.rs
+    goals: GOAL-plat.4, GOAL-plat.5, GOAL-plat.6
 - id: kc-import
   title: Import Pipeline (Markdown + Obsidian + URL + dedup)
-  status: done
+  status: todo
   description: §2.4 Import/Export — Markdown/Logseq/Obsidian/JSON importers + duplicate handling (content hash + near-dupe embedding). GOAL-plat.8, GOAL-plat.9, GOAL-plat.10, GOAL-plat.11
   tags:
   - kc
@@ -710,11 +711,11 @@ nodes:
   type: task
   metadata:
     file: src/compiler/intake.rs
-    goals: GOAL-plat.12, GOAL-plat.13
     design_ref: platform/design.md §2.5
+    goals: GOAL-plat.12, GOAL-plat.13
 - id: kc-degradation
   title: Graceful Degradation (capability levels + fallback chain)
-  status: done
+  status: todo
   description: §2.6 GracefulDegradation — CapabilityLevel detection (Minimal/Embeddings/Full), FallbackProvider chain, actionable error messages. GOAL-plat.3, GOAL-plat.14, GOAL-plat.15, GOAL-plat.16
   tags:
   - kc
@@ -723,12 +724,12 @@ nodes:
   priority: 10
   type: task
   metadata:
-    goals: GOAL-plat.3, GOAL-plat.14, GOAL-plat.15, GOAL-plat.16
     design_ref: platform/design.md §2.6
     file: src/compiler/degradation.rs
+    goals: GOAL-plat.3, GOAL-plat.14, GOAL-plat.15, GOAL-plat.16
 - id: kc-types
   title: KC Shared Types (TopicPage, CompilationRecord, etc.)
-  status: done
+  status: todo
   description: 'Shared KC types from architecture doc §4: TopicPage, TopicId, CompilationRecord, SourceMemoryRef, KcConfig, RecompileStrategy, FeedbackEntry, FeedbackKind, HealthReport, TopicStatus, plus feature-local types from compilation §2.1 (TopicCandidate, ChangeSet, TriggerDecision, LifecycleOp, TopicFeedback, QualityReport)'
   tags:
   - kc
@@ -740,8 +741,8 @@ nodes:
     file: src/compiler/types.rs
 - id: kc-storage
   title: KC Storage Schema (SQLite tables + migrations)
-  status: done
-  description: 'SQLite storage for KC — topic_pages + compilation_records + compilation_sources tables. Must expose KnowledgeStore trait with: create_topic_page(), update_topic_page(), get_topic_page(), list_topic_pages(), delete_topic_page(), save_compilation_record(), get_compilation_record(), get_pages_by_status(), update_activity_score(), mark_archived(), get_stale_pages(). All downstream modules (decay, conflict, health, export, etc.) depend on this trait interface.'
+  status: todo
+  description: 'SQLite schema extensions for KC: kc_topics table, kc_compilation_records, kc_feedback, kc_conflicts, kc_audit_log, knowledge_audit_log. Migration from existing engram schema. KnowledgeStore abstraction.'
   tags:
   - kc
   - foundation
@@ -752,7 +753,7 @@ nodes:
     file: src/compiler/storage.rs
 - id: kc-mod
   title: KC Module Scaffold (mod.rs + feature flag)
-  status: done
+  status: todo
   description: src/compiler/mod.rs — module declaration, re-exports, compiler module entry point. Feature flag gating (kc feature flag).
   tags:
   - kc
@@ -762,43 +763,6 @@ nodes:
   type: task
   metadata:
     file: src/compiler/mod.rs
-- id: kc-manual-edit
-  title: 'KC Manual Edit: Topic Page Direct Editing (src/compiler/feedback.rs)'
-  status: done
-  description: Implement manual edit capability for topic pages — user can directly edit compiled page content, edits persist across recompilation cycles. GOAL-comp.7 (P0). Shares feedback.rs with kc-feedback-processor but this is the P0 portion.
-  tags:
-  - knowledge-compiler
-  - p0
-  - compilation
-  priority: 8
-  metadata:
-    file: src/compiler/feedback.rs
-    goals: GOAL-comp.7
-    design_ref: compilation/design.md §3.5
-- id: kc-unit-tests
-  title: KC Unit Tests (per-module)
-  status: inprogress
-  description: 'Unit tests for each KC module: types serialization, storage CRUD, topic discovery clustering, compilation pipeline stages, decay scoring, conflict detection, export formatting. Each module gets its own test submodule. Target: >80% coverage on P0 modules.'
-  tags:
-  - knowledge-compiler
-  - p0
-  - testing
-  priority: 9
-  metadata:
-    goals: GUARD-2 (correctness)
-    file: src/compiler/tests/
-- id: kc-integration-tests
-  title: KC Integration Tests (end-to-end flows)
-  status: todo
-  description: 'End-to-end integration tests: (1) memories → compile → topic pages with provenance, (2) incremental recompilation on memory change, (3) CLI compile + list + export round-trip, (4) Markdown import → compile → export → compare, (5) decay + archive lifecycle. Uses temp DB, no LLM mock needed (use deterministic test provider).'
-  tags:
-  - knowledge-compiler
-  - p0
-  - testing
-  priority: 10
-  metadata:
-    goals: GUARD-2 (correctness)
-    file: tests/knowledge_compiler.rs
 edges:
 - from: a1-hook-filter
   to: phase-a
@@ -1174,43 +1138,4 @@ edges:
   relation: depends_on
 - from: kc-maintenance-lock
   to: kc-types
-  relation: depends_on
-- from: kc-manual-edit
-  to: kc-compilation-pipeline
-  relation: depends_on
-- from: kc-unit-tests
-  to: kc-types
-  relation: depends_on
-- from: kc-unit-tests
-  to: kc-storage
-  relation: depends_on
-- from: kc-unit-tests
-  to: kc-topic-discovery
-  relation: depends_on
-- from: kc-unit-tests
-  to: kc-compilation-pipeline
-  relation: depends_on
-- from: kc-unit-tests
-  to: kc-decay-engine
-  relation: depends_on
-- from: kc-unit-tests
-  to: kc-conflict-detector
-  relation: depends_on
-- from: kc-unit-tests
-  to: kc-export-engine
-  relation: depends_on
-- from: kc-unit-tests
-  to: kc-embedding-pipeline
-  relation: depends_on
-- from: kc-unit-tests
-  to: kc-manual-edit
-  relation: depends_on
-- from: kc-integration-tests
-  to: kc-compilation-pipeline
-  relation: depends_on
-- from: kc-integration-tests
-  to: kc-cli
-  relation: depends_on
-- from: kc-integration-tests
-  to: kc-import
   relation: depends_on

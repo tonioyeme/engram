@@ -90,6 +90,7 @@
 
 pub mod anomaly;
 pub mod bus;
+pub mod compiler;
 pub mod confidence;
 pub mod entities;
 pub mod config;

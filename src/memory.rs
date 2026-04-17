@@ -625,7 +625,19 @@ impl Memory {
                         "Dedup: merging into existing memory {} (similarity: {:.4})",
                         existing_id, similarity
                     );
-                    self.storage.merge_memory_into(&existing_id, importance)?;
+                    let outcome = self.storage.merge_memory_into(
+                        &existing_id,
+                        content,
+                        importance,
+                        similarity,
+                    )?;
+                    if outcome.content_updated {
+                        log::info!(
+                            "Dedup: content updated for {} (merge_count={})",
+                            existing_id,
+                            outcome.merge_count,
+                        );
+                    }
                     
                     // Also update entity links for the existing memory
                     if self.config.entity_config.enabled {

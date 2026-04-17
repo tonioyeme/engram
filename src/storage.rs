@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
 use std::path::Path;
 
 use crate::synthesis::types::{GateScores, ProvenanceRecord};
-use crate::types::{AclEntry, CrossLink, HebbianLink, MemoryLayer, MemoryRecord, MemoryType, Permission};
+use crate::types::{AclEntry, CrossLink, HebbianLink, MemoryLayer, MergeOutcome, MemoryRecord, MemoryType, Permission};
 
 use std::sync::OnceLock;
 
@@ -2383,19 +2383,22 @@ impl Storage {
     
     /// Merge a duplicate memory's metadata into an existing memory.
     ///
-    /// Strategy (from ISS-003):
+    /// Strategy (from ISS-003, upgraded with smart merge):
     /// - access_count: add new access to existing memory's access log
     /// - importance: max(existing, new)
     /// - created_at: keep existing (older)
-    /// - content: keep existing (already stored, presumably equivalent)
+    /// - content: update if new content is significantly longer (>30% longer)
+    /// - metadata: track merge history (capped at 10 entries) and merge count
     ///
     /// Does NOT create a new memory — just boosts the existing one.
     pub fn merge_memory_into(
         &mut self,
         existing_id: &str,
+        new_content: &str,
         new_importance: f64,
-    ) -> Result<(), rusqlite::Error> {
-        // Insert a new access_log entry for the existing memory (now)
+        similarity: f32,
+    ) -> Result<MergeOutcome, rusqlite::Error> {
+        // Step 1: Insert a new access_log entry for the existing memory (now)
         self.conn.execute(
             "INSERT INTO access_log (memory_id, accessed_at) VALUES (?, ?)",
             params![existing_id, now_f64()],
@@ -2407,13 +2410,88 @@ impl Storage {
             params![new_importance, existing_id],
         )?;
         
+        // Step 2: Content evolution — fetch existing content and metadata
+        let (existing_content, existing_metadata_str): (String, Option<String>) = self.conn.query_row(
+            "SELECT content, metadata FROM memories WHERE id = ?",
+            params![existing_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        
+        let content_updated = new_content.len() > (existing_content.len() as f64 * 1.3) as usize;
+        
+        if content_updated {
+            self.conn.execute(
+                "UPDATE memories SET content = ? WHERE id = ?",
+                params![new_content, existing_id],
+            )?;
+        }
+        
+        // Step 3: Merge history in metadata
+        let mut metadata: serde_json::Value = existing_metadata_str
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        
+        // Ensure metadata is an object
+        if !metadata.is_object() {
+            metadata = serde_json::json!({});
+        }
+        
+        // Build merge history entry
+        let epoch_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let history_entry = serde_json::json!({
+            "ts": epoch_secs,
+            "sim": similarity,
+            "content_updated": content_updated,
+            "prev_content_len": existing_content.len(),
+            "new_content_len": new_content.len(),
+        });
+        
+        // Append to merge_history array (FIFO, capped at 10)
+        let merge_history = metadata.get("merge_history")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        
+        let mut new_history = merge_history;
+        new_history.push(history_entry);
+        // Keep only last 10
+        if new_history.len() > 10 {
+            let start = new_history.len() - 10;
+            new_history = new_history[start..].to_vec();
+        }
+        
+        metadata["merge_history"] = serde_json::Value::Array(new_history);
+        
+        // Step 4: Increment merge_count
+        let merge_count = metadata.get("merge_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) + 1;
+        metadata["merge_count"] = serde_json::json!(merge_count);
+        
+        // Write updated metadata back to DB
+        let metadata_str = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
+        self.conn.execute(
+            "UPDATE memories SET metadata = ? WHERE id = ?",
+            params![metadata_str, existing_id],
+        )?;
+        
         log::info!(
-            "Merged duplicate into memory {}: boosted access + importance(max {})",
+            "Merged duplicate into memory {}: boosted access + importance(max {}), content_updated={}, merge_count={}",
             existing_id,
-            new_importance
+            new_importance,
+            content_updated,
+            merge_count,
         );
         
-        Ok(())
+        Ok(MergeOutcome {
+            memory_id: existing_id.to_string(),
+            content_updated,
+            merge_count: merge_count as i32,
+        })
     }
 
     /// Get memories that have no entity links (for backfill/extraction).

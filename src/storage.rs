@@ -2292,6 +2292,52 @@ impl Storage {
         Ok((entity_count as usize, relation_count as usize, link_count as usize))
     }
 
+    /// Delete an entity and all its relations/links (CASCADE handles it).
+    pub fn delete_entity(&self, entity_id: &str) -> Result<bool, rusqlite::Error> {
+        let affected = self.conn.execute(
+            "DELETE FROM entities WHERE id = ?1",
+            [entity_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Delete entities matching a filter. Returns count deleted.
+    /// Used to purge false-positive entities (e.g., short @mentions that are noise).
+    pub fn delete_entities_by_filter(
+        &self,
+        entity_type: &str,
+        name_pattern: &str,
+    ) -> Result<usize, rusqlite::Error> {
+        // First find matching entity IDs
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM entities WHERE entity_type = ?1 AND name GLOB ?2"
+        )?;
+        let ids: Vec<String> = stmt.query_map(
+            rusqlite::params![entity_type, name_pattern],
+            |row| row.get(0),
+        )?.filter_map(|r| r.ok()).collect();
+        
+        let mut count = 0;
+        for id in &ids {
+            if self.delete_entity(id)? {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Clear all memory_entities links for a batch of memories (for re-extraction).
+    pub fn clear_memory_entity_links(&self, memory_ids: &[String]) -> Result<usize, rusqlite::Error> {
+        let mut count = 0;
+        for mid in memory_ids {
+            count += self.conn.execute(
+                "DELETE FROM memory_entities WHERE memory_id = ?1",
+                [mid],
+            )?;
+        }
+        Ok(count)
+    }
+
     /// Find the most similar memory to the given embedding vector.
     /// Returns (memory_id, cosine_similarity) if any memory exceeds the threshold.
     /// Only searches within the specified namespace and model.

@@ -2396,6 +2396,69 @@ impl Memory {
     pub fn entity_stats(&self) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
         Ok(self.storage.entity_stats()?)
     }
+    
+    /// Purge garbage entities created by regex false positives.
+    /// Removes:
+    /// - Person entities that are 1-2 chars or pure digits (e.g., "0", "1", "types")
+    /// - Orphaned entities with no memory links
+    /// Returns count of entities deleted.
+    pub fn purge_garbage_entities(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut total_deleted = 0;
+        
+        // Phase 1: Delete short/numeric person entities that are clearly false positives
+        let garbage_persons: Vec<String> = {
+            let conn = self.storage.connection();
+            let mut stmt = conn.prepare(
+                "SELECT id, name FROM entities WHERE entity_type = 'person'"
+            )?;
+            let rows: Vec<(String, String)> = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?.filter_map(|r| r.ok()).collect();
+            drop(stmt);
+            
+            rows.into_iter()
+                .filter(|(_, name)| {
+                    let n = name.trim();
+                    // Pure digit, single char, or known false positive
+                    n.len() <= 2
+                        || n.chars().all(|c| c.is_ascii_digit())
+                        || matches!(n, "types" | "user" | "mac" | "sigma" | "github")
+                })
+                .map(|(id, _)| id)
+                .collect()
+        };
+        
+        for id in &garbage_persons {
+            if self.storage.delete_entity(id)? {
+                total_deleted += 1;
+            }
+        }
+        
+        // Phase 2: Delete orphaned entities (no memory_entities links)
+        let orphans: Vec<String> = {
+            let conn = self.storage.connection();
+            let mut stmt = conn.prepare(
+                "SELECT e.id FROM entities e
+                 LEFT JOIN memory_entities me ON e.id = me.entity_id
+                 WHERE me.entity_id IS NULL"
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        
+        for id in &orphans {
+            if self.storage.delete_entity(id)? {
+                total_deleted += 1;
+            }
+        }
+        
+        if total_deleted > 0 {
+            log::info!("Purged {} garbage entities ({} false-positive persons, {} orphans)",
+                total_deleted, garbage_persons.len(), orphans.len());
+        }
+        
+        Ok(total_deleted)
+    }
 
     /// List entities, optionally filtered by type and namespace.
     /// Returns (EntityRecord, mention_count) pairs ordered by mention count descending.

@@ -538,6 +538,8 @@ enum EntityCommand {
         #[arg(long, default_value = "500")]
         batch_size: usize,
     },
+    /// Purge garbage entities (false-positive persons, orphans)
+    Purge,
     /// Show entity statistics
     Stats,
     /// List entities (default view)
@@ -1324,6 +1326,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let (processed, entities, relations) = mem.backfill_entities(batch_size)?;
                     println!("✅ Processed: {} memories, {} entities, {} relations", 
                         processed, entities, relations);
+                }
+                Some(EntityCommand::Purge) => {
+                    println!("🧹 Purging garbage entities...");
+                    let deleted = mem.purge_garbage_entities()?;
+                    println!("✅ Deleted {} garbage entities", deleted);
+                    let (entity_count, relation_count, link_count) = mem.entity_stats()?;
+                    println!("📊 Remaining: {} entities, {} relations, {} links", 
+                        entity_count, relation_count, link_count);
                 }
                 Some(EntityCommand::Stats) => {
                     let (entity_count, relation_count, link_count) = mem.entity_stats()?;

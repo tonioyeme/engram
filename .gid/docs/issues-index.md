@@ -428,7 +428,7 @@ UPDATE memory_embeddings SET model = 'ollama/nomic-embed-text' WHERE model = 'no
 
 ---
 
-## ISS-011 [improvement] [P2] [open]
+## ISS-011 [improvement] [P2] [closed]
 **标题**: Recall 结果去重 — top-K 结果含近似重复，浪费 context window
 **发现日期**: 2026-03-31
 **整理日期**: 2026-04-16
@@ -455,7 +455,7 @@ UPDATE memory_embeddings SET model = 'ollama/nomic-embed-text' WHERE model = 'no
 
 ---
 
-## ISS-012 [improvement] [P2] [open]
+## ISS-012 [improvement] [P2] [closed]
 **标题**: Auto-extract importance 缺校准上限 — 系统指令可获高 importance
 **发现日期**: 2026-03-31
 **整理日期**: 2026-04-16

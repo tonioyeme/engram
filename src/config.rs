@@ -129,6 +129,20 @@ pub struct MemoryConfig {
     /// Cosine similarity threshold for recall result dedup (default: 0.85)
     #[serde(default = "default_recall_dedup_threshold")]
     pub recall_dedup_threshold: f64,
+    
+    // === Multi-retrieval fusion ===
+    /// Weight for temporal channel in hybrid recall (0.0-1.0)
+    /// Only meaningful when query has temporal indicators
+    #[serde(default = "default_temporal_weight")]
+    pub temporal_weight: f64,
+
+    /// Weight for Hebbian graph channel in hybrid recall (0.0-1.0)
+    #[serde(default = "default_hebbian_recall_weight")]
+    pub hebbian_recall_weight: f64,
+
+    /// Enable query-type adaptive weight adjustment (default: true)
+    #[serde(default = "default_adaptive_weights")]
+    pub adaptive_weights: bool,
 }
 
 fn default_entity_weight() -> f64 {
@@ -161,6 +175,18 @@ fn default_recall_dedup_enabled() -> bool {
 
 fn default_recall_dedup_threshold() -> f64 {
     0.85
+}
+
+fn default_temporal_weight() -> f64 {
+    0.10
+}
+
+fn default_hebbian_recall_weight() -> f64 {
+    0.10
+}
+
+fn default_adaptive_weights() -> bool {
+    true
 }
 
 impl Default for MemoryConfig {
@@ -204,6 +230,9 @@ impl Default for MemoryConfig {
             recall_dedup_enabled: default_recall_dedup_enabled(),
             recall_dedup_threshold: default_recall_dedup_threshold(),
             auto_extract_importance_cap: default_auto_extract_importance_cap(),
+            temporal_weight: default_temporal_weight(),
+            hebbian_recall_weight: default_hebbian_recall_weight(),
+            adaptive_weights: default_adaptive_weights(),
         }
     }
 }

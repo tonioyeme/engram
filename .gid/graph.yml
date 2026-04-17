@@ -24,8 +24,8 @@ nodes:
   - filter
   priority: 10
   metadata:
-    project: rustclaw
     file: rustclaw/src/engram_hooks.rs
+    project: rustclaw
 - id: a2-extractor-negatives
   title: 'A2: Extractor prompt 加 negative examples'
   status: done
@@ -42,8 +42,8 @@ nodes:
   - extractor
   priority: 10
   metadata:
-    file: engramai/src/extractor.rs
     project: engramai
+    file: engramai/src/extractor.rs
 - id: a3-sql-cleanup
   title: 'A3: SQL 一次性清理 — 删存量重复 + 系统指令垃圾'
   status: todo
@@ -88,9 +88,9 @@ nodes:
   - recall-quality
   priority: 20
   metadata:
-    project: engramai
     iss: ISS-009
     ritual: true
+    project: engramai
 - id: entity-types
   title: 'B1.1: Entity types & config structs'
   status: todo
@@ -139,9 +139,9 @@ nodes:
   priority: 20
   metadata:
     iss: ISS-009
-    project: engramai
     files:
     - src/entities.rs
+    project: engramai
 - id: entity-storage
   title: 'B1.3: Storage entity CRUD methods'
   status: todo
@@ -216,11 +216,11 @@ nodes:
   - recall
   priority: 20
   metadata:
+    iss: ISS-009
     project: engramai
     files:
     - src/entities.rs
     - src/memory.rs
-    iss: ISS-009
 - id: entity-backfill
   title: 'B1.6: Backfill CLI command for existing memories'
   status: todo
@@ -242,10 +242,10 @@ nodes:
   - cli
   priority: 20
   metadata:
+    iss: ISS-009
+    project: engramai
     files:
     - src/main.rs
-    project: engramai
-    iss: ISS-009
 - id: entity-integration-tests
   title: 'B1.7: Entity indexing integration tests'
   status: todo
@@ -267,28 +267,29 @@ nodes:
   - tests
   priority: 20
   metadata:
-    project: engramai
-    iss: ISS-009
     files:
     - tests/entity_integration_test.rs
+    project: engramai
+    iss: ISS-009
 - id: b2-dedup
   title: 'B2: Dedup on write — embedding similarity + merge (ISS-003)'
-  status: todo
-  description: |
-    ISS-003。add_raw() 前做 embedding similarity check：
-    - cosine > 0.95 → 合并（不新增）
-    - 合并策略：access_count=sum, importance=max, created_at=min, content=最新版
-    - Hebbian links 去重合并
-    - 可选：content hash 精确 dedup 作为快速路径
-    约 200 行改动，主要在 memory.rs + storage.rs
+  status: done
+  description: |-
+    ISS-003 升级完成。merge_memory_into() 从简单的 importance=MAX + access_log 升级为智能合并：
+    1. Content evolution — 新内容 >30% 更长时替换旧内容
+    2. Merge history — metadata.merge_history 记录每次合并（FIFO, cap 10）
+    3. Merge count — metadata.merge_count 累计合并次数
+    4. MergeOutcome 返回类型，调用方可根据结果做进一步处理
+    5. 5 个新测试 + 所有旧测试更新到新签名
+    324 tests pass, commit 5d50753
   tags:
   - engram
   - engramai
   - dedup
   priority: 25
   metadata:
-    iss: ISS-003
     project: engramai
+    iss: ISS-003
 - id: b3-confidence
   title: 'B3: Confidence score — 多信号融合 recall confidence (ISS-007)'
   status: todo

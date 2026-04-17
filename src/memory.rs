@@ -871,6 +871,13 @@ impl Memory {
                 (HashMap::new(), 0.0)
             };
             
+            // Query-type adaptive weight adjustment (C7: Multi-Retrieval Fusion)
+            let query_analysis = if self.config.adaptive_weights {
+                crate::query_classifier::classify_query(query)
+            } else {
+                crate::query_classifier::QueryAnalysis::neutral()
+            };
+            
             // Merge candidate IDs from embedding, FTS, and entity recall
             let mut all_ids: std::collections::HashSet<String> = similarity_map.keys().cloned().collect();
             for record in &fts_results {
@@ -888,25 +895,56 @@ impl Memory {
                 }
             }
             
-            // Score each candidate with combined FTS + embedding + ACT-R + entity
-            // Weights are configurable via MemoryConfig, runtime-normalized to sum to 1.0
+            // Hebbian channel (6th channel): score candidates by Hebbian connectivity
+            let candidate_ids: Vec<String> = candidates.iter().map(|r| r.id.clone()).collect();
+            let hebbian_scores = if self.config.hebbian_enabled {
+                Self::hebbian_channel_scores(&self.storage, &candidate_ids)?
+            } else {
+                HashMap::new()
+            };
+            let hebbian_w = if self.config.hebbian_enabled {
+                self.config.hebbian_recall_weight
+            } else {
+                0.0
+            };
+            
+            // Base weights (from config)
             let raw_fts_weight = self.config.fts_weight;
             let raw_emb_weight = self.config.embedding_weight;
             let raw_actr_weight = self.config.actr_weight;
             let raw_entity_weight = entity_w;
+            let raw_temporal_weight = self.config.temporal_weight;
+            let raw_hebbian_weight = hebbian_w;
             
-            // Runtime normalization — always divide by sum (handles any user config)
-            let total_weight = raw_fts_weight + raw_emb_weight + raw_actr_weight + raw_entity_weight;
-            let (fts_weight, emb_weight, actr_weight, ent_weight) = if total_weight > 0.0 {
+            // Apply query-type modifiers (C7 adaptive weights)
+            let adj_fts = raw_fts_weight * query_analysis.weight_modifiers.fts;
+            let adj_emb = raw_emb_weight * query_analysis.weight_modifiers.embedding;
+            let adj_actr = raw_actr_weight * query_analysis.weight_modifiers.actr;
+            let adj_entity = raw_entity_weight * query_analysis.weight_modifiers.entity;
+            let adj_temporal = raw_temporal_weight * query_analysis.weight_modifiers.temporal;
+            let adj_hebbian = raw_hebbian_weight * query_analysis.weight_modifiers.hebbian;
+            
+            // Runtime normalization — always divide by sum
+            let total_weight = adj_fts + adj_emb + adj_actr + adj_entity + adj_temporal + adj_hebbian;
+            let (fts_weight, emb_weight, actr_weight, ent_weight, temp_weight, hebb_weight) = if total_weight > 0.0 {
                 (
-                    raw_fts_weight / total_weight,
-                    raw_emb_weight / total_weight,
-                    raw_actr_weight / total_weight,
-                    raw_entity_weight / total_weight,
+                    adj_fts / total_weight,
+                    adj_emb / total_weight,
+                    adj_actr / total_weight,
+                    adj_entity / total_weight,
+                    adj_temporal / total_weight,
+                    adj_hebbian / total_weight,
                 )
             } else {
-                (0.25, 0.25, 0.25, 0.25)
+                let n = 1.0 / 6.0;
+                (n, n, n, n, n, n)
             };
+            
+            log::debug!(
+                "C7 recall weights: fts={:.3} emb={:.3} actr={:.3} entity={:.3} temporal={:.3} hebbian={:.3} (query_type={:?})",
+                fts_weight, emb_weight, actr_weight, ent_weight, temp_weight, hebb_weight,
+                query_analysis.query_type,
+            );
             
             let mut scored: Vec<_> = candidates
                 .into_iter()
@@ -942,11 +980,19 @@ impl Memory {
                         self.config.actr_sigmoid_scale,
                     );
                     
-                    // Combined: FTS + embedding + ACT-R + entity
+                    // Temporal channel (5th) — time-range proximity
+                    let temporal_score = Self::temporal_score(&record, &query_analysis.time_range, now);
+                    
+                    // Hebbian channel (6th) — graph connectivity
+                    let hebbian_score = hebbian_scores.get(&record.id).copied().unwrap_or(0.0);
+                    
+                    // Combined: 6-channel fusion
                     let combined_score = (fts_weight * fts_score)
                         + (emb_weight * embedding_score as f64)
                         + (actr_weight * activation_normalized)
-                        + (ent_weight * entity_score);
+                        + (ent_weight * entity_score)
+                        + (temp_weight * temporal_score)
+                        + (hebb_weight * hebbian_score);
                     
                     (record, combined_score, activation)
                 })
@@ -1088,6 +1134,89 @@ impl Memory {
         }
         
         Ok(memory_scores)
+    }
+    
+    /// Temporal channel scoring for C7 Multi-Retrieval Fusion.
+    ///
+    /// When a time range is detected in the query, memories within that range
+    /// are scored by proximity to the range center (1.0 at center, 0.5 at edges).
+    /// Memories outside the range get 0.0.
+    ///
+    /// When no time range is detected, returns a neutral 0.5 for all memories
+    /// (so the temporal channel doesn't distort results when there's no temporal signal).
+    fn temporal_score(
+        record: &MemoryRecord,
+        time_range: &Option<crate::query_classifier::TimeRange>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> f64 {
+        match time_range {
+            Some(range) => {
+                if record.created_at >= range.start && record.created_at <= range.end {
+                    // Within range: score by proximity to center of range
+                    let range_duration = (range.end - range.start).num_seconds() as f64;
+                    let range_center = range.start + (range.end - range.start) / 2;
+                    let distance = (record.created_at - range_center).num_seconds().abs() as f64;
+                    let half_range = range_duration / 2.0;
+                    if half_range > 0.0 {
+                        // 1.0 at center, 0.5 at edges
+                        1.0 - (distance / half_range) * 0.5
+                    } else {
+                        1.0
+                    }
+                } else {
+                    0.0 // Outside range
+                }
+            }
+            None => {
+                // No temporal query: gentle recency signal (complement ACT-R)
+                // Recent memories get slight boost, but not enough to dominate
+                let age_hours = (now - record.created_at).num_seconds() as f64 / 3600.0;
+                // Sigmoid centered at 72 hours (3 days), scale 48
+                let recency = 1.0 / (1.0 + (age_hours - 72.0).exp() / 48.0_f64.exp());
+                // Map to 0.3-0.7 range (narrow band so it's a weak signal)
+                0.3 + recency * 0.4
+            }
+        }
+    }
+    
+    /// Hebbian channel scoring for C7 Multi-Retrieval Fusion.
+    ///
+    /// For each candidate, checks how many other candidates it's Hebbian-linked to.
+    /// Memories that are well-connected to other recall results get boosted —
+    /// they form coherent clusters of associated knowledge.
+    ///
+    /// Scores are normalized to 0.0-1.0.
+    fn hebbian_channel_scores(
+        storage: &crate::storage::Storage,
+        candidate_ids: &[String],
+    ) -> Result<HashMap<String, f64>, Box<dyn std::error::Error>> {
+        let mut scores: HashMap<String, f64> = HashMap::new();
+        let candidate_set: std::collections::HashSet<&String> = candidate_ids.iter().collect();
+        
+        for id in candidate_ids {
+            let links = storage.get_hebbian_links_weighted(id)?;
+            let mut link_score = 0.0;
+            for (linked_id, strength) in &links {
+                if candidate_set.contains(linked_id) {
+                    // This candidate is Hebbian-linked to another candidate
+                    link_score += strength;
+                }
+            }
+            if link_score > 0.0 {
+                scores.insert(id.clone(), link_score);
+            }
+        }
+        
+        // Normalize to 0.0-1.0
+        if let Some(&max) = scores.values().max_by(|a, b| a.partial_cmp(b).unwrap()) {
+            if max > 0.0 {
+                for v in scores.values_mut() {
+                    *v /= max;
+                }
+            }
+        }
+        
+        Ok(scores)
     }
     
     /// Remove near-duplicate recall results based on pairwise embedding similarity.
@@ -3158,5 +3287,120 @@ mod confidence_tests {
         let config = MemoryConfig::default();
         assert!(config.recall_dedup_enabled);
         assert!((config.recall_dedup_threshold - 0.85).abs() < f64::EPSILON);
+    }
+
+    // ── C7 Multi-Retrieval Fusion tests ────────────────────────────
+
+    fn make_test_record(id: &str, content: &str, created_at: chrono::DateTime<Utc>) -> MemoryRecord {
+        MemoryRecord {
+            id: id.to_string(),
+            content: content.to_string(),
+            memory_type: MemoryType::Factual,
+            layer: crate::types::MemoryLayer::Working,
+            created_at,
+            access_times: vec![created_at],
+            working_strength: 1.0,
+            core_strength: 0.0,
+            importance: 0.5,
+            pinned: false,
+            consolidation_count: 0,
+            last_consolidated: None,
+            source: "test".to_string(),
+            contradicts: None,
+            contradicted_by: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_temporal_score_within_range() {
+        use crate::query_classifier::TimeRange;
+        let now = Utc::now();
+        
+        // Memory at the center of a 24-hour range
+        let range = TimeRange {
+            start: now - chrono::Duration::hours(24),
+            end: now,
+        };
+        
+        let record = make_test_record("t1", "test", now - chrono::Duration::hours(12));
+        
+        let score = Memory::temporal_score(&record, &Some(range), now);
+        assert!(score > 0.9, "Center of range should score high: {}", score);
+    }
+
+    #[test]
+    fn test_temporal_score_outside_range() {
+        use crate::query_classifier::TimeRange;
+        let now = Utc::now();
+        
+        let range = TimeRange {
+            start: now - chrono::Duration::hours(24),
+            end: now - chrono::Duration::hours(12),
+        };
+        
+        let record = make_test_record("t2", "test", now - chrono::Duration::hours(1));
+        
+        let score = Memory::temporal_score(&record, &Some(range), now);
+        assert!(score < 0.01, "Outside range should score ~0: {}", score);
+    }
+
+    #[test]
+    fn test_temporal_score_no_range() {
+        let now = Utc::now();
+        
+        let record = make_test_record("t3", "test", now - chrono::Duration::hours(1));
+        
+        let score = Memory::temporal_score(&record, &None, now);
+        // Should be in neutral range (0.25-0.75)
+        assert!(score >= 0.25 && score <= 0.75,
+            "No range: score should be neutral-ish: {}", score);
+    }
+
+    #[test]
+    fn test_hebbian_channel_scores_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("test.db");
+        let mut storage = crate::storage::Storage::new(db.to_str().unwrap()).unwrap();
+        
+        let now = Utc::now();
+        let rec_a = make_test_record("a", "memory A", now);
+        let rec_b = make_test_record("b", "memory B", now);
+        let rec_c = make_test_record("c", "memory C", now);
+        storage.add(&rec_a, "default").unwrap();
+        storage.add(&rec_b, "default").unwrap();
+        storage.add(&rec_c, "default").unwrap();
+        
+        // Create Hebbian link between A and B
+        // First call creates tracking record, second call forms the link (threshold=1)
+        storage.record_coactivation("a", "b", 1).unwrap();
+        storage.record_coactivation("a", "b", 1).unwrap();
+        
+        let candidate_ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let scores = Memory::hebbian_channel_scores(&storage, &candidate_ids).unwrap();
+        
+        // A and B should have scores (linked to each other), C should not
+        assert!(scores.get("a").copied().unwrap_or(0.0) > 0.0, "A should have hebbian score");
+        assert!(scores.get("b").copied().unwrap_or(0.0) > 0.0, "B should have hebbian score");
+        assert!(scores.get("c").copied().unwrap_or(0.0) < 0.01, "C should have no hebbian score");
+    }
+
+    #[test]
+    fn test_c7_config_defaults() {
+        let config = MemoryConfig::default();
+        assert!((config.temporal_weight - 0.10).abs() < f64::EPSILON);
+        assert!((config.hebbian_recall_weight - 0.10).abs() < f64::EPSILON);
+        assert!(config.adaptive_weights);
+    }
+
+    #[test]
+    fn test_adaptive_weights_disabled_preserves_behavior() {
+        // When adaptive_weights = false, query classifier should return neutral
+        let analysis = crate::query_classifier::QueryAnalysis::neutral();
+        assert_eq!(analysis.weight_modifiers.fts, 1.0);
+        assert_eq!(analysis.weight_modifiers.embedding, 1.0);
+        assert_eq!(analysis.weight_modifiers.actr, 1.0);
+        assert_eq!(analysis.weight_modifiers.temporal, 1.0);
+        assert_eq!(analysis.weight_modifiers.hebbian, 1.0);
     }
 }

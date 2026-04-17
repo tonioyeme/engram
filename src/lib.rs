@@ -98,6 +98,7 @@ pub mod extractor;
 pub mod hybrid_search;
 pub mod memory;
 pub mod models;
+pub mod query_classifier;
 pub mod session_wm;
 pub mod storage;
 pub mod synthesis;

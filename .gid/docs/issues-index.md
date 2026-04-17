@@ -10,6 +10,8 @@
 > - `LEARNINGS.md` — 运维笔记 + recall 质量改进方案
 > - `MEMORY-SYSTEM-RESEARCH.md` — 与 Hindsight/Mem0/Zep 对比调研
 > - `ENGRAM-V2-DESIGN.md` — 情感总线架构设计
+> - `INTEROCEPTIVE-LAYER.md` — 内感受层（脑岛）完整设计
+> - `COGNITIVE-COMPONENTS-BACKLOG.md` — 30 个认知组件汇总（A-E 分类）
 
 ---
 
@@ -22,22 +24,24 @@
 | # | Issue | 问题 | 状态 |
 |---|-------|------|------|
 | 1 | **ISS-009** | Entity 索引完全空置 — schema 有、代码零调用、数据零行。recall 无法做概念级跳转 | P1 open |
-| 2 | **ISS-005** | Consolidate 不合成知识 — 只加强 activation，不合成 insight | P1 open |
+| 2 | **ISS-005** | Consolidate 不合成知识 — 只加强 activation，不合成 insight | P1 closed |
 
 ### Tier 2 — 信噪比（决定 recall 结果有多干净）
 
 | # | Issue | 问题 | 状态 |
 |---|-------|------|------|
-| 3 | **RustClaw 侧** | EngramStoreHook 无过滤 — heartbeat/NO_REPLY/系统指令全存，垃圾持续写入（上游污染） | 未建 issue |
-| 4 | **ISS-003** | add() 无 dedup — ~5% 重复率（短期可忍），高频集群挤占排名 | P2 open |
-| 5 | **RustClaw 侧** | Extractor 无 negative examples — Haiku 把系统指令当知识提取 | 未建 issue |
+| 3 | **Phase A1** | EngramStoreHook 无过滤 — heartbeat/NO_REPLY/系统指令全存，垃圾持续写入（上游污染） | ✅ done |
+| 4 | **ISS-003** | add() 无 dedup — ~5% 重复率（短期可忍），高频集群挤占排名 | P2 closed |
+| 5 | **Phase A2** | Extractor 无 negative examples — Haiku 把系统指令当知识提取 | ✅ done |
+| 9 | **ISS-011** | Recall 结果去重 — 返回的 top-K 含近似重复，浪费 context window | P2 open |
+| 10 | **ISS-012** | Importance 校准 — auto-extract importance 无上限，系统指令可得 0.9+ | P2 open |
 
 ### Tier 3 — 排序精度（决定 top-K 里好结果的位置）
 
 | # | Issue | 问题 | 状态 |
 |---|-------|------|------|
 | 6 | **ISS-002** | Recency bias 不足 — ACT-R decay 让新旧记忆权重差异不够 | ✅ closed |
-| 7 | **ISS-007** | 无 confidence score — recall 结果无法区分高相关与噪声 | P1 open |
+| 7 | **ISS-007** | 无 confidence score — recall 结果无法区分高相关与噪声 | P1 closed |
 | 8 | **ISS-008** | Knowledge promotion — 高频记忆不自动提升到 SOUL.md/MEMORY.md | P1 open |
 
 ### 已解决
@@ -66,9 +70,9 @@
 
 | Task | 描述 | 改动位置 | 规模 | 状态 |
 |------|------|----------|------|------|
-| **A1** | EngramStoreHook 过滤 — 不存 HEARTBEAT_OK / NO_REPLY / 系统指令 | `rustclaw/src/engram_hooks.rs` | ~30 行 | todo |
-| **A2** | Extractor prompt 加 negative examples — 不提取系统指令/agent身份 | `engramai/src/extractor.rs` | ~20 行 | todo |
-| **A3** | SQL 一次性清理 — 删精确重复(105条) + 系统指令垃圾 | SQL script | 一次性 | todo |
+| **A1** | EngramStoreHook 过滤 — 不存 HEARTBEAT_OK / NO_REPLY / 系统指令 | `rustclaw/src/engram_hooks.rs` | ~30 行 | done |
+| **A2** | Extractor prompt 加 negative examples — 不提取系统指令/agent身份 | `engramai/src/extractor.rs` | ~20 行 | done |
+| **A3** | SQL 一次性清理 — 删精确重复(105条) + 系统指令垃圾 | SQL script | 一次性 | done |
 
 过滤策略（A1 详细）：
 - ❌ `HEARTBEAT_OK` → 直接丢，零信息
@@ -214,7 +218,7 @@ Engram 的用户（potato + RustClaw）中英混用。embedding-based recall 缓
 
 ---
 
-## ISS-005 [missing] [P1] [open]
+## ISS-005 [missing] [P1] [closed]
 **标题**: consolidate 缺少知识合成 — 只加强 activation 不合成 insight
 **发现日期**: 2026-03-31
 **发现者**: RustClaw
@@ -423,3 +427,251 @@ UPDATE memory_embeddings SET model = 'ollama/nomic-embed-text' WHERE model = 'no
 - ISS-009 (recall 质量低) — 本 bug 是 recall 丢数据的直接原因之一
 
 ---
+
+## ISS-011 [improvement] [P2] [open]
+**标题**: Recall 结果去重 — top-K 结果含近似重复，浪费 context window
+**发现日期**: 2026-03-31
+**整理日期**: 2026-04-16
+**发现者**: RustClaw
+**组件**: recall (result post-processing)
+**跨项目引用**: rustclaw (auto-recall hook 注入 system prompt)
+
+**描述**:
+`recall()` 返回的 top-K 结果中可能包含内容高度相似的多条记忆。写入时有 dedup（ISS-003），但 recall 返回时没有结果级去重。近似重复的结果浪费 agent 的 context window。
+
+**来源**:
+- `INVESTIGATION-2026-03-31.md` §4.2 Fix 6
+- `LEARNINGS.md` "Recall Result Dedup"
+
+**建议方案**:
+- `recall()` 返回后加 post-processing：两条结果 content 相似度 > 0.8 → 只保留 activation/confidence 更高的
+- 可用 embedding cosine 或简单的 token overlap 判断
+- 去重后补位：如果去掉 2 条重复，从候选池补 2 条进来保持 K 条
+
+**规模**: ~50-80 行
+
+**相关**:
+- ISS-003 (写入时 dedup) — 互补关系：写入去重减少存量，recall 去重清理输出
+
+---
+
+## ISS-012 [improvement] [P2] [open]
+**标题**: Auto-extract importance 缺校准上限 — 系统指令可获高 importance
+**发现日期**: 2026-03-31
+**整理日期**: 2026-04-16
+**发现者**: RustClaw
+**组件**: extractor (importance scoring)
+**跨项目引用**: —
+
+**描述**:
+Haiku extractor 提取的 importance 没有上限/基线校准。理论上系统指令也能得到 importance 0.9+（虽然 A2 的 negative examples 缓解了部分问题，但对漏网之鱼仍无校准）。
+
+**来源**:
+- `INVESTIGATION-2026-03-31.md` §4.2 Fix 5
+
+**建议方案**:
+- Auto-extracted facts 的 importance 上限 0.7（不能高于手动存储的基线）
+- `source: "auto-extract"` 的记忆 importance cap 在 0.7
+- `source: "manual"` / `source: "agent"` 的不受限
+- Procedural memory 默认 importance 0.5（除非内容明显是用户偏好/工作流）
+
+**规模**: ~20-30 行
+
+**相关**:
+- Phase A2 (extractor negative examples) — A2 防提取，本 issue 防过高评分
+
+---
+
+## ISS-013 [maintenance] [P3] [open]
+**标题**: STDP 自动因果链接质量审计 — 34,859 条 Hebbian link 未验证
+**发现日期**: 2026-03-31
+**整理日期**: 2026-04-16
+**发现者**: RustClaw
+**组件**: consolidate (Hebbian / STDP)
+**跨项目引用**: —
+
+**描述**:
+`hebbian_links` 表有 34,859 行，其中 `stdp:auto` 标记的约 115 条是 STDP (Spike-Timing Dependent Plasticity) 自动创建的因果链接。这些是 consolidation 时两条记忆频繁被一起召回时自动建立的，但质量未经验证。
+
+可能的问题：
+- 因垃圾记忆（已由 A1/A2/A3 清理）产生的虚假链接仍在
+- session 内高频共现 ≠ 真正因果关系
+- 链接权重分布可能有偏
+
+**来源**:
+- `INVESTIGATION-2026-03-31.md` §3 STDP 分析
+- `LEARNINGS.md` "STDP auto 115 条需要验证"
+
+**建议方案**:
+- 导出所有 stdp:auto 链接，人工抽样检查质量
+- 删除两端任一记忆已被 A3 清理掉的僵尸链接
+- 考虑加 decay：长期不被共同召回的 STDP 链接自动弱化
+
+**规模**: 分析为主，代码改动 ~30-50 行
+
+---
+
+---
+
+# Features: 认知神经科学组件
+
+> 格式: FEAT-{NNN} [{priority}] [{status}]
+> 来源: `COGNITIVE-COMPONENTS-BACKLOG.md`, `INTEROCEPTIVE-LAYER.md`, `ENGRAM-V2-DESIGN.md`, `MEMORY-SYSTEM-RESEARCH.md`
+> 
+> 每个 Feature 对应一组相关的认知科学组件。Feature 下的 Phase 是实现阶段。
+> COGNITIVE-COMPONENTS-BACKLOG.md 保留完整理论背景，这里只跟踪实现状态。
+
+---
+
+## 总览
+
+| Feature | 标题 | 组件数 | 设计文档 | 优先级 | 状态 |
+|---------|------|--------|---------|--------|------|
+| **FEAT-001** | 内感受层（脑岛） | 7 组件, 5 Phase | `INTEROCEPTIVE-LAYER.md` | P1 | todo |
+| **FEAT-002** | 情感闭环 | 6 组件 | `ENGRAM-V2-DESIGN.md` | P2 | todo |
+| **FEAT-003** | 记忆生命周期 | 8 组件 | `MEMORY-SYSTEM-RESEARCH.md` | P1 | partial |
+| **FEAT-004** | 认知理论扩展 | 8 组件 | cognitive-autoresearch Doc 02 | P3 | todo |
+
+---
+
+## FEAT-001 [P1] [todo]
+**标题**: 内感受层 — InteroceptiveHub（脑岛功能等价物）
+**设计文档**: `INTEROCEPTIVE-LAYER.md`（完整 5-Phase 设计 + 架构图 + Rust 类型定义）
+**Backlog 编号**: A1-A7
+**总规模**: ~700-850 行（engram ~500-700, RustClaw ~150）
+
+**核心论点**: engram 有 9 个认知模块各自运行良好，但互不知道对方存在。InteroceptiveHub 是把它们串成闭环的整合层——Craig 脑岛的计算等价物。
+
+### Phase 分解
+
+| Phase | 内容 | Backlog | 规模 | 依赖 | 状态 |
+|-------|------|---------|------|------|------|
+| **F1-P1** | 统一信号格式 `InteroceptiveSignal` | A1 | ~200 行 | 无 | todo |
+| **F1-P2** | InteroceptiveHub 核心（信号接收 + 状态聚合 + somatic cache） | A2, A4, A6 | ~400 行 | F1-P1 | todo |
+| **F1-P3** | GWT 全局广播（SessionWM 变化 → 广播到所有模块） | A3 | ~150 行 | F1-P2 | todo |
+| **F1-P4** | 调节输出层（RegulationAction → SOUL 建议 / 检索策略调整） | A5 | ~200 行 | F1-P2 | todo |
+| **F1-P5** | 前脑岛元表征（"我知道我现在的状态"自我模型） | A7 | ~150 行 | F1-P2, F1-P4 | todo |
+
+### 依赖图
+```
+F1-P1 (信号格式) → F1-P2 (Hub 核心) → F1-P3 (GWT 广播)
+                                      → F1-P4 (调节输出) → F1-P5 (元表征)
+```
+
+### 涉及文件
+- **新增**: `engram/src/interoception.rs`（Hub 核心）
+- **改动**: `anomaly.rs`, `bus/accumulator.rs`, `bus/feedback.rs`, `confidence.rs`, `bus/alignment.rs`（加 InteroceptiveSignal 输出）
+- **改动**: `session_wm.rs`（加广播机制）
+- **RustClaw 侧**: `memory.rs`（持有 Hub）, `engram_hooks.rs`（注入状态）
+
+---
+
+## FEAT-002 [P2] [todo]
+**标题**: 情感闭环 — 从被动记录到主动循环
+**设计文档**: `ENGRAM-V2-DESIGN.md`
+**Backlog 编号**: B1-B6
+
+**核心论点**: 当前 engram 的情感模块是被动记录器。闭环意味着：情绪影响记忆 → 记忆影响行为 → 行为产生新情绪。
+
+### 组件分解
+
+| # | 组件 | 描述 | 依赖 | 复杂度 | 状态 |
+|---|------|------|------|--------|------|
+| **F2-B1** | Emotion → SOUL 闭环 | 持续负面情绪趋势 → 自动生成 SOUL.md 更新建议 | FEAT-001 F1-P4 | 中 | todo |
+| **F2-B2** | SOUL → Importance 自动调权 | SOUL drives 变化 → 相关记忆 importance 批量调整 | 无 | 低 | todo |
+| **F2-B3** | Engram → HEARTBEAT 自适应 | 记忆异常多 → 增加巡检频率；稳定 → 降低 | FEAT-001 F1-P2 | 低 | todo |
+| **F2-B4** | HEARTBEAT → 经验回流 | heartbeat 发现 → 作为经验存入 engram（带 source 标记） | 无 | 低 | todo |
+| **F2-B5** | IDENTITY 自动演化 | 基于积累的经验和情感趋势，自动建议 IDENTITY.md 更新 | F2-B1 | 中 | todo |
+| **F2-B6** | Voice 情感分析 | 语音特征（语速、音调、能量）→ 情绪标签 | 无 | 中 | todo |
+
+### 关键依赖
+- F2-B1 和 F2-B3 依赖 FEAT-001（InteroceptiveHub 提供整合后的状态信号）
+- F2-B2 和 F2-B4 可独立实现
+
+---
+
+## FEAT-003 [P1] [partial]
+**标题**: 记忆生命周期 — 从"存了就存了"到"记忆会演化"
+**设计文档**: `MEMORY-SYSTEM-RESEARCH.md`
+**Backlog 编号**: C1-C9
+
+**核心论点**: 记忆不是存进去就结束。需要去重、合并、合成高阶知识、结构化为实体图谱。
+
+### 组件分解
+
+| # | 组件 | 描述 | ISS 关联 | 状态 |
+|---|------|------|----------|------|
+| **F3-C1** | Gate 入口过滤 | 输入→决定是否值得记忆 | Phase A1/A2 | ✅ done |
+| **F3-C2** | Mission-Steered Extraction | SOUL.md 驱动引导提取方向 | — | todo |
+| **F3-C3** | Embedding Reconciler | 新记忆 vs 已有 → embedding 距离去重/合并 | ISS-003 扩展 | todo |
+| **F3-C4** | LLM Reconciler | 矛盾记忆 → LLM 决定保留/合并 | ISS-005 扩展 | todo |
+| **F3-C5** | Observation Consolidation | 多条观察 → 合成一条知识 | ISS-005 | todo |
+| **F3-C6** | Entity Graph | 实体关系网络 | **ISS-009** | todo |
+| **F3-C7** | Multi-Retrieval Fusion | TEMPR 级多路融合检索 | ISS-006 扩展 | todo |
+| **F3-C8** | Working Context State Machine | 对话上下文状态管理 | — | todo |
+| **F3-C9** | Activation Heatmap | 记忆激活分布可视化 | — | todo |
+
+### 推荐顺序
+1. **F3-C6** (ISS-009 Entity Graph) — recall 天花板，最高优先
+2. **F3-C3** (Embedding Reconciler) — 用户最可感知的改善
+3. **F3-C5** (Observation Consolidation) — ISS-005 的完整实现
+4. **F3-C2** (Mission-Steered) → **F3-C4** (LLM Reconciler) → **F3-C7** (Multi-Retrieval)
+5. **F3-C8**, **F3-C9** — nice-to-have
+
+---
+
+## FEAT-004 [P3] [todo]
+**标题**: 认知理论扩展 — 从文献到代码
+**设计文档**: cognitive-autoresearch Doc 02
+**Backlog 编号**: D1-D8
+
+**核心论点**: 认知科学有大量成熟理论可以为 engram 的记忆管理提供更好的模型。这些是研究性质的实现，优先级最低但长期价值最高。
+
+### 组件分解
+
+| # | 组件 | 认知理论 | 复杂度 | 状态 |
+|---|------|---------|--------|------|
+| **F4-D1** | STDP 因果方向 | Spike-Timing-Dependent Plasticity | 中 | todo |
+| **F4-D2** | 神经调质全局调控 | Neuromodulation (DA/5-HT/ACh/NE) | 高 | todo |
+| **F4-D3** | 感觉门控/丘脑过滤 | Sensory Gating / Thalamic Filter | 中 | todo |
+| **F4-D4** | 稀疏编码 | Sparse Distributed Representation | 中 | todo |
+| **F4-D5** | 神经振荡 | Neural Oscillations (Theta/Gamma) | 高 | todo |
+| **F4-D6** | 小世界网络 | Small-World Network Topology | 高 | todo |
+| **F4-D7** | 皮层柱 | Cortical Column / Minicolumn | 高 | todo |
+| **F4-D8** | 时间细胞 | Time Cells (Hippocampal) | 中 | todo |
+
+### 推荐顺序（按改动量/收益比）
+1. **F4-D1** STDP — 改动最小（Hebbian 已有，加方向），收益最大（因果推理）
+2. **F4-D8** 时间细胞 — 独立模块，改善时间相关检索
+3. **F4-D3** 感觉门控 — 输入预处理层，与 FEAT-001 互补
+4. **F4-D4** 稀疏编码 — top-k 激活机制
+5. **F4-D2/D5/D6/D7** — 需要深度设计后再动，暂不排期
+
+### 交叉区组件（最高优先级 — 两个来源都认为需要）
+以下组件在 cognitive-autoresearch Doc 02 和 engram 内部设计文档中都被提及，已归入对应 Feature：
+- **E1 GWT 全局广播** → FEAT-001 F1-P3
+- **E2 Somatic Marker** → FEAT-001 F1-P2
+- **E3 元认知 Control** → FEAT-001 F1-P5
+- **E4 神经调质** → FEAT-004 F4-D2
+
+---
+
+---
+
+# 全局实现路线建议 (2026-04-16)
+
+**当前 open 的操作性 Issues（可直接做）：**
+- ISS-009 (P1) Entity 索引 → 也是 FEAT-003 F3-C6
+- ISS-008 (P1) Knowledge promotion
+- ISS-004 (P2) 中文分词
+- ISS-011 (P2) Recall 结果去重
+- ISS-012 (P2) Importance 校准
+- ISS-013 (P3) STDP 审计
+
+**Feature 推荐顺序：**
+1. **ISS-009 + ISS-011 + ISS-012** — 操作性修复，直接提升 recall 质量
+2. **FEAT-001 Phase 1-2** — 内感受层核心（信号格式 + Hub），解锁所有后续
+3. **FEAT-003 F3-C3/C5** — Reconciler + Consolidation，记忆质量闭环
+4. **FEAT-001 Phase 3-5** — GWT 广播 + 调节输出 + 元表征
+5. **FEAT-002** — 情感闭环（大部分依赖 FEAT-001）
+6. **FEAT-004** — 认知理论扩展（研究性质，按需推进）

@@ -114,6 +114,21 @@ pub struct MemoryConfig {
     /// Cosine similarity threshold for considering memories as duplicates (default: 0.95)
     #[serde(default = "default_dedup_threshold")]
     pub dedup_threshold: f64,
+    
+    // === Auto-extraction importance cap ===
+    /// Maximum importance for auto-extracted memories (default: 0.7).
+    /// Prevents LLM extractor from assigning high importance to noise.
+    /// Only affects memories stored via extraction pipeline, not manual add().
+    #[serde(default = "default_auto_extract_importance_cap")]
+    pub auto_extract_importance_cap: f64,
+
+    // === Dedup on recall ===
+    /// Enable dedup of recall results (default: true)
+    #[serde(default = "default_recall_dedup_enabled")]
+    pub recall_dedup_enabled: bool,
+    /// Cosine similarity threshold for recall result dedup (default: 0.85)
+    #[serde(default = "default_recall_dedup_threshold")]
+    pub recall_dedup_threshold: f64,
 }
 
 fn default_entity_weight() -> f64 {
@@ -134,6 +149,18 @@ fn default_dedup_enabled() -> bool {
 
 fn default_dedup_threshold() -> f64 {
     0.95
+}
+
+fn default_auto_extract_importance_cap() -> f64 {
+    0.7
+}
+
+fn default_recall_dedup_enabled() -> bool {
+    true
+}
+
+fn default_recall_dedup_threshold() -> f64 {
+    0.85
 }
 
 impl Default for MemoryConfig {
@@ -174,6 +201,9 @@ impl Default for MemoryConfig {
             entity_weight: default_entity_weight(),
             dedup_enabled: default_dedup_enabled(),
             dedup_threshold: default_dedup_threshold(),
+            recall_dedup_enabled: default_recall_dedup_enabled(),
+            recall_dedup_threshold: default_recall_dedup_threshold(),
+            auto_extract_importance_cap: default_auto_extract_importance_cap(),
         }
     }
 }

@@ -512,8 +512,12 @@ impl Memory {
                         let fact_type = Self::parse_memory_type(&fact.memory_type)
                             .unwrap_or(memory_type);
                         
-                        // Use extracted importance, fall back to provided or type default
-                        let fact_importance = Some(fact.importance);
+                        // Cap auto-extracted importance to prevent noise from dominating recall
+                        let capped_importance = fact.importance.min(self.config.auto_extract_importance_cap);
+                        if fact.importance > self.config.auto_extract_importance_cap {
+                            log::debug!("  ↓ importance capped: {:.2} → {:.2}", fact.importance, capped_importance);
+                        }
+                        let fact_importance = Some(capped_importance);
                         
                         // Store each extracted fact separately
                         last_id = self.add_raw(
@@ -939,10 +943,17 @@ impl Memory {
             // Sort by combined score descending
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-            // Take top-k and compute confidence
-            let results: Vec<_> = scored
-                .into_iter()
-                .take(limit)
+            // Take expanded candidate pool for dedup backfilling
+            let expanded_limit = if self.config.recall_dedup_enabled { limit * 3 } else { limit };
+            let top_candidates: Vec<_> = scored.into_iter().take(expanded_limit).collect();
+
+            // Build pairwise embedding lookup for dedup
+            let embedding_lookup: HashMap<&str, &Vec<f32>> = stored_embeddings.iter()
+                .map(|(id, emb)| (id.as_str(), emb))
+                .collect();
+
+            // Convert to RecallResults with confidence
+            let mut all_results: Vec<RecallResult> = top_candidates.iter()
                 .map(|(record, _combined_score, activation)| {
                     // Compute confidence from individual signals (not combined_score)
                     let age_hours = (now - record.created_at).num_seconds() as f64 / 3600.0;
@@ -955,14 +966,28 @@ impl Memory {
                     let confidence_label = confidence_label(confidence);
 
                     RecallResult {
-                        record,
-                        activation,
+                        record: record.clone(),
+                        activation: *activation,
                         confidence,
                         confidence_label,
                     }
                 })
                 .filter(|r| r.confidence >= min_conf)
                 .collect();
+
+            // Dedup by embedding similarity
+            if self.config.recall_dedup_enabled {
+                all_results = Self::dedup_recall_results_by_embedding(
+                    all_results,
+                    &embedding_lookup,
+                    self.config.recall_dedup_threshold,
+                    limit,
+                );
+            } else {
+                all_results.truncate(limit);
+            }
+
+            let results = all_results;
 
             // Record access for all retrieved memories (ACT-R learning)
             for result in &results {
@@ -1053,6 +1078,47 @@ impl Memory {
         Ok(memory_scores)
     }
     
+    /// Remove near-duplicate recall results based on pairwise embedding similarity.
+    /// Greedy: iterate in score order, skip any result too similar to an already-kept one.
+    /// Backfills from the expanded candidate pool to maintain the requested limit.
+    fn dedup_recall_results_by_embedding(
+        candidates: Vec<RecallResult>,
+        embeddings: &HashMap<&str, &Vec<f32>>,
+        threshold: f64,
+        limit: usize,
+    ) -> Vec<RecallResult> {
+        let mut kept: Vec<RecallResult> = Vec::with_capacity(limit);
+        let mut kept_embeddings: Vec<&Vec<f32>> = Vec::with_capacity(limit);
+
+        for candidate in candidates {
+            if kept.len() >= limit {
+                break;
+            }
+
+            let candidate_emb = match embeddings.get(candidate.record.id.as_str()) {
+                Some(emb) => *emb,
+                None => {
+                    // No embedding available, keep by default
+                    kept.push(candidate);
+                    continue;
+                }
+            };
+
+            // Check against all kept results
+            let is_dup = kept_embeddings.iter().any(|kept_emb| {
+                let sim = EmbeddingProvider::cosine_similarity(candidate_emb, kept_emb);
+                sim as f64 > threshold
+            });
+
+            if !is_dup {
+                kept_embeddings.push(candidate_emb);
+                kept.push(candidate);
+            }
+        }
+
+        kept
+    }
+
     /// FTS-based recall fallback when embeddings are not available.
     fn recall_fts(
         &mut self,
@@ -2718,5 +2784,304 @@ mod confidence_tests {
         let c_low = compute_query_confidence(Some(0.3), false, 0.0, 100.0);
         let gap = c_high - c_low;
         assert!(gap > 0.3, "sigmoid should create large gap between 0.8 and 0.3 sim: gap={gap}");
+    }
+
+    #[test]
+    fn test_auto_extract_importance_cap() {
+        let mut config = MemoryConfig::default();
+        config.auto_extract_importance_cap = 0.7;
+        
+        // Test capping logic directly
+        let extracted_importance: f64 = 0.95;
+        let capped = extracted_importance.min(config.auto_extract_importance_cap);
+        assert_eq!(capped, 0.7);
+        
+        // Below cap — no change
+        let low_importance: f64 = 0.3;
+        let not_capped = low_importance.min(config.auto_extract_importance_cap);
+        assert_eq!(not_capped, 0.3);
+        
+        // Exactly at cap — no change
+        let at_cap: f64 = 0.7;
+        let stays = at_cap.min(config.auto_extract_importance_cap);
+        assert_eq!(stays, 0.7);
+    }
+
+    #[test]
+    fn test_auto_extract_importance_cap_default() {
+        let config = MemoryConfig::default();
+        assert_eq!(config.auto_extract_importance_cap, 0.7);
+    }
+
+    #[test]
+    fn test_dedup_recall_results_by_embedding() {
+        // Create mock embeddings - two near-identical and one different
+        let emb_a: Vec<f32> = vec![1.0, 0.0, 0.0];
+        let emb_b: Vec<f32> = vec![0.99, 0.1, 0.0]; // Very similar to A
+        let emb_c: Vec<f32> = vec![0.0, 1.0, 0.0]; // Different
+
+        let mut embeddings_map: HashMap<&str, &Vec<f32>> = HashMap::new();
+        embeddings_map.insert("id-a", &emb_a);
+        embeddings_map.insert("id-b", &emb_b);
+        embeddings_map.insert("id-c", &emb_c);
+
+        let make_result = |id: &str, confidence: f64| RecallResult {
+            record: MemoryRecord {
+                id: id.to_string(),
+                content: format!("content-{}", id),
+                memory_type: MemoryType::Factual,
+                layer: MemoryLayer::Working,
+                created_at: Utc::now(),
+                access_times: vec![Utc::now()],
+                working_strength: 1.0,
+                core_strength: 0.0,
+                importance: 0.5,
+                pinned: false,
+                consolidation_count: 0,
+                last_consolidated: None,
+                source: "test".to_string(),
+                contradicts: None,
+                contradicted_by: None,
+                metadata: None,
+            },
+            activation: 0.5,
+            confidence,
+            confidence_label: "high".to_string(),
+        };
+
+        let candidates = vec![
+            make_result("id-a", 0.9),
+            make_result("id-b", 0.8), // Near-dup of A
+            make_result("id-c", 0.7),
+        ];
+
+        let result = Memory::dedup_recall_results_by_embedding(
+            candidates,
+            &embeddings_map,
+            0.85, // threshold
+            3,    // limit
+        );
+
+        // Should keep A and C, skip B (too similar to A)
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].record.id, "id-a");
+        assert_eq!(result[1].record.id, "id-c");
+    }
+
+    #[test]
+    fn test_dedup_recall_no_duplicates() {
+        // All embeddings are orthogonal — nothing should be deduped
+        let emb_a: Vec<f32> = vec![1.0, 0.0, 0.0];
+        let emb_b: Vec<f32> = vec![0.0, 1.0, 0.0];
+        let emb_c: Vec<f32> = vec![0.0, 0.0, 1.0];
+
+        let mut embeddings_map: HashMap<&str, &Vec<f32>> = HashMap::new();
+        embeddings_map.insert("id-a", &emb_a);
+        embeddings_map.insert("id-b", &emb_b);
+        embeddings_map.insert("id-c", &emb_c);
+
+        let make_result = |id: &str, confidence: f64| RecallResult {
+            record: MemoryRecord {
+                id: id.to_string(),
+                content: format!("content-{}", id),
+                memory_type: MemoryType::Factual,
+                layer: MemoryLayer::Working,
+                created_at: Utc::now(),
+                access_times: vec![Utc::now()],
+                working_strength: 1.0,
+                core_strength: 0.0,
+                importance: 0.5,
+                pinned: false,
+                consolidation_count: 0,
+                last_consolidated: None,
+                source: "test".to_string(),
+                contradicts: None,
+                contradicted_by: None,
+                metadata: None,
+            },
+            activation: 0.5,
+            confidence,
+            confidence_label: "high".to_string(),
+        };
+
+        let candidates = vec![
+            make_result("id-a", 0.9),
+            make_result("id-b", 0.8),
+            make_result("id-c", 0.7),
+        ];
+
+        let result = Memory::dedup_recall_results_by_embedding(
+            candidates,
+            &embeddings_map,
+            0.85,
+            3,
+        );
+
+        // All three should be kept
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_dedup_recall_respects_limit() {
+        // No dups, but limit is 2
+        let emb_a: Vec<f32> = vec![1.0, 0.0, 0.0];
+        let emb_b: Vec<f32> = vec![0.0, 1.0, 0.0];
+        let emb_c: Vec<f32> = vec![0.0, 0.0, 1.0];
+
+        let mut embeddings_map: HashMap<&str, &Vec<f32>> = HashMap::new();
+        embeddings_map.insert("id-a", &emb_a);
+        embeddings_map.insert("id-b", &emb_b);
+        embeddings_map.insert("id-c", &emb_c);
+
+        let make_result = |id: &str| RecallResult {
+            record: MemoryRecord {
+                id: id.to_string(),
+                content: format!("content-{}", id),
+                memory_type: MemoryType::Factual,
+                layer: MemoryLayer::Working,
+                created_at: Utc::now(),
+                access_times: vec![Utc::now()],
+                working_strength: 1.0,
+                core_strength: 0.0,
+                importance: 0.5,
+                pinned: false,
+                consolidation_count: 0,
+                last_consolidated: None,
+                source: "test".to_string(),
+                contradicts: None,
+                contradicted_by: None,
+                metadata: None,
+            },
+            activation: 0.5,
+            confidence: 0.8,
+            confidence_label: "high".to_string(),
+        };
+
+        let candidates = vec![
+            make_result("id-a"),
+            make_result("id-b"),
+            make_result("id-c"),
+        ];
+
+        let result = Memory::dedup_recall_results_by_embedding(
+            candidates,
+            &embeddings_map,
+            0.85,
+            2, // limit of 2
+        );
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].record.id, "id-a");
+        assert_eq!(result[1].record.id, "id-b");
+    }
+
+    #[test]
+    fn test_dedup_recall_missing_embedding_kept() {
+        // If a candidate has no embedding in the lookup, it should be kept
+        let emb_a: Vec<f32> = vec![1.0, 0.0, 0.0];
+
+        let mut embeddings_map: HashMap<&str, &Vec<f32>> = HashMap::new();
+        embeddings_map.insert("id-a", &emb_a);
+        // id-b has no embedding
+
+        let make_result = |id: &str| RecallResult {
+            record: MemoryRecord {
+                id: id.to_string(),
+                content: format!("content-{}", id),
+                memory_type: MemoryType::Factual,
+                layer: MemoryLayer::Working,
+                created_at: Utc::now(),
+                access_times: vec![Utc::now()],
+                working_strength: 1.0,
+                core_strength: 0.0,
+                importance: 0.5,
+                pinned: false,
+                consolidation_count: 0,
+                last_consolidated: None,
+                source: "test".to_string(),
+                contradicts: None,
+                contradicted_by: None,
+                metadata: None,
+            },
+            activation: 0.5,
+            confidence: 0.8,
+            confidence_label: "high".to_string(),
+        };
+
+        let candidates = vec![
+            make_result("id-a"),
+            make_result("id-b"), // No embedding
+        ];
+
+        let result = Memory::dedup_recall_results_by_embedding(
+            candidates,
+            &embeddings_map,
+            0.85,
+            5,
+        );
+
+        // Both should be kept (id-b has no embedding, so can't be deduped)
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_dedup_recall_backfills_from_candidates() {
+        // A, B (dup of A), C (different) — with limit=2, should get A and C
+        let emb_a: Vec<f32> = vec![1.0, 0.0, 0.0];
+        let emb_b: Vec<f32> = vec![0.98, 0.05, 0.0]; // Near-duplicate of A
+        let emb_c: Vec<f32> = vec![0.0, 1.0, 0.0]; // Different
+
+        let mut embeddings_map: HashMap<&str, &Vec<f32>> = HashMap::new();
+        embeddings_map.insert("id-a", &emb_a);
+        embeddings_map.insert("id-b", &emb_b);
+        embeddings_map.insert("id-c", &emb_c);
+
+        let make_result = |id: &str, confidence: f64| RecallResult {
+            record: MemoryRecord {
+                id: id.to_string(),
+                content: format!("content-{}", id),
+                memory_type: MemoryType::Factual,
+                layer: MemoryLayer::Working,
+                created_at: Utc::now(),
+                access_times: vec![Utc::now()],
+                working_strength: 1.0,
+                core_strength: 0.0,
+                importance: 0.5,
+                pinned: false,
+                consolidation_count: 0,
+                last_consolidated: None,
+                source: "test".to_string(),
+                contradicts: None,
+                contradicted_by: None,
+                metadata: None,
+            },
+            activation: 0.5,
+            confidence,
+            confidence_label: "high".to_string(),
+        };
+
+        let candidates = vec![
+            make_result("id-a", 0.9),
+            make_result("id-b", 0.85), // Dup of A, would normally be #2
+            make_result("id-c", 0.7),  // #3 backfills into slot #2
+        ];
+
+        let result = Memory::dedup_recall_results_by_embedding(
+            candidates,
+            &embeddings_map,
+            0.85,
+            2, // limit=2, B gets deduped, C backfills
+        );
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].record.id, "id-a");
+        assert_eq!(result[1].record.id, "id-c"); // Backfilled
+    }
+
+    #[test]
+    fn test_recall_dedup_config_defaults() {
+        let config = MemoryConfig::default();
+        assert!(config.recall_dedup_enabled);
+        assert!((config.recall_dedup_threshold - 0.85).abs() < f64::EPSILON);
     }
 }

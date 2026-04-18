@@ -423,6 +423,16 @@ pub enum LinkRepairAction {
     MarkStale,
 }
 
+/// Result of executing a link repair action.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RepairResult {
+    pub memory_id: String,
+    pub topic_id: TopicId,
+    pub action_taken: LinkRepairAction,
+    pub success: bool,
+    pub details: String,
+}
+
 /// Multi-dimensional health score for a topic page.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TopicHealthScore {
@@ -514,6 +524,7 @@ pub struct OperationSummary {
     pub failure_count: usize,
     pub skipped_count: usize,
     pub duration_ms: u64,
+    pub token_cost: Option<TokenUsage>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1442,10 +1453,18 @@ mod tests {
             failure_count: 5,
             skipped_count: 5,
             duration_ms: 12000,
+            token_cost: Some(TokenUsage {
+                input_tokens: 1500,
+                output_tokens: 500,
+            }),
         };
         let json = serde_json::to_string(&os).unwrap();
         let back: OperationSummary = serde_json::from_str(&json).unwrap();
         assert_eq!(back.success_count + back.failure_count + back.skipped_count, 100);
+        assert!(back.token_cost.is_some());
+        let usage = back.token_cost.unwrap();
+        assert_eq!(usage.input_tokens, 1500);
+        assert_eq!(usage.output_tokens, 500);
     }
 
     // ── TopicSection ─────────────────────────────────────────────────────

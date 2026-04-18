@@ -311,6 +311,97 @@ impl HealthAuditor {
             LinkStatus::Valid => LinkRepairAction::MarkStale, // shouldn't happen
         }
     }
+
+    /// Execute a link repair action on a topic page.
+    ///
+    /// Applies the given [`LinkRepairAction`] to the topic, persists
+    /// the changes via the store, and returns a [`RepairResult`]
+    /// describing what was done.
+    pub fn repair_link(
+        &self,
+        topic: &mut TopicPage,
+        entry: &LinkAuditEntry,
+        action: &LinkRepairAction,
+        store: &dyn KnowledgeStore,
+    ) -> Result<RepairResult, KcError> {
+        match action {
+            LinkRepairAction::Remove => {
+                // Remove the memory_id from source_memory_ids
+                topic
+                    .metadata
+                    .source_memory_ids
+                    .retain(|id| id != &entry.memory_id);
+
+                // Update source refs in store (save remaining refs without the removed one)
+                let mut refs = store.get_source_refs(&topic.id)?;
+                refs.retain(|r| r.memory_id != entry.memory_id);
+                store.save_source_refs(&topic.id, &refs)?;
+
+                // Update topic page in store
+                store.update_topic_page(topic)?;
+
+                Ok(RepairResult {
+                    memory_id: entry.memory_id.clone(),
+                    topic_id: topic.id.clone(),
+                    action_taken: LinkRepairAction::Remove,
+                    success: true,
+                    details: format!(
+                        "Removed broken source '{}' from topic '{}'",
+                        entry.memory_id, topic.id
+                    ),
+                })
+            }
+            LinkRepairAction::MarkStale => {
+                // Update topic status to Stale
+                topic.status = TopicStatus::Stale;
+
+                // Persist the change
+                store.update_topic_page(topic)?;
+
+                Ok(RepairResult {
+                    memory_id: entry.memory_id.clone(),
+                    topic_id: topic.id.clone(),
+                    action_taken: LinkRepairAction::MarkStale,
+                    success: true,
+                    details: format!(
+                        "Marked topic '{}' as stale due to link '{}'",
+                        topic.id, entry.memory_id
+                    ),
+                })
+            }
+            LinkRepairAction::UpdateTarget(new_id) => {
+                // Replace old memory_id with new_id in source_memory_ids
+                for id in &mut topic.metadata.source_memory_ids {
+                    if *id == entry.memory_id {
+                        *id = new_id.0.clone();
+                    }
+                }
+
+                // Update source refs: replace old ref with new one
+                let mut refs = store.get_source_refs(&topic.id)?;
+                for r in &mut refs {
+                    if r.memory_id == entry.memory_id {
+                        r.memory_id = new_id.0.clone();
+                    }
+                }
+                store.save_source_refs(&topic.id, &refs)?;
+
+                // Update topic page in store
+                store.update_topic_page(topic)?;
+
+                Ok(RepairResult {
+                    memory_id: entry.memory_id.clone(),
+                    topic_id: topic.id.clone(),
+                    action_taken: LinkRepairAction::UpdateTarget(new_id.clone()),
+                    success: true,
+                    details: format!(
+                        "Updated source '{}' → '{}' in topic '{}'",
+                        entry.memory_id, new_id, topic.id
+                    ),
+                })
+            }
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -789,5 +880,174 @@ mod tests {
             "Expected 'Recompile' recommendation, got: {:?}",
             report.recommendations
         );
+    }
+
+    // ── test_repair_link_remove ──────────────────────────────────────────
+
+    #[test]
+    fn test_repair_link_remove() {
+        let store = make_store();
+        let mut page = make_test_page("repair-rm", &["m1", "m2", "m3"]);
+        store.create_topic_page(&page).unwrap();
+
+        let now = Utc::now();
+        let refs = vec![
+            SourceMemoryRef {
+                memory_id: "m1".into(),
+                relevance_score: 0.9,
+                added_at: now,
+            },
+            SourceMemoryRef {
+                memory_id: "m2".into(),
+                relevance_score: 0.8,
+                added_at: now,
+            },
+            SourceMemoryRef {
+                memory_id: "m3".into(),
+                relevance_score: 0.7,
+                added_at: now,
+            },
+        ];
+        store.save_source_refs(&page.id, &refs).unwrap();
+
+        let entry = LinkAuditEntry {
+            memory_id: "m2".into(),
+            topic_id: page.id.clone(),
+            status: LinkStatus::Broken,
+            details: "not found".into(),
+        };
+
+        let auditor = HealthAuditor;
+        let result = auditor
+            .repair_link(&mut page, &entry, &LinkRepairAction::Remove, &store)
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.memory_id, "m2");
+        assert!(matches!(result.action_taken, LinkRepairAction::Remove));
+
+        // Verify source_memory_ids no longer contains m2
+        assert!(!page.metadata.source_memory_ids.contains(&"m2".to_string()));
+        assert_eq!(page.metadata.source_memory_ids.len(), 2);
+
+        // Verify store source refs no longer contain m2
+        let stored_refs = store.get_source_refs(&page.id).unwrap();
+        assert_eq!(stored_refs.len(), 2);
+        assert!(!stored_refs.iter().any(|r| r.memory_id == "m2"));
+
+        // Verify the topic page in store is updated
+        let stored_page = store.get_topic_page(&page.id).unwrap().unwrap();
+        assert!(!stored_page.metadata.source_memory_ids.contains(&"m2".to_string()));
+    }
+
+    // ── test_repair_link_mark_stale ──────────────────────────────────────
+
+    #[test]
+    fn test_repair_link_mark_stale() {
+        let store = make_store();
+        let mut page = make_test_page("repair-stale", &["m1", "m2"]);
+        store.create_topic_page(&page).unwrap();
+
+        let now = Utc::now();
+        let refs = vec![
+            SourceMemoryRef {
+                memory_id: "m1".into(),
+                relevance_score: 0.9,
+                added_at: now,
+            },
+            SourceMemoryRef {
+                memory_id: "m2".into(),
+                relevance_score: 0.05,
+                added_at: now,
+            },
+        ];
+        store.save_source_refs(&page.id, &refs).unwrap();
+
+        let entry = LinkAuditEntry {
+            memory_id: "m2".into(),
+            topic_id: page.id.clone(),
+            status: LinkStatus::Stale,
+            details: "low relevance".into(),
+        };
+
+        let auditor = HealthAuditor;
+        let result = auditor
+            .repair_link(&mut page, &entry, &LinkRepairAction::MarkStale, &store)
+            .unwrap();
+
+        assert!(result.success);
+        assert!(matches!(result.action_taken, LinkRepairAction::MarkStale));
+
+        // Verify topic status changed to Stale
+        assert_eq!(page.status, TopicStatus::Stale);
+
+        // Verify store reflects the status change
+        let stored_page = store.get_topic_page(&page.id).unwrap().unwrap();
+        assert_eq!(stored_page.status, TopicStatus::Stale);
+    }
+
+    // ── test_repair_link_update_target ───────────────────────────────────
+
+    #[test]
+    fn test_repair_link_update_target() {
+        let store = make_store();
+        let mut page = make_test_page("repair-update", &["m1", "m2", "m3"]);
+        store.create_topic_page(&page).unwrap();
+
+        let now = Utc::now();
+        let refs = vec![
+            SourceMemoryRef {
+                memory_id: "m1".into(),
+                relevance_score: 0.9,
+                added_at: now,
+            },
+            SourceMemoryRef {
+                memory_id: "m2".into(),
+                relevance_score: 0.8,
+                added_at: now,
+            },
+            SourceMemoryRef {
+                memory_id: "m3".into(),
+                relevance_score: 0.7,
+                added_at: now,
+            },
+        ];
+        store.save_source_refs(&page.id, &refs).unwrap();
+
+        let entry = LinkAuditEntry {
+            memory_id: "m2".into(),
+            topic_id: page.id.clone(),
+            status: LinkStatus::Broken,
+            details: "not found".into(),
+        };
+
+        let new_target = TopicId("m2-replacement".into());
+        let auditor = HealthAuditor;
+        let result = auditor
+            .repair_link(
+                &mut page,
+                &entry,
+                &LinkRepairAction::UpdateTarget(new_target.clone()),
+                &store,
+            )
+            .unwrap();
+
+        assert!(result.success);
+        assert!(matches!(result.action_taken, LinkRepairAction::UpdateTarget(_)));
+
+        // Verify source_memory_ids has new id, not old
+        assert!(!page.metadata.source_memory_ids.contains(&"m2".to_string()));
+        assert!(page.metadata.source_memory_ids.contains(&"m2-replacement".to_string()));
+        assert_eq!(page.metadata.source_memory_ids.len(), 3);
+
+        // Verify store source refs have the new id
+        let stored_refs = store.get_source_refs(&page.id).unwrap();
+        assert_eq!(stored_refs.len(), 3);
+        assert!(stored_refs.iter().any(|r| r.memory_id == "m2-replacement"));
+        assert!(!stored_refs.iter().any(|r| r.memory_id == "m2"));
+
+        // Verify the topic page in store is updated
+        let stored_page = store.get_topic_page(&page.id).unwrap().unwrap();
+        assert!(stored_page.metadata.source_memory_ids.contains(&"m2-replacement".to_string()));
     }
 }

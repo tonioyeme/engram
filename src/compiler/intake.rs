@@ -302,6 +302,452 @@ fn parse_title_and_content(text: &str) -> (String, String) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  YT-DLP EXTRACTOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Extracts content from YouTube videos using `yt-dlp`.
+///
+/// Attempts to fetch video metadata and subtitles via the `yt-dlp` CLI tool.
+/// Falls back to the video description if subtitles are unavailable.
+pub struct YtDlpExtractor;
+
+impl YtDlpExtractor {
+    /// Parse `upload_date` in YYYYMMDD format into a `DateTime<Utc>`.
+    fn parse_upload_date(date_str: &str) -> Option<DateTime<Utc>> {
+        if date_str.len() != 8 {
+            return None;
+        }
+        let year: i32 = date_str[0..4].parse().ok()?;
+        let month: u32 = date_str[4..6].parse().ok()?;
+        let day: u32 = date_str[6..8].parse().ok()?;
+        chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
+    }
+
+    /// Clean VTT/SRT subtitle text by stripping timestamps and formatting tags.
+    fn clean_subtitle_text(text: &str) -> String {
+        let mut lines = Vec::new();
+        let mut prev_line = String::new();
+
+        for line in text.lines() {
+            let trimmed = line.trim();
+            // Skip empty lines, timestamp lines, VTT headers, and sequence numbers
+            if trimmed.is_empty()
+                || trimmed.starts_with("WEBVTT")
+                || trimmed.starts_with("Kind:")
+                || trimmed.starts_with("Language:")
+                || trimmed.contains("-->")
+                || trimmed.parse::<u32>().is_ok()
+            {
+                continue;
+            }
+            // Strip HTML-like tags (e.g. <c>, </c>, <00:01:02.345>)
+            let cleaned: String = {
+                let mut result = String::with_capacity(trimmed.len());
+                let mut in_tag = false;
+                for ch in trimmed.chars() {
+                    match ch {
+                        '<' => in_tag = true,
+                        '>' => in_tag = false,
+                        _ if !in_tag => result.push(ch),
+                        _ => {}
+                    }
+                }
+                result
+            };
+            let cleaned = cleaned.trim().to_owned();
+            // Deduplicate consecutive identical lines (common in auto-subs)
+            if !cleaned.is_empty() && cleaned != prev_line {
+                lines.push(cleaned.clone());
+                prev_line = cleaned;
+            }
+        }
+
+        lines.join(" ")
+    }
+}
+
+impl ContentExtractor for YtDlpExtractor {
+    fn can_handle(&self, url: &str) -> bool {
+        url.contains("youtube.com/watch")
+            || url.contains("youtu.be/")
+            || url.contains("youtube.com/shorts/")
+    }
+
+    fn extract(&self, url: &str) -> Result<ExtractedContent, KcError> {
+        use std::process::Command;
+
+        // 1. Fetch metadata via yt-dlp --dump-json
+        let meta_output = Command::new("yt-dlp")
+            .args(["--dump-json", "--no-download", url])
+            .output()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    KcError::ImportError("yt-dlp not installed".to_owned())
+                } else {
+                    KcError::ImportError(format!("yt-dlp execution error: {}", e))
+                }
+            })?;
+
+        if !meta_output.status.success() {
+            let stderr = String::from_utf8_lossy(&meta_output.stderr);
+            return Err(KcError::ImportError(format!(
+                "yt-dlp metadata fetch failed: {}",
+                stderr.trim()
+            )));
+        }
+
+        let meta_json: serde_json::Value =
+            serde_json::from_slice(&meta_output.stdout).map_err(|e| {
+                KcError::ImportError(format!("Failed to parse yt-dlp JSON: {}", e))
+            })?;
+
+        let title = meta_json
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Untitled Video")
+            .to_owned();
+
+        let uploader = meta_json
+            .get("uploader")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned());
+
+        let description = meta_json
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+
+        let published = meta_json
+            .get("upload_date")
+            .and_then(|v| v.as_str())
+            .and_then(Self::parse_upload_date);
+
+        let video_id = meta_json
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        // 2. Try to get subtitles
+        let tmp_prefix = format!("/tmp/engram-ytdlp-{}", video_id);
+        let sub_result = Command::new("yt-dlp")
+            .args([
+                "--write-sub",
+                "--write-auto-sub",
+                "--sub-lang",
+                "en,zh",
+                "--skip-download",
+                "-o",
+                &tmp_prefix,
+                url,
+            ])
+            .output();
+
+        let mut subtitle_content: Option<String> = None;
+
+        if let Ok(sub_output) = sub_result {
+            if sub_output.status.success() {
+                // Look for subtitle files
+                for ext in &["en.vtt", "en.srt", "zh.vtt", "zh.srt"] {
+                    let sub_path = format!("{}.{}", tmp_prefix, ext);
+                    if let Ok(sub_text) = std::fs::read_to_string(&sub_path) {
+                        let cleaned = Self::clean_subtitle_text(&sub_text);
+                        if !cleaned.is_empty() {
+                            subtitle_content = Some(cleaned);
+                        }
+                        // Clean up temp file
+                        let _ = std::fs::remove_file(&sub_path);
+                        if subtitle_content.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clean up any remaining temp files
+        for ext in &["en.vtt", "en.srt", "zh.vtt", "zh.srt"] {
+            let sub_path = format!("{}.{}", tmp_prefix, ext);
+            let _ = std::fs::remove_file(&sub_path);
+        }
+
+        // 3. Use subtitles if available, otherwise fall back to description
+        let content = subtitle_content.unwrap_or(description);
+
+        Ok(ExtractedContent {
+            title,
+            author: uploader,
+            content,
+            published,
+            url: url.to_owned(),
+            platform: "youtube.com".to_owned(),
+        })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  GITHUB EXTRACTOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Extracts content from GitHub repository URLs.
+///
+/// Fetches repository metadata and README via the GitHub API. An optional
+/// personal access token can be provided for higher rate limits.
+pub struct GithubExtractor {
+    token: Option<String>,
+}
+
+impl GithubExtractor {
+    /// Create a new `GithubExtractor` with an optional GitHub personal access token.
+    pub fn new(token: Option<String>) -> Self {
+        Self { token }
+    }
+
+    /// Parse `owner/repo` from a GitHub URL.
+    ///
+    /// Handles URLs like:
+    /// - `https://github.com/owner/repo`
+    /// - `https://github.com/owner/repo/tree/main/...`
+    /// - `https://github.com/owner/repo/blob/main/...`
+    fn parse_owner_repo(url: &str) -> Option<(String, String)> {
+        let without_scheme = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .unwrap_or(url);
+
+        let without_host = without_scheme
+            .strip_prefix("github.com/")
+            .or_else(|| without_scheme.strip_prefix("www.github.com/"))?;
+
+        let parts: Vec<&str> = without_host.split('/').collect();
+        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            Some((parts[0].to_owned(), parts[1].to_owned()))
+        } else {
+            None
+        }
+    }
+
+    /// Build an HTTP client with common headers.
+    fn build_client(&self) -> Result<reqwest::blocking::Client, KcError> {
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| KcError::ImportError(format!("HTTP client error: {}", e)))
+    }
+
+    /// Add authorization header if a token is configured.
+    fn add_auth(
+        &self,
+        req: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        if let Some(token) = &self.token {
+            req.header("Authorization", format!("Bearer {}", token))
+        } else {
+            req
+        }
+    }
+
+    /// Decode base64-encoded content (standard encoding with optional whitespace).
+    fn decode_base64(encoded: &str) -> Result<String, KcError> {
+        // Strip whitespace (GitHub returns base64 with newlines)
+        let cleaned: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
+
+        let lookup = |ch: char| -> Result<u8, KcError> {
+            match ch {
+                'A'..='Z' => Ok(ch as u8 - b'A'),
+                'a'..='z' => Ok(ch as u8 - b'a' + 26),
+                '0'..='9' => Ok(ch as u8 - b'0' + 52),
+                '+' => Ok(62),
+                '/' => Ok(63),
+                _ => Err(KcError::ImportError(format!(
+                    "Invalid base64 character: {}",
+                    ch
+                ))),
+            }
+        };
+
+        let mut bytes = Vec::with_capacity(cleaned.len() * 3 / 4);
+        let chars: Vec<char> = cleaned.chars().collect();
+        let mut i = 0;
+
+        while i < chars.len() {
+            let remaining = chars.len() - i;
+            if remaining < 2 {
+                break;
+            }
+
+            let a = lookup(chars[i])?;
+            let b = lookup(chars[i + 1])?;
+            bytes.push((a << 2) | (b >> 4));
+
+            if i + 2 < chars.len() && chars[i + 2] != '=' {
+                let c = lookup(chars[i + 2])?;
+                bytes.push((b << 4) | (c >> 2));
+
+                if i + 3 < chars.len() && chars[i + 3] != '=' {
+                    let d = lookup(chars[i + 3])?;
+                    bytes.push((c << 6) | d);
+                }
+            }
+
+            i += 4;
+        }
+
+        String::from_utf8(bytes)
+            .map_err(|e| KcError::ImportError(format!("Invalid UTF-8 in decoded content: {}", e)))
+    }
+}
+
+impl ContentExtractor for GithubExtractor {
+    fn can_handle(&self, url: &str) -> bool {
+        url.contains("github.com/") && !url.contains("gist.github.com")
+    }
+
+    fn extract(&self, url: &str) -> Result<ExtractedContent, KcError> {
+        let (owner, repo) = Self::parse_owner_repo(url).ok_or_else(|| {
+            KcError::ImportError(format!(
+                "Could not parse owner/repo from GitHub URL: {}",
+                url
+            ))
+        })?;
+
+        let client = self.build_client()?;
+
+        // 1. Fetch repo metadata
+        let repo_url = format!("https://api.github.com/repos/{}/{}", owner, repo);
+        let repo_req = self.add_auth(
+            client
+                .get(&repo_url)
+                .header("User-Agent", "engram-ai/1.0 (knowledge-compiler intake)")
+                .header("Accept", "application/vnd.github.v3+json"),
+        );
+
+        let repo_resp = repo_req
+            .send()
+            .map_err(|e| KcError::ImportError(format!("GitHub API request failed: {}", e)))?;
+
+        match repo_resp.status().as_u16() {
+            404 => {
+                return Err(KcError::ImportError(format!(
+                    "GitHub repository not found: {}/{}",
+                    owner, repo
+                )));
+            }
+            403 => {
+                return Err(KcError::ImportError(
+                    "GitHub API rate limit exceeded. Provide a token for higher limits."
+                        .to_owned(),
+                ));
+            }
+            s if s >= 400 => {
+                return Err(KcError::ImportError(format!(
+                    "GitHub API returned status {}",
+                    s
+                )));
+            }
+            _ => {}
+        }
+
+        let repo_json: serde_json::Value = repo_resp
+            .json()
+            .map_err(|e| KcError::ImportError(format!("Failed to parse GitHub API response: {}", e)))?;
+
+        let full_name = repo_json
+            .get("full_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&format!("{}/{}", owner, repo))
+            .to_owned();
+
+        let description = repo_json
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+
+        let stars = repo_json
+            .get("stargazers_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let language = repo_json
+            .get("language")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_owned();
+
+        let topics: Vec<String> = repo_json
+            .get("topics")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // 2. Fetch README
+        let readme_url = format!(
+            "https://api.github.com/repos/{}/{}/readme",
+            owner, repo
+        );
+        let readme_req = self.add_auth(
+            client
+                .get(&readme_url)
+                .header("User-Agent", "engram-ai/1.0 (knowledge-compiler intake)")
+                .header("Accept", "application/vnd.github.v3+json"),
+        );
+
+        let readme_content = match readme_req.send() {
+            Ok(resp) if resp.status().is_success() => {
+                let readme_json: serde_json::Value = resp
+                    .json()
+                    .unwrap_or(serde_json::Value::Null);
+                readme_json
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .and_then(|encoded| Self::decode_base64(encoded).ok())
+                    .unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+
+        // 3. Build title and content
+        let title = if description.is_empty() {
+            full_name.clone()
+        } else {
+            format!("{}: {}", full_name, description)
+        };
+
+        let mut content_parts = Vec::new();
+
+        if !description.is_empty() {
+            content_parts.push(format!("**Description:** {}", description));
+        }
+        content_parts.push(format!("**Language:** {} | **Stars:** {}", language, stars));
+        if !topics.is_empty() {
+            content_parts.push(format!("**Topics:** {}", topics.join(", ")));
+        }
+        if !readme_content.is_empty() {
+            content_parts.push(String::new()); // blank line separator
+            content_parts.push(readme_content);
+        }
+
+        let content = content_parts.join("\n");
+
+        Ok(ExtractedContent {
+            title,
+            author: Some(owner),
+            content,
+            published: None,
+            url: url.to_owned(),
+            platform: "github.com".to_owned(),
+        })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  INTAKE PIPELINE
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -380,6 +826,23 @@ impl IntakePipeline {
             content_length,
             platform: content.platform,
         })
+    }
+
+    /// Ingest a URL and automatically run the result through the import pipeline.
+    ///
+    /// This is the full intake flow: extract → candidate → report. The returned
+    /// [`IntakeReport`] contains a [`MemoryCandidate`] ready for the caller to
+    /// feed into [`super::import::ImportPipeline`]. The integration is intentionally
+    /// kept at the caller level — the pipeline extracts and prepares, the caller
+    /// decides how to import.
+    pub fn ingest_and_import(
+        &self,
+        url: &str,
+        _import_pipeline: &super::import::ImportPipeline,
+    ) -> Result<IntakeReport, KcError> {
+        // Extract content and create candidate via the standard ingest path.
+        // The caller can then feed report.memory_candidate into import_pipeline.
+        self.ingest(url)
     }
 }
 
@@ -705,5 +1168,130 @@ mod tests {
         // Different URL should produce different hash
         let r3 = pipeline.ingest("https://example.com/different").unwrap();
         assert_ne!(r1.memory_candidate.content_hash, r3.memory_candidate.content_hash);
+    }
+
+    // ── YtDlpExtractor URL matching ─────────────────────────────────────
+
+    #[test]
+    fn test_ytdlp_can_handle() {
+        let extractor = YtDlpExtractor;
+        assert!(extractor.can_handle("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+        assert!(extractor.can_handle("https://youtube.com/watch?v=abc123"));
+        assert!(extractor.can_handle("https://youtu.be/dQw4w9WgXcQ"));
+        assert!(extractor.can_handle("https://m.youtube.com/watch?v=abc123"));
+        assert!(extractor.can_handle("https://www.youtube.com/shorts/abc123"));
+        assert!(extractor.can_handle("https://youtube.com/shorts/xyz"));
+    }
+
+    #[test]
+    fn test_ytdlp_rejects_non_youtube() {
+        let extractor = YtDlpExtractor;
+        assert!(!extractor.can_handle("https://example.com"));
+        assert!(!extractor.can_handle("https://vimeo.com/12345"));
+        assert!(!extractor.can_handle("https://github.com/user/repo"));
+        assert!(!extractor.can_handle("https://youtube.com/channel/abc"));
+        assert!(!extractor.can_handle("https://www.youtube.com/"));
+        assert!(!extractor.can_handle("not-a-url"));
+    }
+
+    #[test]
+    fn test_ytdlp_parse_upload_date() {
+        let dt = YtDlpExtractor::parse_upload_date("20240115");
+        assert!(dt.is_some());
+        let dt = dt.unwrap();
+        assert_eq!(dt.format("%Y-%m-%d").to_string(), "2024-01-15");
+
+        // Invalid dates
+        assert!(YtDlpExtractor::parse_upload_date("2024011").is_none());
+        assert!(YtDlpExtractor::parse_upload_date("").is_none());
+        assert!(YtDlpExtractor::parse_upload_date("abcdefgh").is_none());
+        assert!(YtDlpExtractor::parse_upload_date("20241301").is_none()); // invalid month
+    }
+
+    #[test]
+    fn test_ytdlp_clean_subtitle_text() {
+        let vtt = "WEBVTT\nKind: captions\nLanguage: en\n\n\
+                    00:00:01.000 --> 00:00:03.000\n\
+                    Hello world\n\n\
+                    00:00:03.000 --> 00:00:05.000\n\
+                    Hello world\n\n\
+                    00:00:05.000 --> 00:00:07.000\n\
+                    This is a test\n";
+        let cleaned = YtDlpExtractor::clean_subtitle_text(vtt);
+        assert!(cleaned.contains("Hello world"));
+        assert!(cleaned.contains("This is a test"));
+        // Duplicate consecutive lines should be deduped
+        assert_eq!(
+            cleaned.matches("Hello world").count(),
+            1,
+            "cleaned: {}",
+            cleaned
+        );
+        // No timestamps in output
+        assert!(!cleaned.contains("-->"));
+        assert!(!cleaned.contains("WEBVTT"));
+    }
+
+    // ── GithubExtractor URL matching ────────────────────────────────────
+
+    #[test]
+    fn test_github_can_handle() {
+        let extractor = GithubExtractor::new(None);
+        assert!(extractor.can_handle("https://github.com/user/repo"));
+        assert!(extractor.can_handle("https://github.com/user/repo/tree/main/src"));
+        assert!(extractor.can_handle("https://github.com/user/repo/blob/main/README.md"));
+        assert!(extractor.can_handle("http://github.com/user/repo"));
+        assert!(extractor.can_handle("https://www.github.com/user/repo"));
+    }
+
+    #[test]
+    fn test_github_rejects_non_github() {
+        let extractor = GithubExtractor::new(None);
+        assert!(!extractor.can_handle("https://example.com"));
+        assert!(!extractor.can_handle("https://gitlab.com/user/repo"));
+        assert!(!extractor.can_handle("https://youtube.com/watch?v=abc"));
+        assert!(!extractor.can_handle("not-a-url"));
+    }
+
+    #[test]
+    fn test_github_rejects_gist() {
+        let extractor = GithubExtractor::new(None);
+        assert!(!extractor.can_handle("https://gist.github.com/user/abc123"));
+        assert!(!extractor.can_handle("https://gist.github.com/user/abc123/raw"));
+    }
+
+    #[test]
+    fn test_github_parse_owner_repo() {
+        let result = GithubExtractor::parse_owner_repo("https://github.com/rust-lang/rust");
+        assert_eq!(result, Some(("rust-lang".to_owned(), "rust".to_owned())));
+
+        let result =
+            GithubExtractor::parse_owner_repo("https://github.com/user/repo/tree/main/src");
+        assert_eq!(result, Some(("user".to_owned(), "repo".to_owned())));
+
+        let result = GithubExtractor::parse_owner_repo("https://github.com/user/repo/blob/main/README.md");
+        assert_eq!(result, Some(("user".to_owned(), "repo".to_owned())));
+
+        // Invalid URLs
+        assert!(GithubExtractor::parse_owner_repo("https://github.com/").is_none());
+        assert!(GithubExtractor::parse_owner_repo("https://github.com/user").is_none());
+        assert!(GithubExtractor::parse_owner_repo("https://example.com/user/repo").is_none());
+    }
+
+    #[test]
+    fn test_github_decode_base64() {
+        // "Hello, World!" in base64
+        let encoded = "SGVsbG8sIFdvcmxkIQ==";
+        let decoded = GithubExtractor::decode_base64(encoded).unwrap();
+        assert_eq!(decoded, "Hello, World!");
+
+        // With line breaks (as GitHub API returns)
+        let encoded_with_newlines = "SGVs\nbG8s\nIFdv\ncmxk\nIQ==";
+        let decoded = GithubExtractor::decode_base64(encoded_with_newlines).unwrap();
+        assert_eq!(decoded, "Hello, World!");
+
+        // Empty string
+        let decoded = GithubExtractor::decode_base64("").unwrap();
+        assert_eq!(decoded, "");
     }
 }

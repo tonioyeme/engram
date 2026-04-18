@@ -15,6 +15,17 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use engramai::{Memory, MemoryConfig, MemoryType, Permission, EmotionalBus, EmbeddingConfig, AnthropicExtractor, OllamaExtractor};
+use engramai::compiler::{
+    self,
+    conflict::ConflictDetector,
+    decay::DecayEngine,
+    export::{ExportEngine, ExportOutput},
+    health::HealthAuditor,
+    import::{ImportPipeline, MarkdownImporter},
+    privacy::{AccessContext, PrivacyGuard},
+    storage::{KnowledgeStore, SqliteKnowledgeStore},
+    types::*,
+};
 
 /// Engram — Neuroscience-grounded memory system for AI agents.
 #[derive(Parser)]
@@ -470,6 +481,10 @@ enum Commands {
         /// Insight memory ID to reverse
         id: String,
     },
+
+    /// Knowledge compiler — compile, query, maintain knowledge
+    #[command(subcommand)]
+    Knowledge(KnowledgeCommand),
 }
 
 #[derive(Subcommand)]
@@ -602,6 +617,128 @@ enum ExtractorArg {
     Ollama,
     /// Use Anthropic Claude API for extraction (default model: claude-haiku-4-5-20251001)
     Anthropic,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+    Md,
+}
+
+#[derive(Subcommand)]
+enum KnowledgeCommand {
+    /// Search compiled knowledge topics
+    Query {
+        /// Search term
+        search: String,
+        /// Max results
+        #[arg(long, short = 'l', default_value = "10")]
+        limit: usize,
+        /// Output format
+        #[arg(long, short = 'f', default_value = "text")]
+        format: OutputFormat,
+    },
+    /// Inspect a specific topic page
+    Inspect {
+        /// Topic ID
+        topic_id: String,
+        /// Show source memories
+        #[arg(long)]
+        sources: bool,
+        /// Show conflicts
+        #[arg(long)]
+        conflicts: bool,
+    },
+    /// Export knowledge to file
+    Export {
+        /// Output path
+        #[arg(long, short = 'o', default_value = "knowledge-export")]
+        output: String,
+        /// Format: json, md
+        #[arg(long, short = 'f', default_value = "md")]
+        format: OutputFormat,
+    },
+    /// Import knowledge from file/directory
+    Import {
+        /// Path to import from
+        path: String,
+    },
+    /// Health report
+    Health {
+        /// Scope: all, stale, conflicted
+        #[arg(long, default_value = "all")]
+        scope: String,
+        /// Output format
+        #[arg(long, short = 'f', default_value = "text")]
+        format: OutputFormat,
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+    /// Evaluate or apply decay
+    Decay {
+        /// Evaluate only (don't apply)
+        #[arg(long)]
+        evaluate: bool,
+        /// Apply decay
+        #[arg(long)]
+        apply: bool,
+        /// Target specific topic
+        #[arg(long)]
+        topic: Option<String>,
+    },
+    /// Scan for conflicts between topics
+    Conflicts {
+        /// Scan for new conflicts
+        #[arg(long)]
+        scan: bool,
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+    /// Audit links and duplicates
+    Audit {
+        /// Check link integrity
+        #[arg(long)]
+        links: bool,
+        /// Check for duplicates
+        #[arg(long)]
+        duplicates: bool,
+        /// Auto-repair broken links
+        #[arg(long)]
+        repair: bool,
+    },
+    /// Privacy controls
+    Privacy {
+        /// Set privacy level for a topic
+        #[arg(long)]
+        set_level: Option<String>,
+        /// Privacy level (public, private, sensitive, restricted)
+        #[arg(long)]
+        level: Option<String>,
+        /// Show audit log
+        #[arg(long)]
+        audit_log: bool,
+    },
+    /// Compile memories into knowledge topics
+    Compile {
+        /// Topic ID to recompile (omit for auto-discovery)
+        #[arg(long)]
+        topic: Option<String>,
+        /// Dry run
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List all compiled topic pages
+    List {
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+        /// Max results
+        #[arg(long, short = 'l', default_value = "50")]
+        limit: usize,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1581,6 +1718,438 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for src in &result.restored_sources {
                 println!("    {} — original importance: {:.2}, restored: {}", 
                     src.memory_id, src.original_importance, if src.restored { "✅" } else { "❌" });
+            }
+        }
+
+        Commands::Knowledge(cmd) => {
+            // Open knowledge store backed by the same database
+            let kc_store = SqliteKnowledgeStore::open(&cli.database)
+                .map_err(|e| format!("Failed to open knowledge store: {}", e))?;
+            kc_store.init_schema()
+                .map_err(|e| format!("Failed to init KC schema: {}", e))?;
+            let kc_config = KcConfig::load();
+
+            match cmd {
+                KnowledgeCommand::Query { search, limit, format } => {
+                    let topics = kc_store.list_topic_pages()
+                        .map_err(|e| format!("Failed to list topics: {}", e))?;
+                    let search_lower = search.to_lowercase();
+                    let matched: Vec<_> = topics.iter()
+                        .filter(|t| {
+                            t.title.to_lowercase().contains(&search_lower)
+                                || t.content.to_lowercase().contains(&search_lower)
+                                || t.summary.to_lowercase().contains(&search_lower)
+                        })
+                        .take(limit)
+                        .collect();
+
+                    match format {
+                        OutputFormat::Json => {
+                            println!("{}", serde_json::to_string_pretty(&matched)?);
+                        }
+                        _ => {
+                            if matched.is_empty() {
+                                println!("No topics matching '{}'.", search);
+                            } else {
+                                println!("Knowledge topics matching '{}' ({}):", search, matched.len());
+                                for t in &matched {
+                                    println!("  [{}] {} (v{}, {:?})", t.id, t.title, t.version, t.status);
+                                    if !t.summary.is_empty() {
+                                        let preview: String = t.summary.chars().take(80).collect();
+                                        println!("    {}", preview);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                KnowledgeCommand::Inspect { topic_id, sources, conflicts } => {
+                    let tid = TopicId(topic_id.clone());
+                    match kc_store.get_topic_page(&tid)
+                        .map_err(|e| format!("Failed to get topic: {}", e))? {
+                        Some(page) => {
+                            println!("Topic: {} ({})", page.title, page.id);
+                            println!("Status:  {:?}", page.status);
+                            println!("Version: {}", page.version);
+                            println!("Created: {}", page.metadata.created_at.format("%Y-%m-%dT%H:%M:%SZ"));
+                            println!("Updated: {}", page.metadata.updated_at.format("%Y-%m-%dT%H:%M:%SZ"));
+                            if let Some(q) = page.metadata.quality_score {
+                                println!("Quality: {:.2}", q);
+                            }
+                            if !page.metadata.tags.is_empty() {
+                                println!("Tags:    {}", page.metadata.tags.join(", "));
+                            }
+                            println!("\nSummary: {}", page.summary);
+                            println!("\n{}", page.content);
+
+                            if sources {
+                                let refs = kc_store.get_source_refs(&tid)
+                                    .map_err(|e| format!("Failed to get source refs: {}", e))?;
+                                if refs.is_empty() {
+                                    println!("\nNo source memories.");
+                                } else {
+                                    println!("\nSource memories ({}):", refs.len());
+                                    for r in &refs {
+                                        println!("  {} (relevance: {:.3}, added: {})",
+                                            r.memory_id, r.relevance_score,
+                                            r.added_at.format("%Y-%m-%dT%H:%M:%SZ"));
+                                    }
+                                }
+                            }
+
+                            if conflicts {
+                                let all_topics = kc_store.list_topic_pages()
+                                    .map_err(|e| format!("Failed to list topics: {}", e))?;
+                                let detector = ConflictDetector::new();
+                                let scope = ConflictScope::WithinTopic(tid.clone());
+                                match detector.detect_conflicts(&all_topics, &scope, None) {
+                                    Ok(records) => {
+                                        if records.is_empty() {
+                                            println!("\nNo conflicts detected.");
+                                        } else {
+                                            println!("\nConflicts ({}):", records.len());
+                                            for cr in &records {
+                                                println!("  [{:?}] {} ({:?})",
+                                                    cr.severity, cr.conflict.description, cr.conflict.conflict_type);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => println!("\nConflict detection failed: {}", e),
+                                }
+                            }
+                        }
+                        None => {
+                            eprintln!("Topic '{}' not found.", topic_id);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+
+                KnowledgeCommand::Export { output, format } => {
+                    let privacy = PrivacyGuard::in_memory()
+                        .map_err(|e| format!("Failed to create privacy guard: {}", e))?;
+                    let ctx = AccessContext {
+                        accessor: cli.agent_id.clone().unwrap_or_else(|| "cli".to_string()),
+                        include_private: false,
+                        is_export: true,
+                    };
+                    let filter = ExportFilter {
+                        topics: None,
+                        status: None,
+                        tags: None,
+                        since: None,
+                    };
+                    let export_fmt = match format {
+                        OutputFormat::Json => compiler::types::ExportFormat::Json,
+                        OutputFormat::Md | OutputFormat::Text => compiler::types::ExportFormat::Markdown,
+                    };
+                    let result = ExportEngine::export(&kc_store, &privacy, &ctx, &filter, export_fmt)
+                        .map_err(|e| format!("Export failed: {}", e))?;
+
+                    match result {
+                        ExportOutput::Json(json_str) => {
+                            let path = format!("{}.json", output);
+                            std::fs::write(&path, &json_str)?;
+                            println!("Exported knowledge to {}", path);
+                        }
+                        ExportOutput::Markdown(files) => {
+                            std::fs::create_dir_all(&output)?;
+                            for file in &files {
+                                let path = std::path::Path::new(&output).join(&file.path);
+                                std::fs::write(&path, &file.content)?;
+                            }
+                            println!("Exported {} topic(s) to {}/", files.len(), output);
+                        }
+                    }
+                }
+
+                KnowledgeCommand::Import { path } => {
+                    let import_path = std::path::Path::new(&path);
+                    if !import_path.exists() {
+                        eprintln!("Path does not exist: {}", path);
+                        std::process::exit(1);
+                    }
+                    let importer = MarkdownImporter {
+                        split: kc_config.import.split_strategy.clone(),
+                    };
+                    let report = ImportPipeline::run(&kc_store, &importer, import_path, &kc_config.import)
+                        .map_err(|e| format!("Import failed: {}", e))?;
+                    println!("Import complete:");
+                    println!("  Processed: {}", report.total_processed);
+                    println!("  Imported:  {}", report.imported);
+                    println!("  Skipped:   {}", report.skipped);
+                    if !report.errors.is_empty() {
+                        println!("  Errors:    {}", report.errors.len());
+                        for err in &report.errors {
+                            println!("    - {}", err);
+                        }
+                    }
+                }
+
+                KnowledgeCommand::Health { scope: _, format, json } => {
+                    let decay_engine = DecayEngine::new(kc_config.decay.clone());
+                    let conflict_detector = ConflictDetector::new();
+                    let auditor = HealthAuditor;
+
+                    match auditor.health_report(&kc_store, &decay_engine, &conflict_detector) {
+                        Ok(report) => {
+                            if json || matches!(format, OutputFormat::Json) {
+                                println!("{}", serde_json::to_string_pretty(&report)?);
+                            } else {
+                                println!("Knowledge Health Report");
+                                println!("  Total topics:     {}", report.total_topics);
+                                println!("  Stale topics:     {}", report.stale_topics.len());
+                                println!("  Broken links:     {}", report.broken_links.len());
+                                println!("  Recommendations:  {}", report.recommendations.len());
+                                for rec in &report.recommendations {
+                                    println!("    [P{}] {} — {} ({})",
+                                        rec.priority, rec.topic_id, rec.action, rec.reason);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Health report failed: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+
+                KnowledgeCommand::Decay { evaluate: _, apply, topic } => {
+                    let decay_engine = DecayEngine::new(kc_config.decay.clone());
+
+                    if let Some(ref topic_id) = topic {
+                        let tid = TopicId(topic_id.clone());
+                        match kc_store.get_topic_page(&tid)
+                            .map_err(|e| format!("Failed to get topic: {}", e))? {
+                            Some(page) => {
+                                let result = decay_engine.evaluate_topic(&page, &kc_store)
+                                    .map_err(|e| format!("Decay evaluation failed: {}", e))?;
+                                println!("Decay evaluation for '{}':", page.title);
+                                println!("  Freshness:    {:.3}", result.freshness_score);
+                                println!("  Sources:      {}", result.source_count);
+                                println!("  Action:       {:?}", result.recommended_action);
+                                if apply {
+                                    decay_engine.apply_decay(&result.recommended_action, &kc_store)
+                                        .map_err(|e| format!("Apply decay failed: {}", e))?;
+                                    println!("  ✅ Applied.");
+                                }
+                            }
+                            None => {
+                                eprintln!("Topic '{}' not found.", topic_id);
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        let results = decay_engine.evaluate_all(&kc_store)
+                            .map_err(|e| format!("Decay evaluation failed: {}", e))?;
+                        if results.is_empty() {
+                            println!("No active topics to evaluate.");
+                        } else {
+                            println!("Decay evaluation ({} topics):", results.len());
+                            for r in &results {
+                                println!("  [{}] freshness={:.3} sources={} action={:?}",
+                                    r.topic_id, r.freshness_score, r.source_count, r.recommended_action);
+                            }
+                            if apply {
+                                for r in &results {
+                                    decay_engine.apply_decay(&r.recommended_action, &kc_store)
+                                        .map_err(|e| format!("Apply decay failed: {}", e))?;
+                                }
+                                println!("✅ Applied decay to {} topics.", results.len());
+                            }
+                        }
+                    }
+                }
+
+                KnowledgeCommand::Conflicts { scan: _, json } => {
+                    let all_topics = kc_store.list_topic_pages()
+                        .map_err(|e| format!("Failed to list topics: {}", e))?;
+                    if all_topics.len() < 2 {
+                        println!("Need at least 2 topics to detect conflicts.");
+                        return Ok(());
+                    }
+                    let detector = ConflictDetector::new();
+                    let mut all_conflicts = Vec::new();
+                    for topic in &all_topics {
+                        let scope = ConflictScope::WithinTopic(topic.id.clone());
+                        match detector.detect_conflicts(&all_topics, &scope, None) {
+                            Ok(mut conflicts) => all_conflicts.append(&mut conflicts),
+                            Err(e) => eprintln!("Warning: conflict detection failed for {}: {}", topic.id, e),
+                        }
+                    }
+                    // Deduplicate by conflict id
+                    all_conflicts.sort_by(|a, b| a.conflict.id.0.cmp(&b.conflict.id.0));
+                    all_conflicts.dedup_by(|a, b| a.conflict.id.0 == b.conflict.id.0);
+
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&all_conflicts)?);
+                    } else {
+                        if all_conflicts.is_empty() {
+                            println!("No conflicts detected.");
+                        } else {
+                            println!("Conflicts ({}):", all_conflicts.len());
+                            for cr in &all_conflicts {
+                                println!("  [{:?}] {} ({:?})",
+                                    cr.severity, cr.conflict.description, cr.conflict.conflict_type);
+                            }
+                        }
+                    }
+                }
+
+                KnowledgeCommand::Audit { links, duplicates, repair } => {
+                    let auditor = HealthAuditor;
+                    let all_topics = kc_store.list_topic_pages()
+                        .map_err(|e| format!("Failed to list topics: {}", e))?;
+
+                    if links || (!links && !duplicates) {
+                        println!("Link Audit:");
+                        let mut total_broken = 0usize;
+                        let mut total_stale = 0usize;
+                        for topic in &all_topics {
+                            let entries = auditor.audit_links(topic, &kc_store)
+                                .map_err(|e| format!("Audit failed for {}: {}", topic.id, e))?;
+                            let broken: Vec<_> = entries.iter()
+                                .filter(|e| e.status == LinkStatus::Broken)
+                                .collect();
+                            let stale: Vec<_> = entries.iter()
+                                .filter(|e| e.status == LinkStatus::Stale)
+                                .collect();
+                            if !broken.is_empty() || !stale.is_empty() {
+                                println!("  [{}] {} broken, {} stale links",
+                                    topic.id, broken.len(), stale.len());
+                            }
+                            total_broken += broken.len();
+                            total_stale += stale.len();
+                        }
+                        println!("  Total: {} broken, {} stale links across {} topics",
+                            total_broken, total_stale, all_topics.len());
+                    }
+
+                    if duplicates {
+                        let detector = ConflictDetector::new();
+                        let dup_groups = detector.detect_duplicates(&all_topics);
+                        if dup_groups.is_empty() {
+                            println!("\nNo duplicate groups found.");
+                        } else {
+                            println!("\nDuplicate groups ({}):", dup_groups.len());
+                            for group in &dup_groups {
+                                println!("  Canonical: {} (similarity: {:.1}%)",
+                                    group.canonical, group.similarity * 100.0);
+                                for dup in &group.duplicates {
+                                    println!("    duplicate: {}", dup);
+                                }
+                            }
+                        }
+                    }
+
+                    if repair {
+                        println!("\n⚠️  Auto-repair is not yet implemented. Use 'engram knowledge health' for recommendations.");
+                    }
+                }
+
+                KnowledgeCommand::Privacy { set_level, level, audit_log } => {
+                    let privacy = PrivacyGuard::in_memory()
+                        .map_err(|e| format!("Failed to create privacy guard: {}", e))?;
+
+                    if let Some(ref topic_id) = set_level {
+                        let tid = TopicId(topic_id.clone());
+                        match level.as_deref() {
+                            Some(lvl) => {
+                                // Privacy level is tag-based; update topic tags
+                                match kc_store.get_topic_page(&tid)
+                                    .map_err(|e| format!("Failed to get topic: {}", e))? {
+                                    Some(mut page) => {
+                                        // Remove existing privacy tags
+                                        page.metadata.tags.retain(|t| !t.starts_with("privacy:"));
+                                        // Add new privacy tag
+                                        let tag = match lvl {
+                                            "private" => "privacy:private",
+                                            "sensitive" => "privacy:sensitive",
+                                            "internal" => "privacy:internal",
+                                            "public" => "privacy:public",
+                                            _ => {
+                                                eprintln!("Invalid privacy level: {}. Use: public, internal, sensitive, private", lvl);
+                                                std::process::exit(1);
+                                            }
+                                        };
+                                        if tag != "privacy:public" {
+                                            page.metadata.tags.push(tag.to_string());
+                                        }
+                                        kc_store.update_topic_page(&page)
+                                            .map_err(|e| format!("Failed to update topic: {}", e))?;
+                                        println!("Set privacy level for '{}' to '{}'.", topic_id, lvl);
+                                    }
+                                    None => {
+                                        eprintln!("Topic '{}' not found.", topic_id);
+                                        std::process::exit(1);
+                                    }
+                                }
+                            }
+                            None => {
+                                eprintln!("--level is required when using --set-level. Use: public, internal, sensitive, private");
+                                std::process::exit(1);
+                            }
+                        }
+                    } else if audit_log {
+                        let entries = privacy.query_audit_log(None, 50)
+                            .map_err(|e| format!("Failed to query audit log: {}", e))?;
+                        if entries.is_empty() {
+                            println!("No audit log entries.");
+                        } else {
+                            println!("Audit log ({} entries):", entries.len());
+                            for entry in &entries {
+                                let tid = entry.topic_id.as_ref()
+                                    .map(|t| t.0.as_str())
+                                    .unwrap_or("-");
+                                println!("  {} [{}] topic={} actor={} {}",
+                                    entry.timestamp.format("%Y-%m-%dT%H:%M:%SZ"),
+                                    entry.operation, tid, entry.actor, entry.details);
+                            }
+                        }
+                    } else {
+                        println!("Usage:");
+                        println!("  engram knowledge privacy --set-level <TOPIC_ID> --level <LEVEL>");
+                        println!("  engram knowledge privacy --audit-log");
+                    }
+                }
+
+                KnowledgeCommand::Compile { topic, dry_run } => {
+                    println!("⚠️  Knowledge compilation requires an LLM provider.");
+                    println!("   Configure with ENGRAM_LLM_PROVIDER environment variable.");
+                    println!("   Supported: openai, anthropic");
+                    if let Some(ref t) = topic {
+                        println!("   Would compile topic: {}", t);
+                    } else {
+                        println!("   Would auto-discover and compile new topic candidates.");
+                    }
+                    if dry_run {
+                        println!("   (dry-run mode)");
+                    }
+                }
+
+                KnowledgeCommand::List { json, limit } => {
+                    let topics = kc_store.list_topic_pages()
+                        .map_err(|e| format!("Failed to list topics: {}", e))?;
+                    let topics: Vec<_> = topics.into_iter().take(limit).collect();
+
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&topics)?);
+                    } else {
+                        if topics.is_empty() {
+                            println!("No compiled knowledge topics.");
+                        } else {
+                            println!("Knowledge topics ({}):", topics.len());
+                            for t in &topics {
+                                let quality = t.metadata.quality_score
+                                    .map(|q| format!(" q={:.2}", q))
+                                    .unwrap_or_default();
+                                println!("  [{}] {} (v{}, {:?}{})",
+                                    t.id, t.title, t.version, t.status, quality);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

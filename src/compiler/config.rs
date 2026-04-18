@@ -299,6 +299,17 @@ mod tests {
 
     #[test]
     fn test_merge_from_env() {
+        // Save any existing values to avoid parallel-test env pollution
+        let saved: Vec<(&str, Option<String>)> = vec![
+            "ENGRAM_LLM_PROVIDER",
+            "ENGRAM_MIN_CLUSTER_SIZE",
+            "ENGRAM_QUALITY_THRESHOLD",
+            "ENGRAM_LLM_TEMPERATURE",
+        ]
+        .into_iter()
+        .map(|k| (k, std::env::var(k).ok()))
+        .collect();
+
         // Set env vars for this test
         std::env::set_var("ENGRAM_LLM_PROVIDER", "openai");
         std::env::set_var("ENGRAM_MIN_CLUSTER_SIZE", "5");
@@ -308,16 +319,18 @@ mod tests {
         let mut cfg = KcConfig::default();
         cfg.merge_from_env();
 
+        // Restore original state before assertions (so cleanup runs even if assert fails)
+        for (k, v) in &saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+
         assert_eq!(cfg.llm.provider, "openai");
         assert_eq!(cfg.min_cluster_size, 5);
         assert!((cfg.quality_threshold - 0.8).abs() < f64::EPSILON);
         assert!((cfg.llm.temperature - 0.3).abs() < f32::EPSILON);
-
-        // Clean up
-        std::env::remove_var("ENGRAM_LLM_PROVIDER");
-        std::env::remove_var("ENGRAM_MIN_CLUSTER_SIZE");
-        std::env::remove_var("ENGRAM_QUALITY_THRESHOLD");
-        std::env::remove_var("ENGRAM_LLM_TEMPERATURE");
     }
 
     #[test]
@@ -436,11 +449,16 @@ intake.deduplicate = false
 
     #[test]
     fn test_merge_from_env_invalid_number() {
+        let saved = std::env::var("ENGRAM_MIN_CLUSTER_SIZE").ok();
         std::env::set_var("ENGRAM_MIN_CLUSTER_SIZE", "abc");
         let mut cfg = KcConfig::default();
         cfg.merge_from_env();
+        // Restore before assertions
+        match &saved {
+            Some(val) => std::env::set_var("ENGRAM_MIN_CLUSTER_SIZE", val),
+            None => std::env::remove_var("ENGRAM_MIN_CLUSTER_SIZE"),
+        }
         // Invalid → keeps default
         assert_eq!(cfg.min_cluster_size, 3);
-        std::env::remove_var("ENGRAM_MIN_CLUSTER_SIZE");
     }
 }

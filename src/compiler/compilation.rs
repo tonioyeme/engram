@@ -661,7 +661,7 @@ impl<S: KnowledgeStore, L: LlmProvider> CompilationPipeline<S, L> {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Extract the first paragraph as a summary.
-fn extract_summary(content: &str) -> String {
+pub fn extract_summary(content: &str) -> String {
     // Skip the title line (# ...) then take the first non-empty paragraph
     let mut lines = content.lines().peekable();
     // Skip leading blank lines and title
@@ -683,7 +683,7 @@ fn extract_summary(content: &str) -> String {
 }
 
 /// Collect unique tags from all memories.
-fn aggregate_tags(memories: &[MemorySnapshot]) -> Vec<String> {
+pub fn aggregate_tags(memories: &[MemorySnapshot]) -> Vec<String> {
     let mut tags: HashSet<String> = HashSet::new();
     for m in memories {
         for t in &m.tags {

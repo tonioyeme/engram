@@ -2,7 +2,7 @@ project: null
 nodes:
 - id: phase-a
   title: 'Phase A: 止血 — 堵住上游污染源'
-  status: todo
+  status: done
   description: RustClaw 侧过滤 + extractor 改进 + 存量清理。不改 engramai crate 核心逻辑。
   tags:
   - engram
@@ -46,7 +46,7 @@ nodes:
     file: engramai/src/extractor.rs
 - id: a3-sql-cleanup
   title: 'A3: SQL 一次性清理 — 删存量重复 + 系统指令垃圾'
-  status: todo
+  status: done
   description: |
     跑 SQL 脚本清理存量垃圾：
     1. 删精确重复（105 条 content hash 相同）— 保留 access_count 最高的
@@ -63,7 +63,7 @@ nodes:
     project: engramai
 - id: phase-b
   title: 'Phase B: 提质 — engramai crate 核心改进'
-  status: todo
+  status: done
   description: 改 engramai crate 核心：entity 索引、dedup、confidence、recency。需要 ritual 流程。
   tags:
   - engram
@@ -71,7 +71,7 @@ nodes:
   priority: 20
 - id: b1-entity-index
   title: 'B1: Entity 索引实现 — extraction + storage + recall (ISS-009)'
-  status: todo
+  status: done
   description: |
     ISS-009 最大改动，需要 ritual 流程。
     1. Entity extraction on write — extractor 返回 entities（人名/项目名/概念/工具名）
@@ -93,7 +93,7 @@ nodes:
     project: engramai
 - id: entity-types
   title: 'B1.1: Entity types & config structs'
-  status: todo
+  status: done
   description: |
     Create src/entities.rs with foundational types (~80 lines):
     - EntityType enum (Project, Person, Technology, Concept, File, Url, Organization, Other)
@@ -121,7 +121,7 @@ nodes:
     project: engramai
 - id: entity-unit-tests
   title: 'B1.2: EntityExtractor unit tests'
-  status: todo
+  status: done
   description: |
     Write unit tests for entity extraction (~100 lines):
     - Test known entity extraction (Aho-Corasick path)
@@ -144,7 +144,7 @@ nodes:
     project: engramai
 - id: entity-storage
   title: 'B1.3: Storage entity CRUD methods'
-  status: todo
+  status: done
   description: |
     Add entity methods to Storage (~120 lines in storage.rs):
     - upsert_entity() — deterministic ID generation (sha256), INSERT OR REPLACE
@@ -170,7 +170,7 @@ nodes:
     - src/storage.rs
 - id: entity-add-raw
   title: 'B1.4: Integrate entity extraction into add_raw()'
-  status: todo
+  status: done
   description: |
     Hook entity extraction into memory write path (~80 lines):
     - Initialize EntityExtractor in MemorySystem::new()
@@ -197,7 +197,7 @@ nodes:
     project: engramai
 - id: entity-recall
   title: 'B1.5: Entity-aware recall channel'
-  status: todo
+  status: done
   description: |
     Add entity recall as 4th hybrid search channel (~150 lines):
     - entity_recall() function in entities.rs:
@@ -223,7 +223,7 @@ nodes:
     - src/memory.rs
 - id: entity-backfill
   title: 'B1.6: Backfill CLI command for existing memories'
-  status: todo
+  status: done
   description: |
     Add backfill_entities() to process existing memories (~40 lines in main.rs):
     - New CLI subcommand: engram backfill-entities [--namespace NS]
@@ -248,7 +248,7 @@ nodes:
     - src/main.rs
 - id: entity-integration-tests
   title: 'B1.7: Entity indexing integration tests'
-  status: todo
+  status: done
   description: |
     End-to-end tests for entity indexing (~150 lines):
     - Test entity extraction + storage in add_raw()
@@ -292,7 +292,7 @@ nodes:
     iss: ISS-003
 - id: b3-confidence
   title: 'B3: Confidence score — 多信号融合 recall confidence (ISS-007)'
-  status: todo
+  status: done
   description: |
     ISS-007。confidence.rs 已有框架，需要：
     1. 从 hybrid search 多路分数融合 confidence（embedding sim + FTS score + ACT-R activation + entity match）
@@ -310,7 +310,7 @@ nodes:
     iss: ISS-007
 - id: b4-recency
   title: 'B4: Recency 调参 — ACT-R decay analysis + tuning (ISS-002)'
-  status: todo
+  status: done
   description: |
     ISS-002。需要先量化当前 ACT-R 分布：
     1. 分析当前 decay parameter d 值及其效果
@@ -328,91 +328,91 @@ nodes:
     iss: ISS-002
 - id: iss-005-synthesis
   title: 'ISS-005: Knowledge Synthesis Engine'
-  status: todo
+  status: done
   description: Complete implementation of the knowledge synthesis engine — cluster discovery, gate check, insight generation, provenance tracing. See design-1-engine.md.
   tags:
   - iss-005
   - knowledge-synthesis
 - id: synth-types
   title: Create synthesis types module (src/synthesis/types.rs)
-  status: todo
+  status: done
   tags:
   - iss-005
   - knowledge-synthesis
   - foundation
 - id: synth-mod
   title: Create src/synthesis/mod.rs and wire into lib.rs
-  status: todo
+  status: done
   tags:
   - iss-005
   - knowledge-synthesis
   - foundation
 - id: synth-cluster
   title: Implement cluster discovery (src/synthesis/cluster.rs)
-  status: todo
+  status: done
   tags:
   - iss-005
   - knowledge-synthesis
   - GOAL-1
 - id: synth-gate
   title: Implement gate check (src/synthesis/gate.rs)
-  status: todo
+  status: done
   tags:
   - iss-005
   - knowledge-synthesis
   - GOAL-3
 - id: synth-insight
   title: Implement insight generation (src/synthesis/insight.rs)
-  status: todo
+  status: done
   tags:
   - iss-005
   - knowledge-synthesis
   - GOAL-2
 - id: synth-provenance
   title: Implement provenance tracing (src/synthesis/provenance.rs)
-  status: todo
+  status: done
   tags:
   - iss-005
   - knowledge-synthesis
   - GOAL-4
 - id: synth-engine
   title: Implement SynthesisEngine trait (src/synthesis/engine.rs)
-  status: todo
+  status: done
   tags:
   - iss-005
   - knowledge-synthesis
   - integration
 - id: synth-consolidate
   title: Integrate synthesis into consolidate() call path
-  status: todo
+  status: done
   tags:
   - iss-005
   - knowledge-synthesis
   - integration
 - id: synth-incremental
   title: Implement incremental operations (cluster updates on new memory)
-  status: todo
+  status: done
   tags:
   - iss-005
   - knowledge-synthesis
   - incremental
 - id: synth-unit-tests
   title: Write unit tests for all synthesis components
-  status: todo
+  status: done
   tags:
   - iss-005
   - knowledge-synthesis
   - tests
 - id: synth-integration-tests
   title: Write integration tests for full synthesis pipeline
-  status: todo
+  status: done
   tags:
   - iss-005
   - knowledge-synthesis
   - tests
 - id: kc
   title: Knowledge Compiler
-  status: todo
+  status: done
   description: KC 产品层：把碎片记忆编译成结构化知识库。P0 在 engram-ai-rust 内作为 src/compiler/ 模块实现。
   tags:
   - kc
@@ -430,7 +430,7 @@ nodes:
   type: feature
 - id: kc-maintenance
   title: 'KC: Knowledge Maintenance, Access & Privacy'
-  status: todo
+  status: done
   description: 'Knowledge decay, conflict detection, health reporting, export/import, CLI/API access, privacy. Design: .gid/features/knowledge-compiler/maintenance/design.md'
   tags:
   - kc
@@ -439,7 +439,7 @@ nodes:
   type: feature
 - id: kc-platform
   title: 'KC: Platform Setup, LLM Config, Import & Intake'
-  status: todo
+  status: done
   description: 'Setup wizard, LLM config, import pipeline, intake integration. Design: .gid/features/knowledge-compiler/platform/design.md'
   tags:
   - kc
@@ -560,7 +560,7 @@ nodes:
     design_ref: maintenance/design.md §2.2
 - id: kc-health-auditor
   title: Health Auditor (link integrity + health reports)
-  status: todo
+  status: done
   description: §2.3 HealthAuditor — broken link detection + repair, health reports with per-topic scores. GOAL-maint.3, GOAL-maint.5, GOAL-maint.5b
   tags:
   - kc
@@ -588,7 +588,7 @@ nodes:
     design_ref: maintenance/design.md §2.4
 - id: kc-cli
   title: CLI Interface (knowledge subcommands)
-  status: todo
+  status: done
   description: '§2.5 CLI Interface — engram knowledge subcommands: query, inspect, export, import, health, decay, conflicts, audit, privacy. GOAL-maint.8'
   tags:
   - kc
@@ -602,7 +602,7 @@ nodes:
     design_ref: maintenance/design.md §2.5
 - id: kc-api
   title: Programmatic API (MaintenanceApi)
-  status: todo
+  status: done
   description: §2.6 MaintenanceApi — Rust API mirroring all CLI capabilities. Query, maintenance ops, export/import, privacy. GOAL-maint.9
   tags:
   - kc
@@ -700,7 +700,7 @@ nodes:
     goals: GOAL-plat.8, GOAL-plat.9, GOAL-plat.10, GOAL-plat.11
 - id: kc-intake
   title: Intake Pipeline (URL extraction + auto-import)
-  status: todo
+  status: done
   description: §2.5 IntakePipeline — URL content extraction (Jina/yt-dlp/GitHub), auto-import via import pipeline. GOAL-plat.12, GOAL-plat.13
   tags:
   - kc
@@ -777,7 +777,7 @@ nodes:
     design_ref: compilation/design.md §3.5
 - id: kc-unit-tests
   title: KC Unit Tests (per-module)
-  status: inprogress
+  status: done
   description: 'Unit tests for each KC module: types serialization, storage CRUD, topic discovery clustering, compilation pipeline stages, decay scoring, conflict detection, export formatting. Each module gets its own test submodule. Target: >80% coverage on P0 modules.'
   tags:
   - knowledge-compiler
@@ -789,7 +789,7 @@ nodes:
     file: src/compiler/tests/
 - id: kc-integration-tests
   title: KC Integration Tests (end-to-end flows)
-  status: todo
+  status: done
   description: 'End-to-end integration tests: (1) memories → compile → topic pages with provenance, (2) incremental recompilation on memory change, (3) CLI compile + list + export round-trip, (4) Markdown import → compile → export → compare, (5) decay + archive lifecycle. Uses temp DB, no LLM mock needed (use deterministic test provider).'
   tags:
   - knowledge-compiler

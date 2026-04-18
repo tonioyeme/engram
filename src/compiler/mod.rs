@@ -22,6 +22,7 @@
 //! - `llm` — LLM provider abstraction for KC
 //! - `intake` — Document intake and splitting
 
+pub mod api;
 pub mod compilation;
 pub mod config;
 pub mod conflict;

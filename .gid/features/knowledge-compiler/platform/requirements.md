@@ -60,6 +60,8 @@ Embedding provider 按优先级自动选择：
 
 系统在启动时检测可用 provider 并记录选择原因。
 
+**Architectural constraint — single embedding source**: KC 的所有子系统（topic discovery、compilation、cross-topic linking）使用 engram core 已经存好的 embedding（`memory_embeddings` 表）。KC 不应维护自己独立的 embedding provider 或 embedding cache 来处理源记忆。KC 可以为 topic page 本身生成 embedding（用于 topic 间相似度计算），但源记忆的 embedding 必须来自 engram core 的统一管道。这避免了同一 crate 内两套 embedding 系统导致的维度不匹配、模型不一致、重复计算等问题。
+
 **Pass/fail**: (1) 本地 provider 配置且可用 → 使用之，日志显示所用 provider 和模型。(2) 本地不可用但有云端 key → 使用云端，日志显示 provider 切换原因。(3) 两者都不可用 → 启动成功但输出明确警告，说明 recall 将降级为关键词匹配。
 
 #### GOAL-plat.6: Standalone Product Installation [P0]

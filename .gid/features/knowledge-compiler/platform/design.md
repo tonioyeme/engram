@@ -299,105 +299,42 @@ fn migrate_config(mut raw: toml::Value, from: i64, to: i64) -> toml::Value {
 
 **Satisfies:** GOAL-plat.4 (zero-config embedding setup), GOAL-plat.5 (embedding provider fallback)
 
-#### Auto-Download on First Use
+#### Architectural Principle: Single Embedding Source
 
-```rust
-pub struct EmbeddingManager {
-    model: EmbeddingModel,
-    cache_dir: PathBuf,
-    /// Loaded model instance (lazy — None until first embed() call)
-    engine: Option<OrtEngine>,
-}
+KC does NOT maintain its own embedding pipeline for source memories. Engram core already provides:
+- `EmbeddingConfig` — provider selection (Ollama, OpenAI) with model and dimensions
+- `Storage::store_embedding()` / `get_embedding()` / `get_all_embeddings()` — per-model embedding storage in `memory_embeddings` table
+- `Storage::get_embeddings_in_namespace()` — namespace-scoped retrieval
+- `Storage::find_nearest_embedding()` — vector similarity search
 
-#[derive(Debug, Clone)]
-pub enum EmbeddingModel {
-    AllMiniLmL6V2,    // 80MB, 384-dim, English-optimized
-    BgeSmallEnV1_5,   // 130MB, 384-dim, better multilingual
-    Custom { name: String, url: String, dim: usize },
-}
+KC reads embeddings from this existing infrastructure. The flow is:
+1. When a memory is stored (via `Memory::store()` or `engram add`), engram core computes and caches its embedding via the configured provider.
+2. When KC needs embeddings for topic discovery or compilation, it calls `Storage::get_all_embeddings(model_id)` to load all pre-computed vectors.
+3. KC's `MemorySnapshot` carries an `embedding: Option<Vec<f32>>` field — populated from `memory_embeddings` at load time.
+4. When `embedding` is `None` (memory stored while embedding provider was offline), KC falls back to `simple_hash_embedding()` — a deterministic hash producing low-quality vectors suitable only for basic clustering.
 
-impl EmbeddingManager {
-    /// Get or download model, then generate embeddings.
-    /// First call triggers download with progress reporting.
-    pub async fn embed(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        if self.engine.is_none() {
-            let model_path = self.ensure_model().await?;
-            self.engine = Some(OrtEngine::load(&model_path)?);
-        }
-        self.engine.as_ref().unwrap().encode(texts)
-    }
+This eliminates the duplication where `compiler/embedding.rs` defined its own `EmbeddingProvider` trait, `HttpEmbeddingProvider`, `StubEmbeddingProvider`, and `EmbeddingManager` — all redundant with engram core's `src/embeddings.rs`.
 
-    /// Download model if not cached. Reports progress via callback.
-    async fn ensure_model(&self) -> Result<PathBuf, EmbedError> {
-        let model_dir = self.cache_dir.join(self.model.name());
-        if model_dir.join("model.onnx").exists() {
-            return Ok(model_dir);
-        }
+**KC's own embedding module (`compiler/embedding.rs`) is retained for:**
+- Topic page embeddings (computing vectors for compiled topic pages, not source memories)
+- `cosine_similarity()` utility
+- `StubEmbeddingProvider` for testing
 
-        eprintln!("Downloading embedding model {}...", self.model.name());
-        let url = self.model.download_url();
-        download_with_progress(&url, &model_dir).await?;
+**KC does NOT use its own embedding module for:**
+- Source memory embedding generation (reads from `memory_embeddings` instead)
+- Embedding provider selection for source memories (uses engram core's `EmbeddingConfig`)
 
-        // Verify checksum
-        let expected = self.model.checksum();
-        let actual = sha256_file(&model_dir.join("model.onnx"))?;
-        if expected != actual {
-            fs::remove_dir_all(&model_dir)?;
-            return Err(EmbedError::ChecksumMismatch { expected, actual });
-        }
+#### Embedding Cache (existing engram pattern)
 
-        Ok(model_dir)
-    }
-}
-```
-
-#### Model Management (GOAL-plat.5)
-
-```rust
-impl EmbeddingManager {
-    /// List cached models with size info.
-    pub fn list_cached(&self) -> Vec<CachedModel> { /* scan cache_dir */ }
-
-    /// Remove a cached model.
-    pub fn remove_cached(&self, model: &EmbeddingModel) -> Result<(), io::Error> { /* rm -rf */ }
-
-    /// Switch model — requires re-embedding all memories.
-    /// Returns the count of memories that need re-embedding.
-    pub fn plan_model_switch(&self, new_model: &EmbeddingModel, db: &Storage) -> Result<usize, EmbedError> {
-        let total = db.count_memories()?;
-        // All memories need re-embedding since dimensions may differ
-        Ok(total)
-    }
-}
-```
-
-#### Embedding Cache (GOAL-plat.6)
-
-Embeddings are stored alongside memories in SQLite (existing `embeddings` table). The cache is:
+Embeddings are stored alongside memories in SQLite (`memory_embeddings` table). The cache is:
 - **Per-memory**: each memory row has a corresponding embedding row
-- **Model-tagged**: embedding rows store the model name, so model switches can selectively re-embed
-- **Lazy**: embeddings computed on store() and on-demand for older memories without embeddings
+- **Model-tagged**: PK is `(memory_id, model)`, so the same memory can have embeddings from multiple models
+- **Lazy**: embeddings computed on `store()` and on-demand for older memories without embeddings
 
 ```rust
-// In storage.rs (existing pattern, extended)
-pub fn get_or_compute_embedding(
-    &self,
-    memory_id: i64,
-    embed_mgr: &mut EmbeddingManager,
-) -> Result<Vec<f32>, StorageError> {
-    // Check cache first
-    if let Some(cached) = self.get_embedding(memory_id)? {
-        if cached.model == embed_mgr.model.name() {
-            return Ok(cached.vector);
-        }
-        // Model changed — recompute
-    }
-    // Compute and cache
-    let text = self.get_memory_text(memory_id)?;
-    let vectors = block_on(embed_mgr.embed(&[&text]))?;
-    self.store_embedding(memory_id, &vectors[0], embed_mgr.model.name())?;
-    Ok(vectors[0].clone())
-}
+// Already implemented in storage.rs — KC reads from this, doesn't duplicate it
+pub fn get_all_embeddings(&self, model: &str) -> Result<Vec<(String, Vec<f32>)>, rusqlite::Error>;
+pub fn get_embedding(&self, memory_id: &str, model: &str) -> Result<Option<Vec<f32>>, rusqlite::Error>;
 ```
 
 ---

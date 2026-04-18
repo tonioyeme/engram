@@ -23,6 +23,9 @@ pub struct MemorySnapshot {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub tags: Vec<String>,
+    /// Pre-computed embedding from engram's memory_embeddings table.
+    /// When Some, used directly for clustering. When None, falls back to hash-based pseudo-embedding.
+    pub embedding: Option<Vec<f32>>,
 }
 
 impl MemorySnapshot {
@@ -36,6 +39,7 @@ impl MemorySnapshot {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             tags: vec![],
+            embedding: None,
         }
     }
 }
@@ -643,11 +647,12 @@ impl<S: KnowledgeStore, L: LlmProvider> CompilationPipeline<S, L> {
         use crate::compiler::decay::DecayEngine;
         use crate::compiler::discovery::TopicDiscovery;
 
-        // Build pseudo-embeddings for topic discovery
+        // Build embeddings for topic discovery — use real embeddings when available
         let memory_embeddings: Vec<(String, Vec<f32>)> = memories
             .iter()
             .map(|m| {
-                let embedding = simple_hash_embedding(&m.content, 64);
+                let embedding = m.embedding.clone()
+                    .unwrap_or_else(|| simple_hash_embedding(&m.content, 64));
                 (m.id.clone(), embedding)
             })
             .collect();
@@ -810,7 +815,7 @@ impl<S: KnowledgeStore, L: LlmProvider> CompilationPipeline<S, L> {
 ///
 /// Fallback when real embeddings are unavailable.
 /// Produces a deterministic float vector from content using character-level hashing.
-pub(crate) fn simple_hash_embedding(content: &str, dims: usize) -> Vec<f32> {
+pub fn simple_hash_embedding(content: &str, dims: usize) -> Vec<f32> {
     let mut embedding = vec![0.0f32; dims];
     for (i, byte) in content.bytes().enumerate() {
         let idx = i % dims;

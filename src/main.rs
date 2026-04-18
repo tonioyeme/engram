@@ -17,11 +17,15 @@ use clap::{Parser, Subcommand, ValueEnum};
 use engramai::{Memory, MemoryConfig, MemoryType, Permission, EmotionalBus, EmbeddingConfig, AnthropicExtractor, OllamaExtractor};
 use engramai::compiler::{
     self,
+    api::MaintenanceApi,
+    compilation::MemorySnapshot,
     conflict::ConflictDetector,
     decay::DecayEngine,
+    discovery::TopicDiscovery,
     export::{ExportEngine, ExportOutput},
     health::HealthAuditor,
     import::{ImportPipeline, MarkdownImporter},
+    llm::NoopProvider,
     privacy::{AccessContext, PrivacyGuard},
     storage::{KnowledgeStore, SqliteKnowledgeStore},
     types::*,
@@ -2115,16 +2119,151 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 KnowledgeCommand::Compile { topic, dry_run } => {
-                    println!("⚠️  Knowledge compilation requires an LLM provider.");
-                    println!("   Configure with ENGRAM_LLM_PROVIDER environment variable.");
-                    println!("   Supported: openai, anthropic");
-                    if let Some(ref t) = topic {
-                        println!("   Would compile topic: {}", t);
-                    } else {
-                        println!("   Would auto-discover and compile new topic candidates.");
+                    // Step 1: Read all memories
+                    let all_memories = mem.list_ns(None, None)
+                        .map_err(|e| format!("Failed to read memories: {}", e))?;
+
+                    if all_memories.is_empty() {
+                        println!("No memories found. Add some memories first with `engram store`.");
+                        return Ok(());
                     }
-                    if dry_run {
-                        println!("   (dry-run mode)");
+
+                    println!("📚 Found {} memories to analyze", all_memories.len());
+
+                    // Step 2: Load real embeddings from memory_embeddings table
+                    let engram_storage = engramai::storage::Storage::new(db_path)?;
+                    let emb_config = engramai::embeddings::EmbeddingConfig::default();
+                    let model_id = emb_config.model_id(); // "ollama/nomic-embed-text"
+                    let embedding_map: std::collections::HashMap<String, Vec<f32>> = engram_storage
+                        .get_all_embeddings(&model_id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect();
+
+                    // Step 3: Convert MemoryRecord → MemorySnapshot
+                    let snapshots: Vec<MemorySnapshot> = all_memories.iter().map(|m| {
+                        let tags = m.metadata.as_ref()
+                            .and_then(|v| v.get("tags"))
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .unwrap_or_default();
+                        MemorySnapshot {
+                            id: m.id.clone(),
+                            content: m.content.clone(),
+                            memory_type: format!("{:?}", m.memory_type).to_lowercase(),
+                            importance: m.importance,
+                            created_at: m.created_at,
+                            updated_at: m.created_at,
+                            tags,
+                            embedding: embedding_map.get(&m.id).cloned(),
+                        }
+                    }).collect();
+
+                    match topic {
+                        Some(ref topic_id) => {
+                            // Recompile a specific topic
+                            let tid = TopicId(topic_id.clone());
+                            let existing = kc_store.get_topic_page(&tid)
+                                .map_err(|e| format!("Failed to get topic: {}", e))?;
+                            match existing {
+                                Some(page) => {
+                                    if dry_run {
+                                        println!("🔍 Dry run: would recompile topic '{}'", page.title);
+                                        println!("   Current version: {}", page.version);
+                                        println!("   Source memories: {}", page.metadata.source_memory_ids.len());
+                                        println!("   Available memories for matching: {}", snapshots.len());
+                                    } else {
+                                        println!("🔄 Recompiling topic '{}'...", page.title);
+                                        // Filter snapshots to those relevant to this topic
+                                        let relevant: Vec<MemorySnapshot> = snapshots.iter()
+                                            .filter(|s| page.metadata.source_memory_ids.contains(&s.id))
+                                            .cloned()
+                                            .collect();
+
+                                        let api = MaintenanceApi::new(
+                                            SqliteKnowledgeStore::open(&cli.database)
+                                                .map_err(|e| format!("Failed to open store: {}", e))?,
+                                            kc_config.clone(),
+                                        );
+
+                                        let pages = api.compile_all::<NoopProvider>(None, &relevant)
+                                            .map_err(|e| format!("Compilation failed: {}", e))?;
+
+                                        println!("✅ Recompiled {} topic(s)", pages.len());
+                                        for p in &pages {
+                                            let q = p.metadata.quality_score.map(|s| format!(" q={:.2}", s)).unwrap_or_default();
+                                            println!("   [{}] {} (v{}{})", p.id.0, p.title, p.version, q);
+                                        }
+                                    }
+                                }
+                                None => {
+                                    eprintln!("Topic not found: {}", topic_id);
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                        None => {
+                            // Auto-discovery mode
+                            if dry_run {
+                                // Run discovery only, show what would be compiled
+                                let embeddings: Vec<(String, Vec<f32>)> = snapshots.iter()
+                                    .map(|m| {
+                                        let emb = m.embedding.clone()
+                                            .unwrap_or_else(|| {
+                                                engramai::compiler::compilation::simple_hash_embedding(&m.content, 64)
+                                            });
+                                        (m.id.clone(), emb)
+                                    })
+                                    .collect();
+
+                                let discovery = TopicDiscovery::new(kc_config.min_cluster_size);
+                                let candidates = discovery.discover(&embeddings);
+
+                                if candidates.is_empty() {
+                                    println!("🔍 No topic candidates discovered.");
+                                    println!("   Try adding more related memories (min cluster size: {})", kc_config.min_cluster_size);
+                                } else {
+                                    println!("🔍 Dry run: discovered {} topic candidate(s):", candidates.len());
+                                    for (i, c) in candidates.iter().enumerate() {
+                                        let title = c.suggested_title.as_deref().unwrap_or("(untitled)");
+                                        println!("   {}. {} ({} memories)", i + 1, title, c.memories.len());
+                                        for mid in &c.memories {
+                                            if let Some(snap) = snapshots.iter().find(|s| &s.id == mid) {
+                                                let preview: String = snap.content.chars().take(80).collect();
+                                                println!("      - [{}] {}", mid, preview);
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Full compilation
+                                println!("🔬 Discovering topic clusters...");
+
+                                let api = MaintenanceApi::new(
+                                    SqliteKnowledgeStore::open(&cli.database)
+                                        .map_err(|e| format!("Failed to open store: {}", e))?,
+                                    kc_config.clone(),
+                                );
+
+                                let pages = api.compile_all::<NoopProvider>(None, &snapshots)
+                                    .map_err(|e| format!("Compilation failed: {}", e))?;
+
+                                if pages.is_empty() {
+                                    println!("No topic candidates discovered from {} memories.", snapshots.len());
+                                    println!("   Memories may not form clear clusters yet.");
+                                    println!("   Minimum cluster size: {}", kc_config.min_cluster_size);
+                                } else {
+                                    println!("✅ Compiled {} topic(s):", pages.len());
+                                    for p in &pages {
+                                        let q = p.metadata.quality_score.map(|s| format!(" q={:.2}", s)).unwrap_or_default();
+                                        println!("   [{}] {} ({} sources, v{}{})",
+                                            p.id.0, p.title, p.metadata.source_memory_ids.len(), p.version, q);
+                                    }
+                                    println!("\nUse `engram knowledge list` to see all topics.");
+                                    println!("Use `engram knowledge inspect <topic-id>` for details.");
+                                }
+                            }
+                        }
                     }
                 }
 

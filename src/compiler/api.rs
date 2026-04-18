@@ -487,11 +487,12 @@ impl<S: KnowledgeStore> MaintenanceApi<S> {
     ) -> Result<DryRunReport, KcError> {
         use std::collections::HashSet;
 
-        // Build pseudo-embeddings for topic discovery
+        // Build embeddings for topic discovery — use real embeddings when available
         let memory_embeddings: Vec<(String, Vec<f32>)> = memories
             .iter()
             .map(|m| {
-                let embedding = simple_hash_embedding(&m.content, 64);
+                let embedding = m.embedding.clone()
+                    .unwrap_or_else(|| simple_hash_embedding(&m.content, 64));
                 (m.id.clone(), embedding)
             })
             .collect();
@@ -590,13 +591,13 @@ impl<S: KnowledgeStore> MaintenanceApi<S> {
         memories: &[MemorySnapshot],
     ) -> Result<Vec<TopicPage>, KcError> {
         // Build embeddings list — TopicDiscovery expects (id, embedding) pairs.
-        // If memories don't have embeddings, we generate trivial ones.
+        // Use real embeddings from memory_embeddings table when available,
+        // fall back to hash-based pseudo-embedding otherwise.
         let memory_embeddings: Vec<(String, Vec<f32>)> = memories
             .iter()
             .map(|m| {
-                // Use a simple hash-based pseudo-embedding for clustering
-                // when real embeddings aren't available.
-                let embedding = simple_hash_embedding(&m.content, 64);
+                let embedding = m.embedding.clone()
+                    .unwrap_or_else(|| simple_hash_embedding(&m.content, 64));
                 (m.id.clone(), embedding)
             })
             .collect();

@@ -130,38 +130,41 @@ pub struct QualityReport {
 
 **Traces:** GOAL-comp.2 (automatic topic discovery from memory clusters)
 
-**Purpose:** Discover topic candidates by leveraging the existing `synthesis::cluster` module's 4-signal clustering (Hebbian weight, entity Jaccard, embedding cosine, temporal proximity), then label candidates via LLM.
+**Purpose:** Discover topic candidates by clustering memories using their existing embeddings from engram's `memory_embeddings` table. Label candidates via LLM when available.
+
+**Architectural principle — embedding reuse:** TopicDiscovery does NOT generate its own embeddings for source memories. It reads pre-computed embeddings from engram's `memory_embeddings` table (via `Storage::get_all_embeddings(model)`). This is the same embedding used by `hybrid_search` and `find_nearest_embedding`. When a memory lacks an embedding (provider was offline at store time), the caller provides a hash-based fallback — but this is degraded mode, not the design intent.
 
 **Design:**
 
 ```rust
 pub struct TopicDiscovery {
-    config: KcConfig,
-    llm: Arc<dyn SynthesisLlmProvider>,
+    min_cluster_size: usize,
+    overlap_threshold: f64,
 }
 
 impl TopicDiscovery {
-    /// Run discovery over all memories, producing topic candidates.
-    /// Uses existing discover_clusters() from synthesis::cluster.
-    pub async fn discover(&self, memories: &[Memory]) -> Result<Vec<TopicCandidate>, KcError> { .. }
-
-    /// Label a cluster of memories with a topic name via LLM.
-    async fn label_cluster(&self, memories: &[Memory]) -> Result<String, KcError> { .. }
-
-    /// Check if a candidate overlaps significantly with existing topics.
-    fn detect_overlap(&self, candidate: &TopicCandidate, existing: &[TopicPage]) -> Option<TopicId> { .. }
+    /// Discover topic candidates from memories with pre-computed embeddings.
+    /// Embeddings should come from engram's memory_embeddings table.
+    /// The caller is responsible for loading embeddings and falling back
+    /// to hash-based pseudo-embeddings for memories without stored vectors.
+    pub fn discover(
+        &self,
+        memories: &[(String, Vec<f32>)], // (memory_id, embedding from memory_embeddings)
+    ) -> Vec<TopicCandidate> { .. }
 }
 ```
 
 **Algorithm:**
 
-1. Call `discover_clusters()` with `ClusterDiscoveryConfig { min_cluster_size: config.min_topic_size, .. }`.
-2. For each `MemoryCluster` returned, build a `TopicCandidate`:
-   - Call `label_cluster()` — sends the cluster's memory summaries to LLM with prompt: "Given these related memories, suggest a concise topic label (2-5 words)."
-   - Compute `confidence` from the cluster's average composite score.
-   - Run `detect_overlap()` against existing `TopicPage` list — if >60% memory overlap with an existing topic, set `overlaps_with`.
-3. Filter out candidates below `config.min_topic_size` threshold.
-4. Return sorted by confidence descending.
+1. Caller loads embeddings from `Storage::get_all_embeddings(model_id)` and builds `(memory_id, embedding)` pairs. For memories without stored embeddings, caller uses `simple_hash_embedding()` as fallback.
+2. `discover()` runs agglomerative clustering (single-linkage, similarity threshold 0.5) on the provided embeddings.
+3. For each cluster above `min_cluster_size`, build a `TopicCandidate`:
+   - Compute `centroid_embedding` as the mean of member embeddings.
+   - Compute `cohesion_score` from average intra-cluster cosine similarity.
+   - `suggested_title` is `None` until `label_cluster()` is called.
+4. Optionally call `label_cluster()` — sends the cluster's memory contents to LLM with prompt: "Given these related memories, suggest a concise topic label (2-5 words)."
+5. Run `detect_overlap()` against existing `TopicPage` list — if Jaccard similarity of memory sets exceeds threshold, set `overlaps_with`.
+6. Return sorted by cohesion descending.
 
 **Edge cases:**
 - Memories belonging to multiple clusters: each cluster gets its own candidate; the `TopicLifecycle` component (§3.4) handles merge decisions later.

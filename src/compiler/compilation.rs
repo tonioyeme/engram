@@ -478,11 +478,18 @@ pub struct CompilationPipeline<S: KnowledgeStore, L: LlmProvider> {
     store: S,
     llm: Option<L>,
     config: KcConfig,
+    verbose: bool,
 }
 
 impl<S: KnowledgeStore, L: LlmProvider> CompilationPipeline<S, L> {
     pub fn new(store: S, llm: Option<L>, config: KcConfig) -> Self {
-        Self { store, llm, config }
+        Self { store, llm, config, verbose: false }
+    }
+
+    /// Builder method to enable verbose mode (prints LLM prompts to stderr).
+    pub fn with_verbose(mut self, v: bool) -> Self {
+        self.verbose = v;
+        self
     }
 
     /// Run the full pipeline for a single topic candidate: compile and persist.
@@ -619,6 +626,141 @@ impl<S: KnowledgeStore, L: LlmProvider> CompilationPipeline<S, L> {
         Ok(updated)
     }
 
+    /// Perform a read-only dry run: show what a compilation pass *would* do
+    /// without calling the LLM or mutating the store.
+    ///
+    /// For each `TopicCandidate` discovered from memories:
+    /// - If no existing topic overlaps → `NewCompilation`
+    /// - If an existing topic overlaps and has changes → `Recompile`
+    /// - If an existing topic overlaps but nothing changed → `Skip`
+    ///
+    /// For existing topics with no matching candidate:
+    /// - Evaluates decay → `Archive` if stale enough, else `Skip`
+    pub fn dry_run(
+        &self,
+        memories: &[MemorySnapshot],
+    ) -> Result<DryRunReport, KcError> {
+        use crate::compiler::decay::DecayEngine;
+        use crate::compiler::discovery::TopicDiscovery;
+
+        // Build pseudo-embeddings for topic discovery
+        let memory_embeddings: Vec<(String, Vec<f32>)> = memories
+            .iter()
+            .map(|m| {
+                let embedding = simple_hash_embedding(&m.content, 64);
+                (m.id.clone(), embedding)
+            })
+            .collect();
+
+        let discovery = TopicDiscovery::new(self.config.min_cluster_size);
+        let candidates = discovery.discover(&memory_embeddings);
+
+        let existing_pages = self.store.list_topic_pages()?;
+        let mut entries = Vec::new();
+        let mut matched_topic_ids: HashSet<TopicId> = HashSet::new();
+        let mut estimated_llm_calls = 0usize;
+
+        for candidate in &candidates {
+            // Check if this candidate overlaps an existing topic
+            match discovery.detect_overlap(candidate, &existing_pages) {
+                Some(topic_id) => {
+                    matched_topic_ids.insert(topic_id.clone());
+
+                    // Determine if there are changes worth recompiling
+                    let page = self.store.get_topic_page(&topic_id)?;
+                    if let Some(page) = page {
+                        let existing_ids: HashSet<&str> = page
+                            .metadata
+                            .source_memory_ids
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect();
+                        let candidate_ids: HashSet<&str> =
+                            candidate.memories.iter().map(|s| s.as_str()).collect();
+
+                        let added = candidate_ids.difference(&existing_ids).count();
+                        let removed = existing_ids.difference(&candidate_ids).count();
+
+                        if added > 0 || removed > 0 {
+                            entries.push(DryRunEntry {
+                                topic_id: Some(topic_id),
+                                action: DryRunAction::Recompile,
+                                affected_memories: candidate.memories.len(),
+                                reason: format!(
+                                    "{} new memories, {} removed since last compile",
+                                    added, removed
+                                ),
+                            });
+                            estimated_llm_calls += 1;
+                        } else {
+                            entries.push(DryRunEntry {
+                                topic_id: Some(topic_id),
+                                action: DryRunAction::Skip,
+                                affected_memories: candidate.memories.len(),
+                                reason: "No changes detected".to_string(),
+                            });
+                        }
+                    }
+                }
+                None => {
+                    // New topic
+                    entries.push(DryRunEntry {
+                        topic_id: None,
+                        action: DryRunAction::NewCompilation,
+                        affected_memories: candidate.memories.len(),
+                        reason: format!(
+                            "New cluster of {} memories",
+                            candidate.memories.len()
+                        ),
+                    });
+                    estimated_llm_calls += 1;
+                }
+            }
+        }
+
+        // Check existing topics that had no matching candidate — evaluate decay
+        let decay_engine = DecayEngine::new(self.config.decay.clone());
+        for page in &existing_pages {
+            if matched_topic_ids.contains(&page.id) {
+                continue;
+            }
+            if page.status == TopicStatus::Archived {
+                continue;
+            }
+
+            let decay_result = decay_engine.evaluate_topic(page, &self.store)?;
+            if matches!(decay_result.recommended_action, DecayAction::Archive(_)) {
+                entries.push(DryRunEntry {
+                    topic_id: Some(page.id.clone()),
+                    action: DryRunAction::Archive,
+                    affected_memories: 0,
+                    reason: format!(
+                        "Freshness score {:.2} below archive threshold",
+                        decay_result.freshness_score
+                    ),
+                });
+            } else {
+                entries.push(DryRunEntry {
+                    topic_id: Some(page.id.clone()),
+                    action: DryRunAction::Skip,
+                    affected_memories: 0,
+                    reason: "No matching candidate and not decayed enough to archive".to_string(),
+                });
+            }
+        }
+
+        let total_topics_affected = entries
+            .iter()
+            .filter(|e| !matches!(e.action, DryRunAction::Skip))
+            .count();
+
+        Ok(DryRunReport {
+            entries,
+            total_topics_affected,
+            estimated_llm_calls,
+        })
+    }
+
     /// Inner content compilation: tries LLM first, falls back to concatenation.
     fn compile_content(
         &self,
@@ -633,6 +775,10 @@ impl<S: KnowledgeStore, L: LlmProvider> CompilationPipeline<S, L> {
             }
             None => build_full_compile_prompt(title, memories, user_edits),
         };
+
+        if self.verbose {
+            eprintln!("[KC verbose] LLM prompt:\n{}", prompt);
+        }
 
         match &self.llm {
             Some(provider) => {
@@ -659,6 +805,26 @@ impl<S: KnowledgeStore, L: LlmProvider> CompilationPipeline<S, L> {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Helpers
 // ═══════════════════════════════════════════════════════════════════════════════
+
+/// Generate a simple hash-based pseudo-embedding for clustering.
+///
+/// Fallback when real embeddings are unavailable.
+/// Produces a deterministic float vector from content using character-level hashing.
+pub(crate) fn simple_hash_embedding(content: &str, dims: usize) -> Vec<f32> {
+    let mut embedding = vec![0.0f32; dims];
+    for (i, byte) in content.bytes().enumerate() {
+        let idx = i % dims;
+        embedding[idx] += (byte as f32 - 128.0) / 128.0;
+    }
+    // Normalize
+    let mag: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if mag > 0.0 {
+        for v in &mut embedding {
+            *v /= mag;
+        }
+    }
+    embedding
+}
 
 /// Extract the first paragraph as a summary.
 pub fn extract_summary(content: &str) -> String {
@@ -1017,5 +1183,139 @@ mod tests {
         assert!(prompt.contains("existing content"));
         assert!(prompt.contains("New memory"));
         assert!(prompt.contains("m_old"));
+    }
+
+    // ── Dry Run Tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dry_run_no_existing_topics_all_new() {
+        use crate::compiler::llm::NoopProvider;
+        use crate::compiler::storage::SqliteKnowledgeStore;
+
+        let store = SqliteKnowledgeStore::in_memory().unwrap();
+        store.init_schema().unwrap();
+
+        // Use a small cluster size so our memories form candidates
+        let mut config = make_config();
+        config.min_cluster_size = 2;
+
+        let pipeline = CompilationPipeline::<SqliteKnowledgeStore, NoopProvider>::new(
+            store, None, config,
+        );
+
+        // Create memories with similar content so they cluster together
+        let memories = vec![
+            MemorySnapshot::test("m1", "Rust programming language features"),
+            MemorySnapshot::test("m2", "Rust programming language performance"),
+            MemorySnapshot::test("m3", "Rust programming language safety"),
+        ];
+
+        let report = pipeline.dry_run(&memories).unwrap();
+
+        // All entries should be NewCompilation (no existing topics)
+        for entry in &report.entries {
+            assert!(
+                matches!(entry.action, DryRunAction::NewCompilation),
+                "Expected NewCompilation, got {:?}",
+                entry.action
+            );
+            assert!(entry.topic_id.is_none());
+        }
+        assert_eq!(report.total_topics_affected, report.entries.len());
+        assert_eq!(report.estimated_llm_calls, report.entries.len());
+    }
+
+    #[test]
+    fn test_dry_run_existing_topics_no_changes_skip() {
+        use crate::compiler::llm::NoopProvider;
+        use crate::compiler::storage::SqliteKnowledgeStore;
+
+        let store = SqliteKnowledgeStore::in_memory().unwrap();
+        store.init_schema().unwrap();
+
+        // Create an existing topic page
+        let now = Utc::now();
+        let page = TopicPage {
+            id: TopicId("existing-topic".to_string()),
+            title: "Existing Topic".to_string(),
+            content: "Some existing content".to_string(),
+            sections: vec![],
+            summary: "summary".to_string(),
+            status: TopicStatus::Active,
+            version: 1,
+            metadata: TopicMetadata {
+                created_at: now,
+                updated_at: now,
+                compilation_count: 1,
+                source_memory_ids: vec!["m1".into(), "m2".into()],
+                tags: vec![],
+                quality_score: Some(0.8),
+            },
+        };
+        store.create_topic_page(&page).unwrap();
+
+        // Add source refs so decay doesn't trigger archive
+        let refs = vec![
+            SourceMemoryRef { memory_id: "m1".into(), relevance_score: 0.9, added_at: now },
+            SourceMemoryRef { memory_id: "m2".into(), relevance_score: 0.9, added_at: now },
+        ];
+        store.save_source_refs(&TopicId("existing-topic".into()), &refs).unwrap();
+
+        let mut config = make_config();
+        config.min_cluster_size = 2;
+
+        let pipeline = CompilationPipeline::<SqliteKnowledgeStore, NoopProvider>::new(
+            store, None, config,
+        );
+
+        // Pass no memories — the existing topic should get Skip (or Archive via decay)
+        // since there are no candidates at all
+        let report = pipeline.dry_run(&[]).unwrap();
+
+        // The existing topic should appear as Skip or Archive (decay-based)
+        assert!(!report.entries.is_empty(), "Should have entry for existing topic");
+        for entry in &report.entries {
+            assert!(
+                matches!(entry.action, DryRunAction::Skip | DryRunAction::Archive),
+                "Expected Skip or Archive for unmatched topic, got {:?}",
+                entry.action
+            );
+        }
+    }
+
+    // ── Verbose Flag Test ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_verbose_compilation_succeeds() {
+        use crate::compiler::llm::NoopProvider;
+        use crate::compiler::storage::SqliteKnowledgeStore;
+
+        let store = SqliteKnowledgeStore::in_memory().unwrap();
+        store.init_schema().unwrap();
+        let config = make_config();
+
+        // Build pipeline with verbose=true
+        let pipeline = CompilationPipeline::<SqliteKnowledgeStore, NoopProvider>::new(
+            store, None, config,
+        ).with_verbose(true);
+
+        let memories = vec![
+            MemorySnapshot::test("m1", "Test memory one"),
+            MemorySnapshot::test("m2", "Test memory two"),
+        ];
+
+        let candidate = TopicCandidate {
+            memories: vec!["m1".into(), "m2".into()],
+            centroid_embedding: vec![0.0; 64],
+            cohesion_score: 0.9,
+            suggested_title: Some("Verbose Test Topic".to_string()),
+        };
+
+        // compile_new should succeed even with verbose=true (prints to stderr)
+        let result = pipeline.compile_new(&candidate, &memories);
+        assert!(result.is_ok(), "Compilation with verbose=true should succeed: {:?}", result.err());
+        let page = result.unwrap();
+        assert_eq!(page.title, "Verbose Test Topic");
+        assert!(page.content.contains("Test memory one"));
     }
 }

@@ -195,6 +195,70 @@ impl<S: KnowledgeStore> MaintenanceApi<S> {
         score
     }
 
+    /// Knowledge-aware recall: search topic pages with scoring that considers
+    /// topic quality, freshness, and source memory importance.
+    ///
+    /// Unlike `query()` which does simple keyword matching, `recall()` blends
+    /// text relevance with topic metadata signals (quality, freshness, source count)
+    /// to produce a richer ranking.
+    pub fn recall(&self, query: &str, opts: &RecallOpts) -> Result<Vec<RecallResult>, KcError> {
+        let all_pages = self.store.list_topic_pages()?;
+        let q_lower = query.to_lowercase();
+        let now = chrono::Utc::now();
+
+        let mut results: Vec<RecallResult> = all_pages
+            .into_iter()
+            .filter(|page| page.status != TopicStatus::Archived)
+            .filter_map(|page| {
+                // a. Text match score (reuse compute_relevance logic)
+                let text_score = Self::compute_relevance(&page, &q_lower);
+
+                // Must have at least a text match
+                if text_score <= 0.0 {
+                    return None;
+                }
+
+                // b. Quality boost: topic.metadata.quality_score * 0.3
+                let quality_boost = page.metadata.quality_score.unwrap_or(0.0) * 0.3;
+
+                // c. Freshness boost: days since updated_at, decaying with 1/(1 + days/30)
+                let days_since_update =
+                    (now - page.metadata.updated_at).num_days().max(0) as f64;
+                let freshness_boost = 1.0 / (1.0 + days_since_update / 30.0);
+
+                // d. Source count boost: min(source_memory_ids.len() / 10.0, 0.5)
+                let source_boost =
+                    (page.metadata.source_memory_ids.len() as f64 / 10.0).min(0.5);
+
+                // e. Final score
+                let score = text_score * opts.topic_boost
+                    + quality_boost
+                    + freshness_boost
+                    + source_boost;
+
+                // Snippet: first 200 chars of content
+                let snippet: String = page.content.chars().take(200).collect();
+
+                Some(RecallResult {
+                    topic_id: page.id,
+                    title: page.title,
+                    snippet,
+                    score,
+                })
+            })
+            .collect();
+
+        // Sort by score descending
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        results.truncate(opts.limit);
+        Ok(results)
+    }
+
     /// Load a topic page with full detail: source refs, compilation records,
     /// and quality report.
     pub fn inspect(&self, topic_id: &TopicId) -> Result<TopicDetail, KcError> {
@@ -411,6 +475,108 @@ impl<S: KnowledgeStore> MaintenanceApi<S> {
         self.store.update_topic_page(&page)
     }
 
+    // ── Dry Run ──────────────────────────────────────────────────────────
+
+    /// Perform a read-only dry run showing what a compilation pass would do.
+    ///
+    /// Discovers topic candidates, checks overlap with existing topics,
+    /// evaluates decay on unmatched topics. Does NOT call LLM or mutate store.
+    pub fn dry_run(
+        &self,
+        memories: &[MemorySnapshot],
+    ) -> Result<DryRunReport, KcError> {
+        use std::collections::HashSet;
+
+        // Build pseudo-embeddings for topic discovery
+        let memory_embeddings: Vec<(String, Vec<f32>)> = memories
+            .iter()
+            .map(|m| {
+                let embedding = simple_hash_embedding(&m.content, 64);
+                (m.id.clone(), embedding)
+            })
+            .collect();
+
+        let discovery = TopicDiscovery::new(self.config.min_cluster_size);
+        let candidates = discovery.discover(&memory_embeddings);
+        let existing_pages = self.store.list_topic_pages()?;
+
+        let mut entries = Vec::new();
+        let mut matched_topic_ids: HashSet<TopicId> = HashSet::new();
+        let mut estimated_llm_calls = 0usize;
+
+        for candidate in &candidates {
+            match discovery.detect_overlap(candidate, &existing_pages) {
+                Some(topic_id) => {
+                    matched_topic_ids.insert(topic_id.clone());
+                    if let Some(page) = self.store.get_topic_page(&topic_id)? {
+                        let existing_ids: HashSet<&str> = page
+                            .metadata.source_memory_ids.iter().map(|s| s.as_str()).collect();
+                        let candidate_ids: HashSet<&str> =
+                            candidate.memories.iter().map(|s| s.as_str()).collect();
+                        let added = candidate_ids.difference(&existing_ids).count();
+                        let removed = existing_ids.difference(&candidate_ids).count();
+
+                        if added > 0 || removed > 0 {
+                            entries.push(DryRunEntry {
+                                topic_id: Some(topic_id),
+                                action: DryRunAction::Recompile,
+                                affected_memories: candidate.memories.len(),
+                                reason: format!("{} new, {} removed", added, removed),
+                            });
+                            estimated_llm_calls += 1;
+                        } else {
+                            entries.push(DryRunEntry {
+                                topic_id: Some(topic_id),
+                                action: DryRunAction::Skip,
+                                affected_memories: candidate.memories.len(),
+                                reason: "No changes detected".to_string(),
+                            });
+                        }
+                    }
+                }
+                None => {
+                    entries.push(DryRunEntry {
+                        topic_id: None,
+                        action: DryRunAction::NewCompilation,
+                        affected_memories: candidate.memories.len(),
+                        reason: format!("New cluster of {} memories", candidate.memories.len()),
+                    });
+                    estimated_llm_calls += 1;
+                }
+            }
+        }
+
+        // Check existing topics with no matching candidate — evaluate decay
+        let decay_engine = DecayEngine::new(self.config.decay.clone());
+        for page in &existing_pages {
+            if matched_topic_ids.contains(&page.id) || page.status == TopicStatus::Archived {
+                continue;
+            }
+            let decay_result = decay_engine.evaluate_topic(page, &self.store)?;
+            if matches!(decay_result.recommended_action, DecayAction::Archive(_)) {
+                entries.push(DryRunEntry {
+                    topic_id: Some(page.id.clone()),
+                    action: DryRunAction::Archive,
+                    affected_memories: 0,
+                    reason: format!("Freshness {:.2} below threshold", decay_result.freshness_score),
+                });
+            } else {
+                entries.push(DryRunEntry {
+                    topic_id: Some(page.id.clone()),
+                    action: DryRunAction::Skip,
+                    affected_memories: 0,
+                    reason: "No matching candidate, not decayed".to_string(),
+                });
+            }
+        }
+
+        let total_topics_affected = entries.iter()
+            .filter(|e| !matches!(e.action, DryRunAction::Skip))
+            .count();
+
+        Ok(DryRunReport { entries, total_topics_affected, estimated_llm_calls })
+    }
+
     // ── Compilation ──────────────────────────────────────────────────────
 
     /// Compile all discovered topic candidates from the provided memories.
@@ -519,19 +685,7 @@ impl<S: KnowledgeStore> MaintenanceApi<S> {
 /// This is a fallback when real embeddings are unavailable.
 /// Produces a deterministic float vector from content using character-level hashing.
 fn simple_hash_embedding(content: &str, dims: usize) -> Vec<f32> {
-    let mut embedding = vec![0.0f32; dims];
-    for (i, byte) in content.bytes().enumerate() {
-        let idx = i % dims;
-        embedding[idx] += (byte as f32 - 128.0) / 128.0;
-    }
-    // Normalize
-    let mag: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if mag > 0.0 {
-        for v in &mut embedding {
-            *v /= mag;
-        }
-    }
-    embedding
+    super::compilation::simple_hash_embedding(content, dims)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -852,5 +1006,79 @@ mod tests {
             }
             _ => panic!("expected Markdown output"),
         }
+    }
+
+    // ── recall ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_recall_empty_store() {
+        let api = make_api();
+        let results = api.recall("anything", &RecallOpts::default()).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_recall_matches_topic() {
+        let api = make_api();
+        let page = make_topic("t1", "Rust Programming", "Rust is a systems programming language");
+        api.store.create_topic_page(&page).unwrap();
+
+        let results = api.recall("rust", &RecallOpts::default()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].topic_id, TopicId("t1".to_owned()));
+        assert_eq!(results[0].title, "Rust Programming");
+        assert!(!results[0].snippet.is_empty());
+        assert!(results[0].score > 0.0);
+    }
+
+    #[test]
+    fn test_recall_respects_limit() {
+        let api = make_api();
+        for i in 0..3 {
+            let page = make_topic(
+                &format!("t{}", i),
+                &format!("Rust Topic {}", i),
+                "Content about rust programming",
+            );
+            api.store.create_topic_page(&page).unwrap();
+        }
+
+        let opts = RecallOpts {
+            limit: 1,
+            ..RecallOpts::default()
+        };
+        let results = api.recall("rust", &opts).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_recall_quality_boost() {
+        let api = make_api();
+
+        // Two topics with the same text but different quality scores
+        let mut low_quality = make_topic("t_low", "Rust Guide", "Content about rust");
+        low_quality.metadata.quality_score = Some(0.1);
+        api.store.create_topic_page(&low_quality).unwrap();
+
+        let mut high_quality = make_topic("t_high", "Rust Guide", "Content about rust");
+        high_quality.metadata.quality_score = Some(0.9);
+        api.store.create_topic_page(&high_quality).unwrap();
+
+        let results = api.recall("rust", &RecallOpts::default()).unwrap();
+        assert_eq!(results.len(), 2);
+        // Higher quality should rank first
+        assert_eq!(results[0].topic_id, TopicId("t_high".to_owned()));
+        assert_eq!(results[1].topic_id, TopicId("t_low".to_owned()));
+    }
+
+    #[test]
+    fn test_recall_no_archived() {
+        let api = make_api();
+        let mut page = make_topic("t1", "Archived Rust Topic", "Rust content that is archived");
+        page.status = TopicStatus::Archived;
+        api.store.create_topic_page(&page).unwrap();
+
+        let results = api.recall("rust", &RecallOpts::default()).unwrap();
+        assert!(results.is_empty());
     }
 }

@@ -42,6 +42,7 @@ pub mod privacy;
 pub mod storage;
 pub mod topic_lifecycle;
 pub mod types;
+pub mod watcher;
 
 // Re-export all public types for convenience
 pub use storage::*;

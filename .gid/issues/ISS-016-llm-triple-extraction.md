@@ -122,4 +122,4 @@ New signal (optional):
 - Manual triple editing UI
 - Cross-memory triple merging (entity resolution / dedup)
 
-## Status: 📋 Open
+## Status: ✅ DONE (2026-04-18, committed 0383584)

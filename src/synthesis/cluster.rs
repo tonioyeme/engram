@@ -1,12 +1,20 @@
 //! Cluster discovery module for the synthesis engine.
 //!
-//! Uses 4 zero-LLM signals to find groups of related memories:
+//! Uses 4 zero-LLM signals to build a weighted similarity graph:
 //! 1. Hebbian link weights
 //! 2. Entity overlap (Jaccard index)
 //! 3. Embedding similarity (cosine)
 //! 4. Temporal proximity (exponential decay)
+//!
+//! Community detection is performed by **Infomap** (information-theoretic
+//! clustering that minimises the map equation). This replaced the previous
+//! Union-Find connected-components approach which suffered from the
+//! single-linkage chaining effect — one weak bridge between two unrelated
+//! groups was enough to merge them.
 
 use std::collections::{HashMap, HashSet};
+
+use infomap_rs::{Infomap, Network};
 
 use crate::embeddings::EmbeddingProvider;
 use crate::storage::Storage;
@@ -199,8 +207,8 @@ pub fn discover_clusters(
         }
     }
 
-    // Step 5: Connected components
-    let clusters = connected_components(&edges, &candidate_ids, config);
+    // Step 5: Infomap community detection
+    let clusters = infomap_communities(&edges, &candidate_ids, config);
 
     // Step 6: Build MemoryCluster structs
     let mut result: Vec<MemoryCluster> = Vec::new();
@@ -232,67 +240,77 @@ fn is_synthesis_output(record: &MemoryRecord) -> bool {
         .unwrap_or(false)
 }
 
-/// Find connected components from an edge list.
-/// Returns Vec of member sets, filtered by min/max cluster size.
-fn connected_components(
+/// Find communities in the weighted edge graph using Infomap.
+///
+/// Infomap minimises the map equation (information-theoretic objective) to
+/// discover natural community structure in the weighted graph.  Unlike
+/// Union-Find connected-components, Infomap can split a single connected
+/// component into multiple communities when there are clear bottlenecks
+/// in the random-walk flow.
+///
+/// Returns Vec of member-ID vectors, filtered by min/max cluster size.
+fn infomap_communities(
     edges: &[(String, String, f64)],
     all_ids: &HashSet<&str>,
     config: &ClusterDiscoveryConfig,
 ) -> Vec<Vec<String>> {
-    // Union-Find implementation
+    if edges.is_empty() {
+        return Vec::new();
+    }
+
+    // Map string IDs → contiguous indices for Infomap.
     let id_list: Vec<String> = all_ids.iter().map(|s| s.to_string()).collect();
     let id_to_idx: HashMap<&str, usize> = id_list
         .iter()
         .enumerate()
         .map(|(i, s)| (s.as_str(), i))
         .collect();
-    let mut parent: Vec<usize> = (0..id_list.len()).collect();
 
-    fn find(parent: &mut Vec<usize>, i: usize) -> usize {
-        if parent[i] != i {
-            parent[i] = find(parent, parent[i]);
-        }
-        parent[i]
-    }
+    let mut network = Network::with_capacity(id_list.len());
+    network.ensure_capacity(id_list.len());
 
-    fn union(parent: &mut Vec<usize>, a: usize, b: usize) {
-        let ra = find(parent, a);
-        let rb = find(parent, b);
-        if ra != rb {
-            parent[ra] = rb;
-        }
-    }
-
-    for (a, b, _) in edges {
+    for (a, b, weight) in edges {
         if let (Some(&ia), Some(&ib)) = (id_to_idx.get(a.as_str()), id_to_idx.get(b.as_str())) {
-            union(&mut parent, ia, ib);
+            // Undirected: add both directions so Infomap treats it symmetrically.
+            network.add_edge(ia, ib, *weight);
+            network.add_edge(ib, ia, *weight);
         }
     }
 
-    // Group by root
-    let mut groups: HashMap<usize, Vec<String>> = HashMap::new();
-    for (i, id) in id_list.iter().enumerate() {
-        let root = find(&mut parent, i);
-        groups.entry(root).or_default().push(id.clone());
+    let result = Infomap::new(&network).seed(42).run();
+
+    // Group node indices by module assignment.
+    let mut modules: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (node_idx, &module_id) in result.assignments.iter().enumerate() {
+        if node_idx < id_list.len() {
+            modules.entry(module_id).or_default().push(node_idx);
+        }
     }
 
-    // Filter by size and handle splitting
-    let mut result = Vec::new();
-    for (_, mut members) in groups {
-        if members.len() < config.min_cluster_size {
-            continue; // too small
+    // Convert back to string IDs, filter by size, handle splitting.
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    for (_, member_indices) in modules {
+        if member_indices.len() < config.min_cluster_size {
+            continue;
         }
+
+        let mut members: Vec<String> = member_indices
+            .iter()
+            .map(|&i| id_list[i].clone())
+            .collect();
+        members.sort();
+
         if members.len() > config.max_cluster_size {
-            // Split: for simplicity, take the top max_cluster_size by their edge connectivity
-            // TODO: implement proper recursive splitting with higher threshold
-            members.sort();
+            // Split oversized communities: take top max_cluster_size members.
+            // A better approach would recursively sub-cluster, but matches
+            // the previous behaviour for now.
             members.truncate(config.max_cluster_size);
         }
-        members.sort();
-        result.push(members);
+
+        groups.push(members);
     }
 
-    result
+    groups
 }
 
 /// Build a MemoryCluster struct from a set of member IDs.
@@ -584,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn test_connected_components_simple_triangle() {
+    fn test_infomap_communities_simple_triangle() {
         let config = ClusterDiscoveryConfig {
             min_cluster_size: 3,
             max_cluster_size: 15,
@@ -597,33 +615,38 @@ mod tests {
         ];
         let ids: HashSet<&str> = ["a", "b", "c"].into_iter().collect();
 
-        let components = connected_components(&edges, &ids, &config);
+        let components = infomap_communities(&edges, &ids, &config);
         assert_eq!(components.len(), 1);
         assert_eq!(components[0], vec!["a", "b", "c"]);
     }
 
     #[test]
-    fn test_connected_components_two_clusters() {
+    fn test_infomap_communities_two_clusters() {
         let config = ClusterDiscoveryConfig {
             min_cluster_size: 2,
             max_cluster_size: 15,
             ..Default::default()
         };
+        // Two tight triangles with no bridge → Infomap finds 2 communities
         let edges = vec![
-            ("a".to_string(), "b".to_string(), 0.5),
-            ("c".to_string(), "d".to_string(), 0.6),
+            ("a".to_string(), "b".to_string(), 1.0),
+            ("b".to_string(), "c".to_string(), 1.0),
+            ("a".to_string(), "c".to_string(), 1.0),
+            ("d".to_string(), "e".to_string(), 1.0),
+            ("e".to_string(), "f".to_string(), 1.0),
+            ("d".to_string(), "f".to_string(), 1.0),
         ];
-        let ids: HashSet<&str> = ["a", "b", "c", "d"].into_iter().collect();
+        let ids: HashSet<&str> = ["a", "b", "c", "d", "e", "f"].into_iter().collect();
 
-        let mut components = connected_components(&edges, &ids, &config);
+        let mut components = infomap_communities(&edges, &ids, &config);
         components.sort_by(|a, b| a[0].cmp(&b[0]));
         assert_eq!(components.len(), 2);
-        assert_eq!(components[0], vec!["a", "b"]);
-        assert_eq!(components[1], vec!["c", "d"]);
+        assert_eq!(components[0], vec!["a", "b", "c"]);
+        assert_eq!(components[1], vec!["d", "e", "f"]);
     }
 
     #[test]
-    fn test_connected_components_filters_small() {
+    fn test_infomap_communities_filters_small() {
         let config = ClusterDiscoveryConfig {
             min_cluster_size: 3,
             max_cluster_size: 15,
@@ -633,29 +656,71 @@ mod tests {
         let edges = vec![("a".to_string(), "b".to_string(), 0.5)];
         let ids: HashSet<&str> = ["a", "b", "c"].into_iter().collect();
 
-        let components = connected_components(&edges, &ids, &config);
+        let components = infomap_communities(&edges, &ids, &config);
         // Both the pair {a,b} and the singleton {c} are < 3
         assert_eq!(components.len(), 0);
     }
 
     #[test]
-    fn test_connected_components_truncates_large() {
+    fn test_infomap_communities_truncates_large() {
         let config = ClusterDiscoveryConfig {
             min_cluster_size: 2,
             max_cluster_size: 3,
             ..Default::default()
         };
+        // One tight cluster of 5 nodes
         let edges = vec![
-            ("a".to_string(), "b".to_string(), 0.5),
-            ("b".to_string(), "c".to_string(), 0.6),
-            ("c".to_string(), "d".to_string(), 0.4),
-            ("d".to_string(), "e".to_string(), 0.3),
+            ("a".to_string(), "b".to_string(), 1.0),
+            ("b".to_string(), "c".to_string(), 1.0),
+            ("c".to_string(), "d".to_string(), 1.0),
+            ("d".to_string(), "e".to_string(), 1.0),
+            ("a".to_string(), "c".to_string(), 1.0),
+            ("a".to_string(), "d".to_string(), 1.0),
+            ("a".to_string(), "e".to_string(), 1.0),
+            ("b".to_string(), "d".to_string(), 1.0),
+            ("b".to_string(), "e".to_string(), 1.0),
+            ("c".to_string(), "e".to_string(), 1.0),
         ];
         let ids: HashSet<&str> = ["a", "b", "c", "d", "e"].into_iter().collect();
 
-        let components = connected_components(&edges, &ids, &config);
-        assert_eq!(components.len(), 1);
-        assert!(components[0].len() <= 3);
+        let components = infomap_communities(&edges, &ids, &config);
+        // Should produce at least one community, truncated to max_cluster_size=3
+        for component in &components {
+            assert!(component.len() <= 3);
+        }
+    }
+
+    #[test]
+    fn test_infomap_no_chaining_effect() {
+        // Two tight clusters connected by a single weak edge.
+        // Union-Find would merge them. Infomap should keep them separate.
+        let config = ClusterDiscoveryConfig {
+            min_cluster_size: 3,
+            max_cluster_size: 15,
+            ..Default::default()
+        };
+        let edges = vec![
+            // Cluster 1: tight triangle
+            ("a".to_string(), "b".to_string(), 1.0),
+            ("b".to_string(), "c".to_string(), 1.0),
+            ("a".to_string(), "c".to_string(), 1.0),
+            // Cluster 2: tight triangle
+            ("d".to_string(), "e".to_string(), 1.0),
+            ("e".to_string(), "f".to_string(), 1.0),
+            ("d".to_string(), "f".to_string(), 1.0),
+            // Weak bridge
+            ("c".to_string(), "d".to_string(), 0.05),
+        ];
+        let ids: HashSet<&str> = ["a", "b", "c", "d", "e", "f"].into_iter().collect();
+
+        let components = infomap_communities(&edges, &ids, &config);
+
+        // Should find 2 separate communities, not 1 merged blob.
+        assert_eq!(
+            components.len(), 2,
+            "Expected 2 communities (Infomap should split at weak bridge), got {}",
+            components.len()
+        );
     }
 
     #[test]

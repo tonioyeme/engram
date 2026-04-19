@@ -29,7 +29,6 @@ pub mod conflict;
 pub mod decay;
 pub mod degradation;
 pub mod discovery;
-pub mod embedding;
 pub mod export;
 pub mod feedback;
 pub mod health;

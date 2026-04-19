@@ -89,7 +89,9 @@
 //! ```
 
 pub mod anomaly;
+pub mod association;
 pub mod bus;
+pub mod clustering;
 pub mod compiler;
 pub mod confidence;
 pub mod entities;
@@ -97,17 +99,21 @@ pub mod config;
 pub mod embeddings;
 pub mod extractor;
 pub mod hybrid_search;
+pub mod interoceptive;
 pub mod memory;
 pub mod models;
 pub mod query_classifier;
 pub mod session_wm;
 pub mod storage;
 pub mod synthesis;
+pub mod triple;
+pub mod triple_extractor;
 pub mod types;
 
 // Re-export main types
 pub use bus::{EmotionalBus, SoulUpdate, HeartbeatUpdate, Drive, HeartbeatTask, Identity, EmotionalTrend, ActionStats, SubscriptionManager, Subscription, Notification, DriveEmbeddings, score_alignment_hybrid};
 pub use config::MemoryConfig;
+pub use config::TripleConfig;
 pub use embeddings::{EmbeddingConfig, EmbeddingProvider, EmbeddingError};
 pub use extractor::{MemoryExtractor, ExtractedFact, AnthropicExtractor, AnthropicExtractorConfig, TokenProvider, OllamaExtractor, OllamaExtractorConfig};
 pub use memory::{Memory, SleepReport, is_insight};
@@ -125,3 +131,5 @@ pub use synthesis::types::{
     SynthesisLlmProvider, MemoryCluster, GateDecision, GateResult,
     ProvenanceRecord, ProvenanceChain, UndoSynthesis,
 };
+pub use triple::{Triple, Predicate, TripleSource};
+pub use triple_extractor::{TripleExtractor, AnthropicTripleExtractor, OllamaTripleExtractor};

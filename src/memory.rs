@@ -60,6 +60,10 @@ pub struct Memory {
     synthesis_settings: Option<crate::synthesis::types::SynthesisSettings>,
     /// Optional LLM provider for synthesis insight generation
     synthesis_llm_provider: Option<Box<dyn crate::synthesis::types::SynthesisLlmProvider>>,
+    /// Interoceptive hub for unified internal state monitoring
+    interoceptive_hub: crate::interoceptive::InteroceptiveHub,
+    /// Optional LLM-based triple extractor for knowledge graph enrichment
+    triple_extractor: Option<Box<dyn crate::triple_extractor::TripleExtractor>>,
 }
 
 impl Memory {
@@ -101,6 +105,8 @@ impl Memory {
             entity_extractor,
             synthesis_settings: None,
             synthesis_llm_provider: None,
+            interoceptive_hub: crate::interoceptive::InteroceptiveHub::new(),
+            triple_extractor: None,
         };
         
         // Auto-configure extractor from environment/config
@@ -147,6 +153,8 @@ impl Memory {
             entity_extractor,
             synthesis_settings: None,
             synthesis_llm_provider: None,
+            interoceptive_hub: crate::interoceptive::InteroceptiveHub::new(),
+            triple_extractor: None,
         };
         
         // Auto-configure extractor from environment/config
@@ -194,6 +202,8 @@ impl Memory {
             entity_extractor,
             synthesis_settings: None,
             synthesis_llm_provider: None,
+            interoceptive_hub: crate::interoceptive::InteroceptiveHub::new(),
+            triple_extractor: None,
         };
         
         // Auto-configure extractor from environment/config
@@ -246,6 +256,8 @@ impl Memory {
             entity_extractor,
             synthesis_settings: None,
             synthesis_llm_provider: None,
+            interoceptive_hub: crate::interoceptive::InteroceptiveHub::new(),
+            triple_extractor: None,
         };
         
         // Auto-configure extractor from environment/config
@@ -262,6 +274,155 @@ impl Memory {
     /// Get a mutable reference to the Emotional Bus, if attached.
     pub fn emotional_bus_mut(&mut self) -> Option<&mut EmotionalBus> {
         self.emotional_bus.as_mut()
+    }
+
+    // ── Interoceptive Hub API ─────────────────────────────────────────
+
+    /// Get a reference to the interoceptive hub.
+    pub fn interoceptive_hub(&self) -> &crate::interoceptive::InteroceptiveHub {
+        &self.interoceptive_hub
+    }
+
+    /// Get a mutable reference to the interoceptive hub.
+    pub fn interoceptive_hub_mut(&mut self) -> &mut crate::interoceptive::InteroceptiveHub {
+        &mut self.interoceptive_hub
+    }
+
+    /// Take a snapshot of the current interoceptive state.
+    ///
+    /// Returns the integrated state across all domains — suitable for
+    /// injection into system prompts or inspection.
+    pub fn interoceptive_snapshot(&self) -> crate::interoceptive::InteroceptiveState {
+        self.interoceptive_hub.current_state()
+    }
+
+    /// Run an interoceptive tick: pull signals from all attached subsystems
+    /// and feed them into the hub.
+    ///
+    /// Call this periodically (e.g., every heartbeat or every N messages)
+    /// to keep the interoceptive state current.
+    pub fn interoceptive_tick(&mut self) {
+        use crate::bus::accumulator::EmotionalAccumulator;
+        use crate::bus::feedback::BehaviorFeedback;
+        use crate::interoceptive::InteroceptiveSignal;
+
+        let mut signals: Vec<InteroceptiveSignal> = Vec::new();
+
+        // Pull from DB-backed subsystems via the storage connection.
+        let conn = self.storage.connection();
+
+        // Accumulator: pull all emotional trends.
+        if let Ok(acc) = EmotionalAccumulator::new(conn) {
+            if let Ok(trends) = acc.get_all_trends() {
+                for trend in &trends {
+                    if let Ok(Some(sig)) = acc.to_signal(&trend.domain) {
+                        signals.push(sig);
+                    }
+                }
+            }
+        }
+
+        // Feedback: pull all action stats.
+        if let Ok(fb) = BehaviorFeedback::new(conn) {
+            if let Ok(stats) = fb.get_all_action_stats() {
+                for stat in &stats {
+                    if let Ok(Some(sig)) = fb.to_signal(&stat.action) {
+                        signals.push(sig);
+                    }
+                }
+            }
+        }
+
+        // Alignment: generate signal if emotional bus is attached (has drives).
+        // Note: alignment is content-dependent, so we skip it in tick.
+        // It's triggered per-interaction instead.
+
+        // Feed all collected signals into the hub.
+        if !signals.is_empty() {
+            log::debug!("Interoceptive tick: processing {} signals", signals.len());
+            self.interoceptive_hub.process_batch(signals);
+        }
+    }
+
+    /// Broadcast memory admission to the interoceptive hub (GWT global workspace).
+    ///
+    /// When memories enter working memory (via recall), this broadcasts
+    /// signals to the hub for integration. Implements Baars' Global Workspace
+    /// Theory: working memory contents are "broadcast" to all cognitive modules.
+    ///
+    /// For each admitted memory:
+    /// 1. Generate a confidence signal (metacognitive assessment)
+    /// 2. Check drive alignment if emotional bus is attached
+    /// 3. Spread activation to Hebbian neighbors (associative priming)
+    ///
+    /// Returns the IDs of Hebbian neighbors activated (for potential WM boosting).
+    pub fn broadcast_admission(
+        &mut self,
+        memory_ids: &[String],
+        session_wm: &mut SessionWorkingMemory,
+    ) -> Vec<String> {
+        use crate::interoceptive::InteroceptiveSignal;
+
+        let mut signals: Vec<InteroceptiveSignal> = Vec::new();
+        let mut neighbor_ids: Vec<String> = Vec::new();
+
+        for memory_id in memory_ids {
+            // Fetch the memory record for signal generation.
+            let record = match self.storage.get(memory_id) {
+                Ok(Some(r)) => r,
+                _ => continue,
+            };
+
+            // 1. Confidence signal — metacognitive assessment of this memory.
+            let conf_signal = crate::confidence::confidence_to_signal(&record, None, None);
+            signals.push(conf_signal);
+
+            // 2. Alignment signal — does this memory align with core drives?
+            if let Some(ref bus) = self.emotional_bus {
+                let drives = bus.drives();
+                if !drives.is_empty() {
+                    let align_signal =
+                        crate::bus::alignment::alignment_to_signal(&record.content, drives);
+                    signals.push(align_signal);
+                }
+            }
+
+            // 3. Spreading activation — Hebbian neighbors get primed.
+            if self.config.hebbian_enabled {
+                if let Ok(neighbors) = self.storage.get_hebbian_links_weighted(memory_id) {
+                    for (neighbor_id, weight) in &neighbors {
+                        // Only spread to neighbors with meaningful link strength.
+                        if *weight > 0.1 {
+                            neighbor_ids.push(neighbor_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Feed all broadcast signals into the hub.
+        if !signals.is_empty() {
+            log::debug!(
+                "GWT broadcast: {} memories → {} signals",
+                memory_ids.len(),
+                signals.len()
+            );
+            self.interoceptive_hub.process_batch(signals);
+        }
+
+        // Boost Hebbian neighbors in working memory (associative priming).
+        // This implements spreading activation: memories connected to the
+        // admitted ones get a small activation boost in WM.
+        if !neighbor_ids.is_empty() {
+            neighbor_ids.dedup();
+            session_wm.activate(&neighbor_ids);
+            log::debug!(
+                "GWT spreading activation: {} Hebbian neighbors primed",
+                neighbor_ids.len()
+            );
+        }
+
+        neighbor_ids
     }
     
     /// Get a reference to the underlying storage connection.
@@ -310,6 +471,11 @@ impl Memory {
     /// but skips LLM insight generation (graceful degradation).
     pub fn set_synthesis_llm_provider(&mut self, provider: Box<dyn crate::synthesis::types::SynthesisLlmProvider>) {
         self.synthesis_llm_provider = Some(provider);
+    }
+
+    /// Set the LLM triple extractor for knowledge graph enrichment during consolidation.
+    pub fn set_triple_extractor(&mut self, extractor: Box<dyn crate::triple_extractor::TripleExtractor>) {
+        self.triple_extractor = Some(extractor);
     }
     
     /// Remove the memory extractor (revert to storing raw content).
@@ -679,6 +845,12 @@ impl Memory {
         self.storage.add(&record, ns)?;
         
         // Step 4: Store pre-computed embedding (avoid double-embed)
+        // Keep a reference for Step 6 (association discovery) before consuming
+        let embedding_for_assoc: Option<Vec<f32>> = if self.config.association.enabled {
+            pre_embedding.clone()
+        } else {
+            None
+        };
         if let Some(embedding) = pre_embedding {
             self.storage.store_embedding(
                 &id,
@@ -725,6 +897,71 @@ impl Memory {
                         log::warn!("Failed to upsert entity relation: {}", e);
                     }
                 }
+            }
+        }
+
+        // Step 6: Association discovery (multi-signal Hebbian)
+        if self.config.association.enabled {
+            let start = std::time::Instant::now();
+
+            // Collect entity names for signal computation
+            let entity_names: Vec<String> = if self.config.entity_config.enabled {
+                self.entity_extractor.extract(content)
+                    .into_iter()
+                    .map(|e| e.normalized)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // created_at as f64 timestamp (same format as storage)
+            let created_at_f64 = record.created_at.timestamp() as f64
+                + record.created_at.timestamp_subsec_nanos() as f64 / 1_000_000_000.0;
+
+            let selector = crate::association::CandidateSelector::new(&self.storage);
+            match selector.select_candidates(
+                &id,
+                created_at_f64,
+                &entity_names,
+                embedding_for_assoc.as_deref(),
+                &self.config.association,
+            ) {
+                Ok(candidates) if !candidates.is_empty() => {
+                    let former = crate::association::LinkFormer::new(&self.storage);
+                    match former.discover_associations(
+                        &id,
+                        candidates,
+                        &entity_names,
+                        embedding_for_assoc.as_deref(),
+                        created_at_f64,
+                        &self.config.association,
+                        ns,
+                    ) {
+                        Ok(n) => {
+                            if n > 0 {
+                                log::debug!(
+                                    "Association discovery: created {} links for memory {}",
+                                    n, &id
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Association discovery failed: {}", e);
+                        }
+                    }
+                }
+                Ok(_) => {} // No candidates found
+                Err(e) => {
+                    log::warn!("Association candidate selection failed: {}", e);
+                }
+            }
+
+            let elapsed = start.elapsed();
+            if elapsed > std::time::Duration::from_millis(100) {
+                log::warn!(
+                    "Association discovery took {:?} — consider tuning candidate_limit",
+                    elapsed
+                );
             }
         }
         
@@ -1367,7 +1604,16 @@ impl Memory {
 
         // Decay Hebbian links
         if self.config.hebbian_enabled {
-            self.storage.decay_hebbian_links(self.config.hebbian_decay)?;
+            if self.config.association.enabled {
+                // Differential decay: co-recall links decay slowest, multi medium, single fastest
+                self.storage.decay_hebbian_links_differential(
+                    self.config.association.decay_corecall,
+                    self.config.association.decay_multi,
+                    self.config.association.decay_single,
+                )?;
+            } else {
+                self.storage.decay_hebbian_links(self.config.hebbian_decay)?;
+            }
         }
 
         // Run synthesis if enabled (GUARD-3: opt-in, backward compatible)
@@ -1393,6 +1639,79 @@ impl Memory {
                     }
                 }
                 self.restore_llm_provider(engine.into_provider());
+            }
+        }
+
+        // [ISS-016] Triple extraction phase (cold path, no DB lock during LLM calls)
+        if self.config.triple.enabled {
+            if self.triple_extractor.is_some() {
+                if let Err(e) = self.run_triple_extraction() {
+                    log::warn!("Triple extraction failed (non-fatal): {e}");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Run triple extraction on un-enriched memories.
+    /// Called during consolidation when triple extraction is enabled.
+    /// Uses lock-release-lock pattern to avoid holding DB lock during LLM calls.
+    fn run_triple_extraction(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let batch_size = self.config.triple.batch_size;
+        let max_retries = self.config.triple.max_retries;
+
+        // Step 1: Query un-enriched memories
+        let memory_ids = self.storage.get_unenriched_memory_ids(batch_size, max_retries)?;
+        if memory_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Step 2: Read memory content (batch read)
+        let mut memory_texts: Vec<(String, String)> = Vec::new();
+        for id in &memory_ids {
+            if let Ok(Some(record)) = self.storage.get(id) {
+                memory_texts.push((id.clone(), record.content.clone()));
+            }
+        }
+
+        // Step 3: LLM extraction — NO DB lock held
+        let extractor = self.triple_extractor.as_ref().unwrap(); // caller checks this
+        let mut results: Vec<(String, Result<Vec<crate::triple::Triple>, Box<dyn std::error::Error + Send + Sync>>)> = Vec::new();
+        for (id, content) in &memory_texts {
+            let result = extractor.extract_triples(content);
+            results.push((id.clone(), result));
+        }
+
+        // Step 4: Store results in a transaction
+        self.storage.begin_transaction()?;
+        let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            for (id, result) in &results {
+                match result {
+                    Ok(triples) if !triples.is_empty() => {
+                        self.storage.store_triples(id, triples)?;
+                        log::debug!("Extracted {} triples for memory {}", triples.len(), id);
+                    }
+                    Ok(_) => {
+                        // Empty triples — mark as attempted
+                        self.storage.increment_extraction_attempts(id)?;
+                    }
+                    Err(e) => {
+                        log::warn!("Triple extraction failed for {}: {}", id, e);
+                        self.storage.increment_extraction_attempts(id)?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        match write_result {
+            Ok(()) => {
+                self.storage.commit_transaction()?;
+            }
+            Err(e) => {
+                let _ = self.storage.rollback_transaction();
+                log::warn!("Triple storage failed (non-fatal): {}", e);
             }
         }
 
@@ -1933,6 +2252,10 @@ impl Memory {
                 .collect();
             session_wm.activate_with_scores(&entries);
             session_wm.set_query(query);
+
+            // GWT broadcast: admitted memories → interoceptive hub + Hebbian spreading.
+            let admitted_ids: Vec<String> = results.iter().map(|r| r.record.id.clone()).collect();
+            self.broadcast_admission(&admitted_ids, session_wm);
             
             Ok(SessionRecallResult {
                 results,
@@ -1992,6 +2315,10 @@ impl Memory {
             let result_ids: Vec<String> = cached_results.iter().map(|r| r.record.id.clone()).collect();
             session_wm.activate(&result_ids);
             session_wm.set_query(query);
+
+            // GWT broadcast on cached path too — re-activation reinforces the hub state.
+            // (Lighter than full-recall broadcast: same memories, but keeps hub current.)
+            self.broadcast_admission(&result_ids, session_wm);
             
             Ok(SessionRecallResult {
                 results: cached_results,
@@ -3402,5 +3729,137 @@ mod confidence_tests {
         assert_eq!(analysis.weight_modifiers.actr, 1.0);
         assert_eq!(analysis.weight_modifiers.temporal, 1.0);
         assert_eq!(analysis.weight_modifiers.hebbian, 1.0);
+    }
+
+    // ── GWT Broadcast Tests ───────────────────────────────────────
+
+    #[test]
+    fn test_broadcast_admission_generates_confidence_signals() {
+        let mut mem = Memory::new(":memory:", None).unwrap();
+        let mut wm = SessionWorkingMemory::default();
+
+        // Store a memory so we have something to broadcast.
+        let id = mem
+            .add("Rust is a systems programming language", MemoryType::Factual, Some(0.5), None, None)
+            .unwrap();
+
+        // Hub should be empty before broadcast.
+        assert_eq!(mem.interoceptive_hub().buffer_len(), 0);
+
+        // Broadcast the memory admission.
+        mem.broadcast_admission(&[id], &mut wm);
+
+        // Hub should now have at least one signal (confidence).
+        // No emotional bus → no alignment signal, but confidence is always generated.
+        assert!(
+            mem.interoceptive_hub().buffer_len() >= 1,
+            "expected ≥1 signal in hub, got {}",
+            mem.interoceptive_hub().buffer_len()
+        );
+    }
+
+    #[test]
+    fn test_broadcast_admission_multiple_memories() {
+        let mut mem = Memory::new(":memory:", None).unwrap();
+        let mut wm = SessionWorkingMemory::default();
+
+        let id1 = mem
+            .add("First memory about coding", MemoryType::Factual, Some(0.5), None, None)
+            .unwrap();
+        let id2 = mem
+            .add("Second memory about trading", MemoryType::Factual, Some(0.6), None, None)
+            .unwrap();
+        let id3 = mem
+            .add("Third memory about research", MemoryType::Factual, Some(0.7), None, None)
+            .unwrap();
+
+        mem.broadcast_admission(&[id1, id2, id3], &mut wm);
+
+        // Each memory generates at least 1 confidence signal → ≥3.
+        assert!(
+            mem.interoceptive_hub().buffer_len() >= 3,
+            "expected ≥3 signals, got {}",
+            mem.interoceptive_hub().buffer_len()
+        );
+    }
+
+    #[test]
+    fn test_broadcast_with_nonexistent_memory_is_safe() {
+        let mut mem = Memory::new(":memory:", None).unwrap();
+        let mut wm = SessionWorkingMemory::default();
+
+        // Broadcast a memory that doesn't exist — should not panic.
+        let neighbors = mem.broadcast_admission(&["nonexistent-id".to_string()], &mut wm);
+        assert!(neighbors.is_empty());
+        assert_eq!(mem.interoceptive_hub().buffer_len(), 0);
+    }
+
+    #[test]
+    fn test_broadcast_updates_hub_domain_state() {
+        let mut mem = Memory::new(":memory:", None).unwrap();
+        let mut wm = SessionWorkingMemory::default();
+
+        // Store multiple memories and broadcast them.
+        let id1 = mem
+            .add("Important fact about Rust", MemoryType::Factual, Some(0.8), None, None)
+            .unwrap();
+        let id2 = mem
+            .add("Another fact about memory", MemoryType::Factual, Some(0.3), None, None)
+            .unwrap();
+
+        mem.broadcast_admission(&[id1, id2], &mut wm);
+
+        // Hub should have processed signals and have some state.
+        let state = mem.interoceptive_snapshot();
+        assert!(state.buffer_size > 0, "hub should have buffered signals");
+    }
+
+    #[test]
+    fn test_broadcast_hebbian_spreading() {
+        // Use raw storage to set up Hebbian links, then verify
+        // broadcast_admission spreads activation.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("broadcast_hebb.db");
+        let mut mem = Memory::new(db.to_str().unwrap(), None).unwrap();
+        let mut wm = SessionWorkingMemory::default();
+
+        // Store two memories.
+        let id_a = mem
+            .add("Memory A about Rust", MemoryType::Factual, Some(0.5), None, None)
+            .unwrap();
+        let id_b = mem
+            .add("Memory B about Rust compilers", MemoryType::Factual, Some(0.5), None, None)
+            .unwrap();
+
+        // Create a Hebbian link by simulating co-recall via the storage layer.
+        // We need to strengthen it enough (weight > 0.1) for spreading to activate.
+        // record_coactivation with threshold=1 → second call forms the link.
+        {
+            // Use recall to trigger co-activation recording (indirect approach).
+            // Or directly use the underlying record_coactivation on Memory.
+            // Since Memory doesn't expose &mut Storage, we'll use a workaround:
+            // call recall with both IDs to trigger Hebbian learning.
+            //
+            // Actually, the cleanest approach: use rusqlite directly on the
+            // connection to insert a Hebbian link for testing purposes.
+            let conn = mem.connection();
+            conn.execute(
+                "INSERT OR REPLACE INTO hebbian_links (source_id, target_id, strength, coactivation_count, created_at) VALUES (?1, ?2, 0.5, 5, ?3)",
+                rusqlite::params![&id_a, &id_b, Utc::now().timestamp() as f64],
+            ).unwrap();
+        }
+
+        // Now broadcast only memory A → should spread to B via Hebbian link.
+        let neighbors = mem.broadcast_admission(&[id_a.clone()], &mut wm);
+
+        // B should appear as a primed neighbor.
+        assert!(
+            neighbors.contains(&id_b),
+            "expected id_b in neighbors, got {:?}",
+            neighbors
+        );
+
+        // B should now be in working memory (primed by spreading activation).
+        assert!(wm.contains(&id_b), "id_b should be in WM after spreading");
     }
 }

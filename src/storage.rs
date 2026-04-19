@@ -5,6 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
 use std::path::Path;
 
 use crate::synthesis::types::{GateScores, ProvenanceRecord};
+use crate::triple::{Triple, Predicate, TripleSource};
 use crate::types::{AclEntry, CrossLink, HebbianLink, MemoryLayer, MergeOutcome, MemoryRecord, MemoryType, Permission};
 
 use std::sync::OnceLock;
@@ -181,6 +182,12 @@ impl Storage {
         
         // Rebuild FTS with CJK tokenization if needed
         Self::rebuild_fts_if_needed(&conn)?;
+        
+        // Run migrations for multi-signal Hebbian columns
+        Self::migrate_hebbian_signals(&conn)?;
+        
+        // Run migrations for triple extraction
+        Self::migrate_triples(&conn)?;
         
         Ok(Self { conn })
     }
@@ -602,7 +609,77 @@ impl Storage {
         Ok(())
     }
 
+    /// Migrate hebbian_links table: add signal_source and signal_detail columns.
+    fn migrate_hebbian_signals(conn: &Connection) -> SqlResult<()> {
+        // Add signal_source column (safe migration: ignore "duplicate column name")
+        match conn.execute(
+            "ALTER TABLE hebbian_links ADD COLUMN signal_source TEXT DEFAULT 'corecall'",
+            [],
+        ) {
+            Ok(_) => {},
+            Err(e) if e.to_string().contains("duplicate column name") => {},
+            Err(e) => return Err(e),
+        }
+        
+        // Add signal_detail column
+        match conn.execute(
+            "ALTER TABLE hebbian_links ADD COLUMN signal_detail TEXT DEFAULT NULL",
+            [],
+        ) {
+            Ok(_) => {},
+            Err(e) if e.to_string().contains("duplicate column name") => {},
+            Err(e) => return Err(e),
+        }
+        
+        // Backfill existing rows
+        conn.execute(
+            "UPDATE hebbian_links SET signal_source = 'corecall' WHERE signal_source IS NULL",
+            [],
+        )?;
+        
+        // Add index for signal_source queries
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_hebbian_signal_source ON hebbian_links(signal_source);"
+        )?;
+        
+        Ok(())
+    }
+    
     /// Migrate entity tables: add unique constraints needed for upsert operations.
+    /// Migrate schema for triple extraction support.
+    fn migrate_triples(conn: &Connection) -> SqlResult<()> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS triples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 1.0,
+                source TEXT NOT NULL DEFAULT 'llm',
+                created_at TEXT NOT NULL,
+                UNIQUE(memory_id, subject, predicate, object)
+            );
+            CREATE INDEX IF NOT EXISTS idx_triples_memory ON triples(memory_id);
+            CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject);
+            CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object);
+            "#
+        )?;
+
+        // Add triple_extraction_attempts column to memories
+        match conn.execute(
+            "ALTER TABLE memories ADD COLUMN triple_extraction_attempts INTEGER NOT NULL DEFAULT 0",
+            [],
+        ) {
+            Ok(_) => {},
+            Err(e) if e.to_string().contains("duplicate column name") => {},
+            Err(e) => return Err(e),
+        }
+
+        Ok(())
+    }
+
     fn migrate_entities(conn: &Connection) -> SqlResult<()> {
         // Add UNIQUE index on entities(name, entity_type, namespace) for deterministic upserts
         conn.execute_batch(
@@ -1180,6 +1257,39 @@ impl Storage {
             [],
         )?;
         
+        Ok(pruned)
+    }
+
+    /// Decay Hebbian links with differential rates based on signal source.
+    ///
+    /// - `corecall` links decay slowest (highest retention)
+    /// - `multi` links decay at medium rate
+    /// - All other signal sources (`entity`, `embedding`, `temporal`) decay fastest
+    ///
+    /// Returns the number of deleted (pruned) links.
+    pub fn decay_hebbian_links_differential(
+        &mut self,
+        decay_corecall: f64,
+        decay_multi: f64,
+        decay_single: f64,
+    ) -> Result<usize, rusqlite::Error> {
+        // Apply differential decay rates based on signal_source
+        self.conn.execute(
+            "UPDATE hebbian_links SET strength = strength * CASE \
+                WHEN signal_source = 'corecall' THEN ?1 \
+                WHEN signal_source = 'multi' THEN ?2 \
+                ELSE ?3 \
+            END \
+            WHERE strength > 0",
+            params![decay_corecall, decay_multi, decay_single],
+        )?;
+
+        // Prune very weak links (same threshold as uniform decay)
+        let pruned = self.conn.execute(
+            "DELETE FROM hebbian_links WHERE strength > 0 AND strength < 0.1",
+            [],
+        )?;
+
         Ok(pruned)
     }
 
@@ -2665,5 +2775,576 @@ impl Storage {
             confidence: row.get(7)?,
             source_original_importance: row.get(8)?,
         })
+    }
+    
+    /// Get entity names associated with a memory.
+    ///
+    /// Joins through `memory_entities` → `entities` to return entity name strings.
+    pub fn get_entities_for_memory(&self, memory_id: &str) -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.name FROM entities e \
+             INNER JOIN memory_entities me ON e.id = me.entity_id \
+             WHERE me.memory_id = ?1"
+        )?;
+        let rows = stmt.query_map(params![memory_id], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// Get the first available embedding for a memory (any model).
+    ///
+    /// Used by association discovery when the caller doesn't know
+    /// which model was used for a specific memory.
+    pub fn get_embedding_for_memory(&self, memory_id: &str) -> Result<Option<Vec<f32>>, rusqlite::Error> {
+        let result: Option<Vec<u8>> = self.conn
+            .query_row(
+                "SELECT embedding FROM memory_embeddings WHERE memory_id = ?1 LIMIT 1",
+                params![memory_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result.map(|bytes| bytes_to_f32_vec(&bytes)))
+    }
+
+    /// Get the created_at timestamp for a memory.
+    ///
+    /// Returns the Unix timestamp (f64) or None if the memory doesn't exist.
+    pub fn get_memory_timestamp(&self, memory_id: &str) -> Result<Option<f64>, rusqlite::Error> {
+        self.conn
+            .query_row(
+                "SELECT created_at FROM memories WHERE id = ?1",
+                params![memory_id],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// Record a write-time discovered association (multi-signal Hebbian link).
+    ///
+    /// Checks for existing link in both directions (source→target OR target→source).
+    /// If exists: updates strength to max(existing, new) and updates signal_source if new is stronger.
+    /// If not: inserts a new link.
+    ///
+    /// Returns `Ok(true)` if a new link was created, `Ok(false)` if an existing link was updated.
+    pub fn record_association(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        strength: f64,
+        signal_source: &str,
+        signal_detail: &str,
+        namespace: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        // Check for existing link (either direction)
+        let existing: Option<(String, String, f64)> = self.conn
+            .query_row(
+                "SELECT source_id, target_id, strength FROM hebbian_links \
+                 WHERE (source_id = ?1 AND target_id = ?2) OR (source_id = ?2 AND target_id = ?1) \
+                 LIMIT 1",
+                params![source_id, target_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        
+        match existing {
+            Some((existing_src, existing_tgt, existing_strength)) => {
+                // Update if new strength is higher
+                let new_strength = existing_strength.max(strength);
+                if strength > existing_strength {
+                    // New link is stronger — update strength and signal_source
+                    self.conn.execute(
+                        "UPDATE hebbian_links SET strength = ?1, signal_source = ?2, signal_detail = ?3 \
+                         WHERE source_id = ?4 AND target_id = ?5",
+                        params![new_strength, signal_source, signal_detail, existing_src, existing_tgt],
+                    )?;
+                } else {
+                    // Just update strength (keep existing signal_source)
+                    self.conn.execute(
+                        "UPDATE hebbian_links SET strength = ?1 \
+                         WHERE source_id = ?2 AND target_id = ?3",
+                        params![new_strength, existing_src, existing_tgt],
+                    )?;
+                }
+                Ok(false)
+            }
+            None => {
+                // Create new link
+                self.conn.execute(
+                    "INSERT INTO hebbian_links (source_id, target_id, strength, coactivation_count, \
+                     created_at, signal_source, signal_detail, namespace) \
+                     VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7)",
+                    params![
+                        source_id,
+                        target_id,
+                        strength,
+                        now_f64(),
+                        signal_source,
+                        signal_detail,
+                        namespace,
+                    ],
+                )?;
+                Ok(true)
+            }
+        }
+    }
+    
+    /// Get memory IDs created since a given timestamp.
+    ///
+    /// Used by candidate selection for temporal window filtering.
+    pub fn get_memory_ids_since(
+        &self,
+        since_timestamp: f64,
+        namespace: &str,
+    ) -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM memories WHERE created_at >= ?1 AND namespace = ?2 \
+             ORDER BY created_at DESC LIMIT 100"
+        )?;
+        let rows = stmt.query_map(params![since_timestamp, namespace], |row| {
+            row.get(0)
+        })?;
+        rows.collect()
+    }
+
+    // ── Triple CRUD (ISS-016) ─────────────────────────────────────────
+
+    /// Store triples for a memory. Duplicate (memory_id, s, p, o) are silently ignored.
+    /// Also inserts triple subjects/objects as entities into memory_entities
+    /// with source='triple' for transparent Hebbian integration.
+    /// Returns the number of triples actually inserted.
+    pub fn store_triples(&self, memory_id: &str, triples: &[Triple]) -> Result<usize, rusqlite::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut inserted = 0;
+        
+        for triple in triples {
+            let rows = self.conn.execute(
+                "INSERT OR IGNORE INTO triples (memory_id, subject, predicate, object, confidence, source, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    memory_id,
+                    triple.subject,
+                    triple.predicate.as_str(),
+                    triple.object,
+                    triple.confidence,
+                    match &triple.source {
+                        TripleSource::Llm => "llm",
+                        TripleSource::Rule => "rule",
+                        TripleSource::Manual => "manual",
+                    },
+                    now,
+                ],
+            )?;
+            if rows > 0 {
+                inserted += 1;
+                // Insert subject and object as entities for Hebbian integration
+                self.insert_triple_entity(memory_id, &triple.subject)?;
+                self.insert_triple_entity(memory_id, &triple.object)?;
+            }
+        }
+        
+        Ok(inserted)
+    }
+    
+    /// Insert a triple-derived entity into entities + memory_entities tables.
+    /// Uses deterministic ID from entity name hash.
+    fn insert_triple_entity(&self, memory_id: &str, entity_name: &str) -> Result<(), rusqlite::Error> {
+        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+        
+        let name_lower = entity_name.to_lowercase();
+        let mut hasher = DefaultHasher::new();
+        name_lower.hash(&mut hasher);
+        let entity_id = format!("triple-{:x}", hasher.finish());
+        
+        let now = datetime_to_f64(&chrono::Utc::now());
+        
+        // Upsert into entities table
+        self.conn.execute(
+            "INSERT OR IGNORE INTO entities (id, name, entity_type, namespace, metadata, created_at, updated_at) \
+             VALUES (?1, ?2, 'concept', 'triple', '{}', ?3, ?3)",
+            params![entity_id, name_lower, now],
+        )?;
+        
+        // Link to memory
+        self.conn.execute(
+            "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, role) VALUES (?1, ?2, 'triple')",
+            params![memory_id, entity_id],
+        )?;
+        
+        Ok(())
+    }
+    
+    /// Get triples for a memory.
+    pub fn get_triples(&self, memory_id: &str) -> Result<Vec<Triple>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT subject, predicate, object, confidence, source FROM triples WHERE memory_id = ?1"
+        )?;
+        let rows = stmt.query_map(params![memory_id], |row| {
+            let subject: String = row.get(0)?;
+            let predicate_str: String = row.get(1)?;
+            let object: String = row.get(2)?;
+            let confidence: f64 = row.get(3)?;
+            let source_str: String = row.get(4)?;
+            
+            let predicate = Predicate::from_str_lossy(&predicate_str);
+            let source = match source_str.as_str() {
+                "rule" => TripleSource::Rule,
+                "manual" => TripleSource::Manual,
+                _ => TripleSource::Llm,
+            };
+            
+            Ok(Triple {
+                subject,
+                predicate,
+                object,
+                confidence: confidence.clamp(0.0, 1.0),
+                source,
+            })
+        })?;
+        rows.collect()
+    }
+    
+    /// Check if a memory has triples already extracted.
+    pub fn has_triples(&self, memory_id: &str) -> Result<bool, rusqlite::Error> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM triples WHERE memory_id = ?1",
+            params![memory_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+    
+    /// Get memory IDs that need triple extraction (no triples, retry_count < max).
+    pub fn get_unenriched_memory_ids(&self, limit: usize, max_retries: u32) -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM memories \
+             WHERE id NOT IN (SELECT DISTINCT memory_id FROM triples) \
+               AND triple_extraction_attempts < ?1 \
+             ORDER BY created_at DESC \
+             LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(params![max_retries, limit], |row| row.get(0))?;
+        rows.collect()
+    }
+    
+    /// Increment the extraction attempt counter for a memory.
+    pub fn increment_extraction_attempts(&self, memory_id: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE memories SET triple_extraction_attempts = triple_extraction_attempts + 1 WHERE id = ?1",
+            params![memory_id],
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{MemoryLayer, MemoryRecord, MemoryType};
+
+    fn test_storage() -> Storage {
+        Storage::new(":memory:").expect("in-memory storage")
+    }
+
+    fn make_record(id: &str, content: &str, created_at: DateTime<Utc>) -> MemoryRecord {
+        MemoryRecord {
+            id: id.to_string(),
+            content: content.to_string(),
+            memory_type: MemoryType::Factual,
+            layer: MemoryLayer::Working,
+            created_at,
+            access_times: vec![created_at],
+            working_strength: 1.0,
+            core_strength: 0.0,
+            importance: 0.5,
+            pinned: false,
+            consolidation_count: 0,
+            last_consolidated: None,
+            source: String::new(),
+            contradicts: None,
+            contradicted_by: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_record_association_new() {
+        let storage = test_storage();
+        // Need to create memories first for FK constraints
+        let mut storage_mut = Storage::new(":memory:").unwrap();
+        let now = Utc::now();
+        let m1 = make_record("mem_a", "memory about cats", now);
+        let m2 = make_record("mem_b", "memory about dogs", now);
+        storage_mut.add(&m1, "default").unwrap();
+        storage_mut.add(&m2, "default").unwrap();
+
+        let created = storage_mut
+            .record_association("mem_a", "mem_b", 0.5, "entity", r#"{"entity_overlap":0.4}"#, "default")
+            .unwrap();
+        assert!(created, "should create new link");
+
+        // Verify the link exists with correct columns
+        let row: (f64, String, String) = storage_mut.connection().query_row(
+            "SELECT strength, signal_source, signal_detail FROM hebbian_links WHERE source_id = 'mem_a' AND target_id = 'mem_b'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert!((row.0 - 0.5).abs() < f64::EPSILON);
+        assert_eq!(row.1, "entity");
+        assert_eq!(row.2, r#"{"entity_overlap":0.4}"#);
+    }
+
+    #[test]
+    fn test_record_association_duplicate() {
+        let mut storage = test_storage();
+        let now = Utc::now();
+        let m1 = make_record("mem_a", "memory about cats", now);
+        let m2 = make_record("mem_b", "memory about dogs", now);
+        storage.add(&m1, "default").unwrap();
+        storage.add(&m2, "default").unwrap();
+
+        // First insertion
+        let created1 = storage
+            .record_association("mem_a", "mem_b", 0.5, "entity", "{}", "default")
+            .unwrap();
+        assert!(created1);
+
+        // Second insertion of same pair — should update, not create
+        let created2 = storage
+            .record_association("mem_a", "mem_b", 0.3, "temporal", "{}", "default")
+            .unwrap();
+        assert!(!created2, "should not create duplicate");
+
+        // Verify only one row exists
+        let count: i64 = storage.connection().query_row(
+            "SELECT COUNT(*) FROM hebbian_links WHERE \
+             (source_id = 'mem_a' AND target_id = 'mem_b') OR \
+             (source_id = 'mem_b' AND target_id = 'mem_a')",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_record_association_bidirectional() {
+        let mut storage = test_storage();
+        let now = Utc::now();
+        let m1 = make_record("mem_a", "memory about cats", now);
+        let m2 = make_record("mem_b", "memory about dogs", now);
+        storage.add(&m1, "default").unwrap();
+        storage.add(&m2, "default").unwrap();
+
+        // A → B
+        let created1 = storage
+            .record_association("mem_a", "mem_b", 0.5, "entity", "{}", "default")
+            .unwrap();
+        assert!(created1);
+
+        // B → A should detect existing link and not create duplicate
+        let created2 = storage
+            .record_association("mem_b", "mem_a", 0.6, "multi", "{}", "default")
+            .unwrap();
+        assert!(!created2, "B→A should not create duplicate when A→B exists");
+
+        // Verify only one row total
+        let count: i64 = storage.connection().query_row(
+            "SELECT COUNT(*) FROM hebbian_links WHERE \
+             (source_id = 'mem_a' AND target_id = 'mem_b') OR \
+             (source_id = 'mem_b' AND target_id = 'mem_a')",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+
+        // Strength should be updated to max(0.5, 0.6) = 0.6
+        let strength: f64 = storage.connection().query_row(
+            "SELECT strength FROM hebbian_links WHERE source_id = 'mem_a' AND target_id = 'mem_b'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!((strength - 0.6).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_decay_differential_rates() {
+        let mut storage = test_storage();
+        let now = Utc::now();
+
+        // Create three memories
+        for id in &["m1", "m2", "m3", "m4", "m5", "m6"] {
+            let rec = make_record(id, &format!("memory {}", id), now);
+            storage.add(&rec, "default").unwrap();
+        }
+
+        // Create links with different signal_sources, all starting at strength 1.0
+        let now_f64 = now.timestamp() as f64;
+        storage.connection().execute(
+            "INSERT INTO hebbian_links (source_id, target_id, strength, coactivation_count, created_at, signal_source, namespace) \
+             VALUES ('m1', 'm2', 1.0, 1, ?1, 'corecall', 'default')",
+            params![now_f64],
+        ).unwrap();
+        storage.connection().execute(
+            "INSERT INTO hebbian_links (source_id, target_id, strength, coactivation_count, created_at, signal_source, namespace) \
+             VALUES ('m3', 'm4', 1.0, 1, ?1, 'multi', 'default')",
+            params![now_f64],
+        ).unwrap();
+        storage.connection().execute(
+            "INSERT INTO hebbian_links (source_id, target_id, strength, coactivation_count, created_at, signal_source, namespace) \
+             VALUES ('m5', 'm6', 1.0, 1, ?1, 'entity', 'default')",
+            params![now_f64],
+        ).unwrap();
+
+        // Apply differential decay
+        storage.decay_hebbian_links_differential(0.95, 0.90, 0.85).unwrap();
+
+        // Check strengths
+        let get_strength = |src: &str, tgt: &str| -> f64 {
+            storage.connection().query_row(
+                "SELECT strength FROM hebbian_links WHERE source_id = ?1 AND target_id = ?2",
+                params![src, tgt],
+                |row| row.get(0),
+            ).unwrap()
+        };
+
+        let corecall_str = get_strength("m1", "m2");
+        let multi_str = get_strength("m3", "m4");
+        let entity_str = get_strength("m5", "m6");
+
+        assert!((corecall_str - 0.95).abs() < 1e-9, "corecall should be 0.95, got {}", corecall_str);
+        assert!((multi_str - 0.90).abs() < 1e-9, "multi should be 0.90, got {}", multi_str);
+        assert!((entity_str - 0.85).abs() < 1e-9, "entity should be 0.85, got {}", entity_str);
+
+        // Verify ordering: corecall > multi > entity (differential rates)
+        assert!(corecall_str > multi_str);
+        assert!(multi_str > entity_str);
+    }
+
+    #[test]
+    fn test_decay_differential_deletes_weak() {
+        let mut storage = test_storage();
+        let now = Utc::now();
+
+        // Create memories
+        for id in &["m1", "m2", "m3", "m4"] {
+            let rec = make_record(id, &format!("memory {}", id), now);
+            storage.add(&rec, "default").unwrap();
+        }
+
+        let now_f64 = now.timestamp() as f64;
+        // Create a weak entity link (strength 0.11 — just above threshold)
+        storage.connection().execute(
+            "INSERT INTO hebbian_links (source_id, target_id, strength, coactivation_count, created_at, signal_source, namespace) \
+             VALUES ('m1', 'm2', 0.11, 1, ?1, 'entity', 'default')",
+            params![now_f64],
+        ).unwrap();
+        // Create a stronger corecall link
+        storage.connection().execute(
+            "INSERT INTO hebbian_links (source_id, target_id, strength, coactivation_count, created_at, signal_source, namespace) \
+             VALUES ('m3', 'm4', 0.5, 1, ?1, 'corecall', 'default')",
+            params![now_f64],
+        ).unwrap();
+
+        // Decay: entity link → 0.11 * 0.85 = 0.0935 < 0.1 → should be deleted
+        // corecall link → 0.5 * 0.95 = 0.475 → should survive
+        let deleted = storage.decay_hebbian_links_differential(0.95, 0.90, 0.85).unwrap();
+        assert_eq!(deleted, 1, "should delete 1 weak link");
+
+        // Verify entity link is gone
+        let count: i64 = storage.connection().query_row(
+            "SELECT COUNT(*) FROM hebbian_links WHERE source_id = 'm1' AND target_id = 'm2'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 0, "weak entity link should be deleted");
+
+        // Verify corecall link survives
+        let count: i64 = storage.connection().query_row(
+            "SELECT COUNT(*) FROM hebbian_links WHERE source_id = 'm3' AND target_id = 'm4'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1, "strong corecall link should survive");
+    }
+
+    #[test]
+    fn test_hebbian_signal_migration_fresh_db() {
+        // Fresh DB should have signal_source and signal_detail columns
+        let storage = test_storage();
+        let has_signal_source: bool = storage.connection().query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('hebbian_links') WHERE name='signal_source'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(has_signal_source, "signal_source column should exist on fresh DB");
+
+        let has_signal_detail: bool = storage.connection().query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('hebbian_links') WHERE name='signal_detail'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(has_signal_detail, "signal_detail column should exist on fresh DB");
+
+        // Index should exist
+        let has_index: bool = storage.connection().query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name='idx_hebbian_signal_source'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(has_index, "idx_hebbian_signal_source index should exist");
+    }
+
+    #[test]
+    fn test_hebbian_signal_migration_idempotent() {
+        // Running migration twice should not fail
+        let storage = test_storage();
+        // Migration already ran in Storage::new(). Run it again manually.
+        Storage::migrate_hebbian_signals(storage.connection()).unwrap();
+        // And a third time for good measure
+        Storage::migrate_hebbian_signals(storage.connection()).unwrap();
+
+        let has_signal_source: bool = storage.connection().query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('hebbian_links') WHERE name='signal_source'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(has_signal_source);
+    }
+
+    #[test]
+    fn test_hebbian_signal_migration_backfills_existing_rows() {
+        // Create a DB, insert a hebbian_link without signal_source, then migrate
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;").unwrap();
+        Storage::create_schema(&conn).unwrap();
+        Storage::migrate_v2(&conn).unwrap();
+
+        // Insert two memories for FK constraints
+        let now = now_f64();
+        conn.execute(
+            "INSERT INTO memories (id, content, memory_type, layer, created_at, namespace) VALUES ('m1', 'test1', 'factual', 'working', ?1, 'default')",
+            params![now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO memories (id, content, memory_type, layer, created_at, namespace) VALUES ('m2', 'test2', 'factual', 'working', ?1, 'default')",
+            params![now],
+        ).unwrap();
+
+        // Insert a hebbian_link before migration (signal_source column doesn't exist yet)
+        conn.execute(
+            "INSERT INTO hebbian_links (source_id, target_id, strength, coactivation_count, created_at, namespace) VALUES ('m1', 'm2', 1.0, 3, ?1, 'default')",
+            params![now],
+        ).unwrap();
+
+        // Run migration (adds columns and backfills)
+        Storage::migrate_hebbian_signals(&conn).unwrap();
+
+        // After migration, the row should have signal_source = 'corecall' from backfill
+        // (The ALTER TABLE DEFAULT fills NULL for existing rows, then UPDATE backfills)
+        let source_after: String = conn.query_row(
+            "SELECT signal_source FROM hebbian_links WHERE source_id = 'm1'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(source_after, "corecall", "signal_source should be backfilled to 'corecall'");
     }
 }

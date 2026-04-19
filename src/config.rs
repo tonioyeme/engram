@@ -5,6 +5,78 @@ use serde::{Deserialize, Serialize};
 use crate::embeddings::EmbeddingConfig;
 use crate::entities::EntityConfig;
 
+/// Configuration for LLM-based triple extraction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TripleConfig {
+    /// Enable triple extraction during consolidation
+    pub enabled: bool,
+    /// Number of memories to process per consolidation cycle
+    pub batch_size: usize,
+    /// Maximum extraction attempts before skipping a memory
+    pub max_retries: u32,
+    /// Override model for triple extraction (None = use extractor default)
+    pub model: Option<String>,
+}
+
+impl Default for TripleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            batch_size: 10,
+            max_retries: 3,
+            model: None,
+        }
+    }
+}
+
+/// Configuration for write-time association discovery (multi-signal Hebbian).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssociationConfig {
+    /// Enable/disable write-time association discovery
+    pub enabled: bool,
+    /// Weight for entity overlap signal
+    pub w_entity: f64,
+    /// Weight for embedding similarity signal
+    pub w_embedding: f64,
+    /// Weight for temporal proximity signal
+    pub w_temporal: f64,
+    /// Combined score threshold for link creation
+    pub link_threshold: f64,
+    /// Maximum new links per memory write
+    pub max_links_per_memory: usize,
+    /// Maximum candidates to evaluate
+    pub candidate_limit: usize,
+    /// Temporal window in days for candidate selection
+    pub temporal_window_days: u64,
+    /// Initial strength for write-time discovered links
+    pub initial_strength: f64,
+    /// Decay rate for co-recall links
+    pub decay_corecall: f64,
+    /// Decay rate for multi-signal links
+    pub decay_multi: f64,
+    /// Decay rate for single-signal links
+    pub decay_single: f64,
+}
+
+impl Default for AssociationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            w_entity: 0.3,
+            w_embedding: 0.5,
+            w_temporal: 0.2,
+            link_threshold: 0.4,
+            max_links_per_memory: 5,
+            candidate_limit: 50,
+            temporal_window_days: 7,
+            initial_strength: 0.5,
+            decay_corecall: 0.95,
+            decay_multi: 0.90,
+            decay_single: 0.85,
+        }
+    }
+}
+
 /// All tunable parameters for the Engram memory system.
 ///
 /// Default values come from neuroscience literature (ACT-R, Memory Chain Model,
@@ -143,6 +215,14 @@ pub struct MemoryConfig {
     /// Enable query-type adaptive weight adjustment (default: true)
     #[serde(default = "default_adaptive_weights")]
     pub adaptive_weights: bool,
+
+    /// Write-time association discovery configuration
+    #[serde(default)]
+    pub association: AssociationConfig,
+
+    /// LLM triple extraction configuration
+    #[serde(default)]
+    pub triple: TripleConfig,
 }
 
 fn default_entity_weight() -> f64 {
@@ -233,6 +313,8 @@ impl Default for MemoryConfig {
             temporal_weight: default_temporal_weight(),
             hebbian_recall_weight: default_hebbian_recall_weight(),
             adaptive_weights: default_adaptive_weights(),
+            association: AssociationConfig::default(),
+            triple: TripleConfig::default(),
         }
     }
 }
@@ -316,5 +398,127 @@ impl MemoryConfig {
             forget_threshold: 0.001,
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_triple_config_defaults() {
+        let config = TripleConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.batch_size, 10);
+        assert_eq!(config.max_retries, 3);
+        assert!(config.model.is_none());
+    }
+
+    #[test]
+    fn test_triple_config_serde_roundtrip() {
+        let original = TripleConfig {
+            enabled: true,
+            batch_size: 20,
+            max_retries: 5,
+            model: Some("claude-haiku-4-5-20251001".to_string()),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let deserialized: TripleConfig = serde_json::from_str(&json).expect("deserialize");
+        assert!(deserialized.enabled);
+        assert_eq!(deserialized.batch_size, 20);
+        assert_eq!(deserialized.max_retries, 5);
+        assert_eq!(deserialized.model.as_deref(), Some("claude-haiku-4-5-20251001"));
+    }
+
+    #[test]
+    fn test_memory_config_has_triple() {
+        let config = MemoryConfig::default();
+        assert!(!config.triple.enabled);
+        assert_eq!(config.triple.batch_size, 10);
+    }
+
+    #[test]
+    fn test_association_config_defaults() {
+        let config = AssociationConfig::default();
+        assert!(!config.enabled);
+        assert!((config.w_entity - 0.3).abs() < f64::EPSILON);
+        assert!((config.w_embedding - 0.5).abs() < f64::EPSILON);
+        assert!((config.w_temporal - 0.2).abs() < f64::EPSILON);
+        assert!((config.link_threshold - 0.4).abs() < f64::EPSILON);
+        assert_eq!(config.max_links_per_memory, 5);
+        assert_eq!(config.candidate_limit, 50);
+        assert_eq!(config.temporal_window_days, 7);
+        assert!((config.initial_strength - 0.5).abs() < f64::EPSILON);
+        assert!((config.decay_corecall - 0.95).abs() < f64::EPSILON);
+        assert!((config.decay_multi - 0.90).abs() < f64::EPSILON);
+        assert!((config.decay_single - 0.85).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_memory_config_has_association() {
+        let config = MemoryConfig::default();
+        // Association should be present and disabled by default
+        assert!(!config.association.enabled);
+        assert_eq!(config.association.candidate_limit, 50);
+    }
+
+    #[test]
+    fn test_association_config_serde_roundtrip() {
+        let original = AssociationConfig::default();
+        let json = serde_json::to_string(&original).expect("serialize");
+        let deserialized: AssociationConfig = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(original.enabled, deserialized.enabled);
+        assert!((original.w_entity - deserialized.w_entity).abs() < f64::EPSILON);
+        assert!((original.w_embedding - deserialized.w_embedding).abs() < f64::EPSILON);
+        assert!((original.w_temporal - deserialized.w_temporal).abs() < f64::EPSILON);
+        assert!((original.link_threshold - deserialized.link_threshold).abs() < f64::EPSILON);
+        assert_eq!(original.max_links_per_memory, deserialized.max_links_per_memory);
+        assert_eq!(original.candidate_limit, deserialized.candidate_limit);
+        assert_eq!(original.temporal_window_days, deserialized.temporal_window_days);
+        assert!((original.initial_strength - deserialized.initial_strength).abs() < f64::EPSILON);
+        assert!((original.decay_corecall - deserialized.decay_corecall).abs() < f64::EPSILON);
+        assert!((original.decay_multi - deserialized.decay_multi).abs() < f64::EPSILON);
+        assert!((original.decay_single - deserialized.decay_single).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_association_config_serde_custom_values() {
+        let custom = AssociationConfig {
+            enabled: true,
+            w_entity: 0.5,
+            w_embedding: 0.3,
+            w_temporal: 0.2,
+            link_threshold: 0.6,
+            max_links_per_memory: 10,
+            candidate_limit: 100,
+            temporal_window_days: 14,
+            initial_strength: 0.7,
+            decay_corecall: 0.99,
+            decay_multi: 0.95,
+            decay_single: 0.80,
+        };
+        let json = serde_json::to_string(&custom).expect("serialize");
+        let deserialized: AssociationConfig = serde_json::from_str(&json).expect("deserialize");
+
+        assert!(deserialized.enabled);
+        assert!((deserialized.w_entity - 0.5).abs() < f64::EPSILON);
+        assert_eq!(deserialized.candidate_limit, 100);
+        assert_eq!(deserialized.temporal_window_days, 14);
+    }
+
+    #[test]
+    fn test_memory_config_serde_roundtrip_with_association() {
+        let mut config = MemoryConfig::default();
+        config.association.enabled = true;
+        config.association.link_threshold = 0.6;
+
+        let json = serde_json::to_string(&config).expect("serialize");
+        let deserialized: MemoryConfig = serde_json::from_str(&json).expect("deserialize");
+
+        assert!(deserialized.association.enabled);
+        assert!((deserialized.association.link_threshold - 0.6).abs() < f64::EPSILON);
+        // Other fields preserved
+        assert!((deserialized.mu1 - config.mu1).abs() < f64::EPSILON);
     }
 }

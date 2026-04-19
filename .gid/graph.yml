@@ -843,7 +843,7 @@ nodes:
   priority: 30
 - id: cs-warm-path
   title: 'Warm path: recluster dirty clusters + pending memories'
-  status: todo
+  status: done
   description: '实现 recluster_dirty(): 取 dirty cluster IDs + pending memory IDs → 收集所有相关记忆 → 调 discover_clusters_subset() 局部 Infomap → 更新 assignments + centroids → 清除 dirty/pending 标记。触发条件: 每 100 条新增或 consolidate() 调用时。O(m log m) where m << n。'
   tags:
   - incremental

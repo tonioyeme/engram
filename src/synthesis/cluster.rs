@@ -114,6 +114,22 @@ pub enum HotAssignResult {
     NoClusters,
 }
 
+/// Result of the warm recluster path.
+#[derive(Debug, Clone)]
+pub enum WarmReclusterResult {
+    /// Nothing to do — no dirty clusters and no pending memories.
+    NothingToDo,
+    /// Recluster completed.
+    Reclustered {
+        /// Number of dirty clusters that were reclustered.
+        dirty_clusters: usize,
+        /// Number of pending memories that were included.
+        pending_count: usize,
+        /// Number of new clusters produced.
+        new_clusters: usize,
+    },
+}
+
 /// Cosine similarity between two vectors.
 /// For L2-normalized vectors, this is equivalent to dot product.
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
@@ -181,6 +197,102 @@ pub fn assign_new_memory(
         storage.add_pending_memory(memory_id)?;
         Ok(HotAssignResult::Pending)
     }
+}
+
+// ===========================================================================
+// Warm path: recluster dirty clusters + pending memories
+// ===========================================================================
+
+/// Compute the mean embedding vector for a set of memory IDs.
+/// Skips memories without embeddings. Returns None if no embeddings found.
+fn compute_centroid_embedding(storage: &Storage, member_ids: &[String]) -> Option<Vec<f32>> {
+    let mut sum: Vec<f64> = Vec::new();
+    let mut count = 0usize;
+
+    for mid in member_ids {
+        if let Ok(Some(emb)) = storage.get_embedding_for_memory(mid) {
+            if sum.is_empty() {
+                sum = vec![0.0f64; emb.len()];
+            }
+            if emb.len() == sum.len() {
+                for (s, e) in sum.iter_mut().zip(emb.iter()) {
+                    *s += *e as f64;
+                }
+                count += 1;
+            }
+        }
+    }
+
+    if count == 0 {
+        return None;
+    }
+
+    Some(sum.iter().map(|s| (*s / count as f64) as f32).collect())
+}
+
+/// Warm path: recluster dirty clusters and assign pending memories.
+///
+/// Collects all members of dirty clusters + pending memory IDs,
+/// runs a local `discover_clusters_subset()` on just those memories,
+/// replaces the old cluster assignments with new ones, and clears
+/// dirty/pending flags.
+///
+/// Complexity: O(m log m) where m = dirty members + pending, typically m << n.
+pub fn recluster_dirty(
+    storage: &Storage,
+    config: &ClusterDiscoveryConfig,
+    embedding_model: Option<&str>,
+) -> Result<WarmReclusterResult, Box<dyn std::error::Error>> {
+    // 1. Get dirty cluster IDs + pending memory IDs
+    let dirty_ids = storage.get_dirty_cluster_ids()?;
+    let pending_ids = storage.get_pending_memory_ids()?;
+
+    if dirty_ids.is_empty() && pending_ids.is_empty() {
+        return Ok(WarmReclusterResult::NothingToDo);
+    }
+
+    let pending_count = pending_ids.len();
+
+    // 2. Collect all involved memory IDs
+    let mut involved_ids: Vec<String> = Vec::new();
+    for cid in &dirty_ids {
+        let members = storage.get_cluster_members(cid)?;
+        involved_ids.extend(members);
+    }
+    involved_ids.extend(pending_ids);
+    // Deduplicate (a pending memory might also be in a dirty cluster)
+    involved_ids.sort();
+    involved_ids.dedup();
+
+    // 3. Run local discover_clusters on the subset
+    let local_clusters = discover_clusters_subset(
+        storage,
+        &involved_ids,
+        config,
+        embedding_model,
+    )?;
+
+    // 4. Convert MemoryCluster → (cluster_id, member_ids, centroid_embedding)
+    //    for replace_clusters storage API
+    let new_cluster_data: Vec<(String, Vec<String>, Vec<f32>)> = local_clusters
+        .iter()
+        .filter_map(|mc| {
+            let centroid = compute_centroid_embedding(storage, &mc.members)?;
+            Some((mc.id.clone(), mc.members.clone(), centroid))
+        })
+        .collect();
+
+    let new_clusters_count = new_cluster_data.len();
+
+    // 5. Replace old clusters with new ones + clear dirty/pending
+    storage.replace_clusters(&dirty_ids, &new_cluster_data)?;
+    storage.clear_pending_and_dirty()?;
+
+    Ok(WarmReclusterResult::Reclustered {
+        dirty_clusters: dirty_ids.len(),
+        pending_count,
+        new_clusters: new_clusters_count,
+    })
 }
 
 // ===========================================================================
@@ -1525,6 +1637,96 @@ mod tests {
             HotAssignResult::Pending => {} // expected
             other => panic!("expected Pending, got {:?}", other),
         }
+    }
+
+    // =======================================================================
+    // Warm path recluster_dirty tests
+    // =======================================================================
+
+    #[test]
+    fn test_recluster_dirty_nothing_to_do() {
+        let storage = test_storage();
+        let config = ClusterDiscoveryConfig::default();
+        let result = recluster_dirty(&storage, &config, None).unwrap();
+        match result {
+            WarmReclusterResult::NothingToDo => {} // expected
+            other => panic!("expected NothingToDo, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_recluster_dirty_with_pending() {
+        let mut storage = test_storage();
+        let config = ClusterDiscoveryConfig {
+            cluster_threshold: 0.1,
+            min_cluster_size: 2,
+            min_importance: 0.0,
+            ..Default::default()
+        };
+
+        // Add 4 real MemoryRecord entries
+        let ids: Vec<String> = (0..4).map(|i| format!("mem-{}", i)).collect();
+        for id in &ids {
+            let mut rec = make_test_record(id);
+            rec.importance = 0.5;
+            storage.add(&rec, "default").unwrap();
+        }
+
+        // Store embeddings — two pairs of similar vectors
+        let embeddings: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.9, 0.1, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![0.0, 0.1, 0.9],
+        ];
+        for (id, emb) in ids.iter().zip(embeddings.iter()) {
+            storage.store_embedding(id, emb, "test/model", emb.len()).unwrap();
+        }
+
+        // Add all as pending
+        for id in &ids {
+            storage.add_pending_memory(id).unwrap();
+        }
+
+        let result = recluster_dirty(&storage, &config, Some("test/model")).unwrap();
+        match result {
+            WarmReclusterResult::Reclustered { pending_count, .. } => {
+                assert_eq!(pending_count, 4);
+            }
+            other => panic!("expected Reclustered, got {:?}", other),
+        }
+
+        // Verify pending is cleared
+        let remaining = storage.get_pending_memory_ids().unwrap();
+        assert!(remaining.is_empty(), "pending should be cleared after recluster");
+    }
+
+    #[test]
+    fn test_compute_centroid_embedding() {
+        let mut storage = test_storage();
+
+        // Add two memories with embeddings
+        let r1 = make_test_record("c-1");
+        let r2 = make_test_record("c-2");
+        storage.add(&r1, "default").unwrap();
+        storage.add(&r2, "default").unwrap();
+
+        let emb1 = vec![1.0_f32, 0.0, 0.0];
+        let emb2 = vec![0.0_f32, 1.0, 0.0];
+        storage.store_embedding("c-1", &emb1, "test/model", 3).unwrap();
+        storage.store_embedding("c-2", &emb2, "test/model", 3).unwrap();
+
+        let ids = vec!["c-1".to_string(), "c-2".to_string()];
+        let centroid = compute_centroid_embedding(&storage, &ids).unwrap();
+        // Mean of [1,0,0] and [0,1,0] = [0.5, 0.5, 0.0]
+        assert!((centroid[0] - 0.5).abs() < 1e-6);
+        assert!((centroid[1] - 0.5).abs() < 1e-6);
+        assert!((centroid[2] - 0.0).abs() < 1e-6);
+
+        // No embeddings → None
+        let no_ids = vec!["nonexistent".to_string()];
+        let result = compute_centroid_embedding(&storage, &no_ids);
+        assert!(result.is_none());
     }
 
     #[test]

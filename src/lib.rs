@@ -112,7 +112,9 @@ pub mod triple_extractor;
 pub mod types;
 
 // Re-export main types
-pub use bus::{EmotionalBus, SoulUpdate, HeartbeatUpdate, Drive, HeartbeatTask, Identity, EmotionalTrend, ActionStats, SubscriptionManager, Subscription, Notification, DriveEmbeddings, score_alignment_hybrid};
+pub use bus::{EmpathyBus, SoulUpdate, HeartbeatUpdate, Drive, HeartbeatTask, Identity, EmpathyTrend, ActionStats, SubscriptionManager, Subscription, Notification, DriveEmbeddings, score_alignment_hybrid};
+// Backward-compat aliases
+pub use bus::{EmotionalBus, EmotionalTrend};
 pub use config::MemoryConfig;
 pub use config::TripleConfig;
 pub use embeddings::{EmbeddingConfig, EmbeddingProvider, EmbeddingError};

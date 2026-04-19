@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 /// Which internal monitoring subsystem produced this signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SignalSource {
+    // ── Engram-internal sources ──────────────────────────────────────
     /// Anomaly/baseline tracker — z-score deviations from expected patterns.
     Anomaly,
     /// Emotional accumulator — running valence trends per domain.
@@ -29,6 +30,16 @@ pub enum SignalSource {
     Confidence,
     /// Drive alignment — how well current activity aligns with core drives.
     Alignment,
+
+    // ── Runtime-sourced signals (from host agent) ────────────────────
+    /// Token budget consumption and rate pressure.
+    OperationalLoad,
+    /// Loop depth, retries, tool failure patterns.
+    ExecutionStress,
+    /// Task completion rate, response latency, session coherence.
+    CognitiveFlow,
+    /// Memory utilization, disk I/O, queue depth.
+    ResourcePressure,
 }
 
 impl std::fmt::Display for SignalSource {
@@ -39,6 +50,10 @@ impl std::fmt::Display for SignalSource {
             Self::Feedback => write!(f, "feedback"),
             Self::Confidence => write!(f, "confidence"),
             Self::Alignment => write!(f, "alignment"),
+            Self::OperationalLoad => write!(f, "operational_load"),
+            Self::ExecutionStress => write!(f, "execution_stress"),
+            Self::CognitiveFlow => write!(f, "cognitive_flow"),
+            Self::ResourcePressure => write!(f, "resource_pressure"),
         }
     }
 }
@@ -60,7 +75,7 @@ pub struct InteroceptiveSignal {
 
     /// Affective valence: -1.0 (very negative) to +1.0 (very positive).
     /// Anomaly: negative = deviation from baseline.
-    /// Accumulator: direct emotional valence.
+    /// Accumulator: direct empathy valence.
     /// Feedback: success_rate mapped to [-1, 1].
     /// Confidence: confidence mapped to [-1, 1].
     /// Alignment: alignment score mapped to [-1, 1].
@@ -144,6 +159,36 @@ pub enum SignalContext {
     DriveAlignment {
         content_snippet: String,
         alignment_score: f64,
+    },
+
+    // ── Runtime signal contexts ──────────────────────────────────────
+
+    /// Token budget pressure from host agent.
+    TokenPressure {
+        budget_used_pct: f64,
+        tokens_per_second: f64,
+        budget_runway_secs: f64,
+    },
+
+    /// Execution stress from agentic loop.
+    LoopStress {
+        loop_depth: u32,
+        retry_count: u32,
+        tool_failure_rate: f64,
+        consecutive_failures: u32,
+    },
+
+    /// Cognitive flow from task execution.
+    TaskFlow {
+        task_completion_rate: f64,
+        response_latency_ms: u64,
+        session_duration_secs: u64,
+    },
+
+    /// Resource pressure from system metrics.
+    SystemPressure {
+        disk_free_gb: f64,
+        queue_depth: u32,
     },
 }
 
@@ -229,6 +274,21 @@ impl DomainState {
             SignalSource::Accumulator => {
                 // Accumulator directly contributes to valence_trend (already done above).
             }
+            // Runtime signal sources: all contribute to valence_trend (already done above).
+            // Their specific metrics are carried in SignalContext and affect arousal via the
+            // hub's global_arousal computation. No separate per-domain field needed — the
+            // valence and arousal on the signal itself encode the semantic meaning.
+            SignalSource::OperationalLoad
+            | SignalSource::ExecutionStress
+            | SignalSource::CognitiveFlow
+            | SignalSource::ResourcePressure => {
+                // Valence already updated above. These runtime sources also contribute
+                // to anomaly_level when arousal is high (indicates abnormal operating state).
+                if signal.arousal > 0.5 {
+                    self.anomaly_level =
+                        alpha * signal.arousal * 2.0 + (1.0 - alpha) * self.anomaly_level;
+                }
+            }
         }
 
         self.signal_count += 1;
@@ -247,7 +307,7 @@ pub struct SomaticMarker {
     /// Hash of the situation / context that triggered this marker.
     pub situation_hash: u64,
 
-    /// The average emotional valence associated with this situation.
+    /// The average empathy valence associated with this situation.
     pub valence: f64,
 
     /// How many times this situation has been encountered.

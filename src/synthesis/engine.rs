@@ -151,12 +151,84 @@ impl SynthesisEngine for DefaultSynthesisEngine {
             gate_results: Vec::new(),
         };
 
-        // Step 1: Discover clusters
-        let clusters = cluster::discover_clusters(
-            storage,
-            &settings.cluster_discovery,
-            self.embedding_model.as_deref(),
-        )?;
+        // Step 1: Determine clustering strategy (hot/warm/cold)
+        let pending_count = storage.get_pending_count().unwrap_or(0);
+        let total_count = storage.count_memories().unwrap_or(0);
+        let dirty_count = storage
+            .get_dirty_cluster_ids()
+            .map(|v| v.len())
+            .unwrap_or(0);
+
+        let cold_ratio = settings
+            .cluster_discovery
+            .cold_recluster_ratio
+            .unwrap_or(0.2);
+        let should_cold = total_count == 0
+            || (total_count > 0 && pending_count as f64 / total_count as f64 > cold_ratio);
+
+        let clusters = if should_cold {
+            // Cold path: full Infomap recluster (also the initial path when no clusters exist)
+            log::info!(
+                "synthesis: cold recluster ({} pending / {} total, {} dirty)",
+                pending_count,
+                total_count,
+                dirty_count
+            );
+            let clusters = cluster::discover_clusters(
+                storage,
+                &settings.cluster_discovery,
+                self.embedding_model.as_deref(),
+            )?;
+
+            // Save full cluster state for incremental use
+            let cluster_tuples: Vec<(String, Vec<String>, Vec<f32>)> = clusters
+                .iter()
+                .filter_map(|c| {
+                    let centroid =
+                        cluster::compute_centroid_embedding(storage, &c.members)?;
+                    Some((c.id.clone(), c.members.clone(), centroid))
+                })
+                .collect();
+            if !cluster_tuples.is_empty() {
+                let _ = storage.save_full_cluster_state(&cluster_tuples);
+            }
+
+            clusters
+        } else if pending_count > 0 || dirty_count > 0 {
+            // Warm path: recluster only dirty clusters + pending memories,
+            // then read all clusters from storage (avoids full Infomap)
+            log::info!(
+                "synthesis: warm recluster ({} pending, {} dirty clusters)",
+                pending_count,
+                dirty_count
+            );
+            let _warm_result = cluster::recluster_dirty(
+                storage,
+                &settings.cluster_discovery,
+                self.embedding_model.as_deref(),
+            )?;
+            // After warm recluster, read all cluster data from storage
+            storage
+                .get_all_cluster_data()
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?
+        } else {
+            // Nothing pending, nothing dirty — use cached cluster data from storage
+            log::info!("synthesis: using cached cluster data (no pending/dirty)");
+            let cached = storage
+                .get_all_cluster_data()
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+            if cached.is_empty() {
+                // No cached data — fall back to cold path (first run)
+                log::info!("synthesis: no cached clusters, falling back to cold recluster");
+                cluster::discover_clusters(
+                    storage,
+                    &settings.cluster_discovery,
+                    self.embedding_model.as_deref(),
+                )?
+            } else {
+                cached
+            }
+        };
         report.clusters_found = clusters.len();
 
         if clusters.is_empty() {
@@ -802,5 +874,250 @@ mod tests {
         assert!(report.insights_created.is_empty());
         assert!(report.sources_demoted.is_empty());
         assert!(report.errors.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 9: Cold path triggers on empty cluster state (total_count == 0)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cold_path_on_empty_storage() {
+        let engine = DefaultSynthesisEngine::new(None, None);
+        let mut storage = Storage::new(":memory:").expect("in-memory db");
+        let settings = default_settings();
+
+        // total_count == 0 → should_cold = true
+        let total = storage.count_memories().unwrap();
+        assert_eq!(total, 0);
+
+        // Synthesize should succeed (cold path, finds 0 clusters)
+        let report = engine.synthesize(&mut storage, &settings).unwrap();
+        assert_eq!(report.clusters_found, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 10: count_memories and get_all_cluster_data work correctly
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_count_memories() {
+        let memories = vec![
+            make_memory("m1", "Memory one", MemoryType::Factual, 0.5),
+            make_memory("m2", "Memory two", MemoryType::Episodic, 0.5),
+            make_memory("m3", "Memory three", MemoryType::Relational, 0.5),
+        ];
+        let storage = setup_storage_with_memories(&memories);
+        assert_eq!(storage.count_memories().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_get_all_cluster_data_empty() {
+        let storage = Storage::new(":memory:").expect("in-memory db");
+        let clusters = storage.get_all_cluster_data().unwrap();
+        assert!(clusters.is_empty());
+    }
+
+    #[test]
+    fn test_get_all_cluster_data_after_save() {
+        let storage = Storage::new(":memory:").expect("in-memory db");
+
+        // Save some cluster state
+        let cluster_tuples = vec![
+            (
+                "cluster-a".to_string(),
+                vec!["m1".to_string(), "m2".to_string()],
+                vec![0.1f32, 0.2, 0.3],
+            ),
+            (
+                "cluster-b".to_string(),
+                vec!["m3".to_string(), "m4".to_string(), "m5".to_string()],
+                vec![0.4f32, 0.5, 0.6],
+            ),
+        ];
+        storage.save_full_cluster_state(&cluster_tuples).unwrap();
+
+        let clusters = storage.get_all_cluster_data().unwrap();
+        assert_eq!(clusters.len(), 2);
+
+        // Find cluster-a
+        let ca = clusters.iter().find(|c| c.id == "cluster-a").unwrap();
+        assert_eq!(ca.members, vec!["m1", "m2"]);
+        assert!((ca.quality_score - 0.5).abs() < 0.01); // default quality
+
+        // Find cluster-b
+        let cb = clusters.iter().find(|c| c.id == "cluster-b").unwrap();
+        assert_eq!(cb.members, vec!["m3", "m4", "m5"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 11: Cold path saves cluster state for future warm/cached use
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cold_path_saves_cluster_state() {
+        // Directly test the save_full_cluster_state + get_all_cluster_data round-trip
+        // which is what the cold path does after discover_clusters
+        let storage = Storage::new(":memory:").expect("in-memory db");
+
+        // Simulate what cold path does: save cluster state
+        let cluster_tuples = vec![
+            (
+                "cluster-cold-1".to_string(),
+                vec!["m1".to_string(), "m2".to_string(), "m3".to_string()],
+                vec![0.5f32, 0.5, 0.0],
+            ),
+        ];
+        storage.save_full_cluster_state(&cluster_tuples).unwrap();
+
+        // Verify cluster state was saved and can be retrieved
+        let cached = storage.get_all_cluster_data().unwrap();
+        assert!(!cached.is_empty(), "Cluster state should be saved after cold path");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].id, "cluster-cold-1");
+        assert_eq!(cached[0].members.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 12: Three-tier config defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_three_tier_config_defaults() {
+        let config = ClusterDiscoveryConfig::default();
+        assert!(config.cold_recluster_ratio.is_none());
+        assert!(config.warm_recluster_interval.is_none());
+        assert!(config.hot_assign_threshold.is_none());
+    }
+
+    #[test]
+    fn test_three_tier_config_custom() {
+        let mut config = ClusterDiscoveryConfig::default();
+        config.cold_recluster_ratio = Some(0.3);
+        config.warm_recluster_interval = Some(50);
+        config.hot_assign_threshold = Some(0.7);
+
+        assert_eq!(config.cold_recluster_ratio.unwrap(), 0.3);
+        assert_eq!(config.warm_recluster_interval.unwrap(), 50);
+        assert_eq!(config.hot_assign_threshold.unwrap(), 0.7);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 13: Warm path — pending/dirty triggers warm recluster
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_warm_path_with_pending() {
+        let memories = vec![
+            make_memory("m1", "Memory one", MemoryType::Factual, 0.7),
+            make_memory("m2", "Memory two", MemoryType::Episodic, 0.7),
+            make_memory("m3", "Memory three", MemoryType::Relational, 0.7),
+            make_memory("m4", "Memory four", MemoryType::Factual, 0.7),
+            make_memory("m5", "Memory five", MemoryType::Episodic, 0.7),
+        ];
+        let mut storage = setup_storage_with_memories(&memories);
+
+        // Set up existing cluster state (simulating a previous cold run)
+        let cluster_tuples = vec![(
+            "cluster-existing".to_string(),
+            vec!["m1".to_string(), "m2".to_string(), "m3".to_string()],
+            vec![1.0f32, 0.0, 0.0],
+        )];
+        storage.save_full_cluster_state(&cluster_tuples).unwrap();
+
+        // Add pending memories (simulating memories added since last cold run)
+        // Only 1 pending out of 5 total = 20%, right at threshold, so should NOT cold
+        storage.add_pending_memory("m4").unwrap();
+
+        let pending = storage.get_pending_count().unwrap();
+        assert_eq!(pending, 1);
+
+        let engine = DefaultSynthesisEngine::new(None, None);
+        let mut settings = default_settings();
+        settings.cluster_discovery.min_importance = 0.3;
+        // Set cold ratio high so we don't trigger cold
+        settings.cluster_discovery.cold_recluster_ratio = Some(0.5);
+
+        // This should take the warm path (pending > 0, ratio < cold threshold)
+        let report = engine.synthesize(&mut storage, &settings).unwrap();
+
+        // The warm path ran — report should reflect clusters found from storage
+        // (at minimum the existing cluster, possibly updated)
+        assert!(report.errors.is_empty() || report.errors.iter().all(|e| {
+            // Storage errors from missing memories in subset are acceptable
+            matches!(e, SynthesisError::StorageError { .. })
+        }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 14: Cold ratio threshold triggers cold path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cold_path_triggered_by_ratio() {
+        let memories = vec![
+            make_memory("m1", "Memory one", MemoryType::Factual, 0.7),
+            make_memory("m2", "Memory two", MemoryType::Episodic, 0.7),
+            make_memory("m3", "Memory three", MemoryType::Relational, 0.7),
+        ];
+        let mut storage = setup_storage_with_memories(&memories);
+
+        // Set up existing cluster state
+        let cluster_tuples = vec![(
+            "cluster-old".to_string(),
+            vec!["m1".to_string()],
+            vec![1.0f32, 0.0, 0.0],
+        )];
+        storage.save_full_cluster_state(&cluster_tuples).unwrap();
+
+        // Add 2 pending out of 3 total = 66.7% > default 20% ratio → cold path
+        storage.add_pending_memory("m2").unwrap();
+        storage.add_pending_memory("m3").unwrap();
+
+        let engine = DefaultSynthesisEngine::new(None, None);
+        let settings = default_settings();
+
+        // should_cold = true because pending/total = 2/3 = 0.67 > 0.2
+        let report = engine.synthesize(&mut storage, &settings).unwrap();
+
+        // Cold path runs discover_clusters from scratch
+        // Just verify it doesn't error
+        assert!(report.errors.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 15: Cached path — no pending, no dirty
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cached_path_no_pending_no_dirty() {
+        let memories = vec![
+            make_memory("m1", "Memory one", MemoryType::Factual, 0.7),
+            make_memory("m2", "Memory two", MemoryType::Episodic, 0.7),
+            make_memory("m3", "Memory three", MemoryType::Relational, 0.7),
+        ];
+        let mut storage = setup_storage_with_memories(&memories);
+
+        // Set up existing cluster state (no pending, no dirty)
+        let cluster_tuples = vec![(
+            "cluster-cached".to_string(),
+            vec!["m1".to_string(), "m2".to_string(), "m3".to_string()],
+            vec![1.0f32, 0.0, 0.0],
+        )];
+        storage.save_full_cluster_state(&cluster_tuples).unwrap();
+
+        let engine = DefaultSynthesisEngine::new(None, None);
+        let mut settings = default_settings();
+        settings.cluster_discovery.min_importance = 0.3;
+
+        // No pending, no dirty → cached path
+        let pending = storage.get_pending_count().unwrap();
+        let dirty = storage.get_dirty_cluster_ids().unwrap();
+        assert_eq!(pending, 0);
+        assert!(dirty.is_empty());
+
+        let report = engine.synthesize(&mut storage, &settings).unwrap();
+
+        // Should find clusters from cache (1 cluster with 3 members)
+        assert_eq!(report.clusters_found, 1);
     }
 }

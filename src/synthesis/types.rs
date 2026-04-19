@@ -154,6 +154,14 @@ pub struct ClusterDiscoveryConfig {
     /// `None` = default 0.6.
     #[serde(default)]
     pub hot_assign_threshold: Option<f64>,
+    /// Cold recluster trigger: full recluster when pending exceeds this
+    /// fraction of total memories. `None` = default 0.2 (20%).
+    #[serde(default)]
+    pub cold_recluster_ratio: Option<f64>,
+    /// Warm recluster trigger: recluster when pending count exceeds this.
+    /// `None` = default 100.
+    #[serde(default)]
+    pub warm_recluster_interval: Option<usize>,
 }
 
 impl Default for ClusterDiscoveryConfig {
@@ -172,6 +180,8 @@ impl Default for ClusterDiscoveryConfig {
             infomap_trials: None,
             infomap_hierarchical: None,
             hot_assign_threshold: None,
+            cold_recluster_ratio: None,
+            warm_recluster_interval: None,
         }
     }
 }

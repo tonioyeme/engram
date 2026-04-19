@@ -85,7 +85,7 @@ Respond with ONLY a JSON array (no markdown, no explanation):
 [{"content": "...", "memory_type": "...", "importance": 0.X, "confidence": "confident|likely|uncertain", "valence": 0.X, "domain": "..."}]
 
 Additional required fields:
-- valence (REQUIRED): emotional valence of this specific fact, from -1.0 (very negative) to 1.0 (very positive). 0.0 = purely neutral/informational. Consider the speaker's emotional state and context, not just keywords. Examples: frustration with a bug = -0.5, excitement about a working feature = 0.7, neutral status report = 0.0, mixed feelings = use the dominant emotion for this specific fact.
+- valence (REQUIRED): empathy valence of this specific fact, from -1.0 (very negative) to 1.0 (very positive). 0.0 = purely neutral/informational. Consider the speaker's emotional state and context, not just keywords. Examples: frustration with a bug = -0.5, excitement about a working feature = 0.7, neutral status report = 0.0, mixed feelings = use the dominant emotion for this specific fact.
 - domain (REQUIRED): which domain this fact belongs to. One of: "coding", "trading", "research", "communication", "general". Choose the most specific applicable domain.
 
 Conversation:

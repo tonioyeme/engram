@@ -3419,6 +3419,51 @@ impl Storage {
             "SELECT COUNT(*) FROM cluster_pending", [], |row| row.get::<_, i64>(0)
         ).map(|c| c as usize)
     }
+
+    /// Count total memories in storage.
+    pub fn count_memories(&self) -> Result<usize, rusqlite::Error> {
+        self.conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get::<_, i64>(0))
+            .map(|c| c as usize)
+    }
+
+    /// Get all current clusters as MemoryCluster structs.
+    ///
+    /// Reads from cluster_assignments and builds minimal MemoryCluster structs.
+    /// Quality scores and signal summaries use defaults since the full pairwise
+    /// data is not recomputed — this is intentional for the warm/cached path
+    /// where we skip expensive Infomap recomputation.
+    pub fn get_all_cluster_data(&self) -> Result<Vec<crate::synthesis::types::MemoryCluster>, rusqlite::Error> {
+        use std::collections::HashMap;
+        let mut clusters: HashMap<String, Vec<String>> = HashMap::new();
+        let mut stmt = self.conn.prepare("SELECT memory_id, cluster_id FROM cluster_assignments")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (memory_id, cluster_id) = row?;
+            clusters.entry(cluster_id).or_default().push(memory_id);
+        }
+
+        let result = clusters.into_iter().map(|(cluster_id, mut members)| {
+            members.sort();
+            let centroid_id = members.first().cloned().unwrap_or_default();
+            crate::synthesis::types::MemoryCluster {
+                id: cluster_id,
+                members,
+                quality_score: 0.5, // default for cached clusters
+                centroid_id,
+                signals_summary: crate::synthesis::types::SignalsSummary {
+                    dominant_signal: crate::synthesis::types::ClusterSignal::Hebbian,
+                    hebbian_contribution: 0.4,
+                    entity_contribution: 0.3,
+                    embedding_contribution: 0.2,
+                    temporal_contribution: 0.1,
+                },
+            }
+        }).collect();
+
+        Ok(result)
+    }
 }
 
 #[cfg(test)]

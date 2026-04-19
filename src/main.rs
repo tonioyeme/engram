@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use engramai::{Memory, MemoryConfig, MemoryType, Permission, EmotionalBus, EmbeddingConfig, AnthropicExtractor, OllamaExtractor};
+use engramai::{Memory, MemoryConfig, MemoryType, Permission, EmpathyBus, EmbeddingConfig, AnthropicExtractor, OllamaExtractor};
 use engramai::compiler::{
     self,
     api::MaintenanceApi,
@@ -44,7 +44,7 @@ struct Cli {
     #[arg(short, long, env = "ENGRAM_AGENT_ID")]
     agent_id: Option<String>,
     
-    /// Workspace directory for Emotional Bus (SOUL.md, HEARTBEAT.md, etc.)
+    /// Workspace directory for Empathy Bus (SOUL.md, HEARTBEAT.md, etc.)
     #[arg(short, long, env = "ENGRAM_WORKSPACE")]
     workspace: Option<PathBuf>,
     
@@ -306,7 +306,7 @@ enum Commands {
         recent: usize,
     },
     
-    /// Emotional Bus commands
+    /// Empathy Bus commands
     Bus {
         #[command(subcommand)]
         action: BusAction,
@@ -493,7 +493,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum BusAction {
-    /// Show emotional trends by domain
+    /// Show empathy trends by domain
     Trends {
         /// Output as JSON
         #[arg(long, short = 'j')]
@@ -766,10 +766,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut mem_config = MemoryConfig::default();
     mem_config.embedding = embedding_config;
     
-    // Create Memory with or without Emotional Bus
+    // Create Memory with or without Empathy Bus
     let mut mem = if let Some(ref workspace) = cli.workspace {
         let ws_path = workspace.to_str().ok_or("invalid workspace path")?;
-        Memory::with_emotional_bus(db_path, ws_path, Some(mem_config))?
+        Memory::with_empathy_bus(db_path, ws_path, Some(mem_config))?
     } else {
         Memory::new(db_path, Some(mem_config))?
     };
@@ -1155,11 +1155,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Bus { action } => {
             // Bus commands require workspace
             let workspace = cli.workspace.as_ref()
-                .ok_or("Emotional Bus commands require --workspace")?;
+                .ok_or("Empathy Bus commands require --workspace")?;
             let ws_path = workspace.to_str().ok_or("invalid workspace path")?;
             
             // Create bus directly if not already attached
-            let bus = EmotionalBus::new(ws_path, mem.connection())?;
+            let bus = EmpathyBus::new(ws_path, mem.connection())?;
             
             match action {
                 BusAction::Trends { json } => {
@@ -1169,7 +1169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("{}", serde_json::to_string_pretty(&trends)?);
                     } else {
                         if trends.is_empty() {
-                            println!("No emotional trends recorded yet.");
+                            println!("No empathy trends recorded yet.");
                         } else {
                             println!("Emotional Trends:");
                             for trend in &trends {

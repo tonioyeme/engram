@@ -205,7 +205,7 @@ pub fn assign_new_memory(
 
 /// Compute the mean embedding vector for a set of memory IDs.
 /// Skips memories without embeddings. Returns None if no embeddings found.
-fn compute_centroid_embedding(storage: &Storage, member_ids: &[String]) -> Option<Vec<f32>> {
+pub(crate) fn compute_centroid_embedding(storage: &Storage, member_ids: &[String]) -> Option<Vec<f32>> {
     let mut sum: Vec<f64> = Vec::new();
     let mut count = 0usize;
 

@@ -193,6 +193,12 @@ Phase 3 (P2 — 规模化):
   多设备同步
   第三方 API
   Marketplace（知识模板/公共知识库）
+
+Future (待详细设计):
+  KC 自动生成 Issue 文档 — 聚类编译的 insight 如果是
+  "未解决的技术问题/改进方向"，自动生成 .gid/issues/ 草稿
+  → 通知人确认。需要：意图分类、issue 模板映射、去重检查。
+  (2026-04-18 potato 提出)
 ```
 
 ### 形式 1: engram crate 内置模块 [P0]

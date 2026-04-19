@@ -102,6 +102,7 @@ pub mod hybrid_search;
 pub mod interoceptive;
 pub mod memory;
 pub mod models;
+pub mod promotion;
 pub mod query_classifier;
 pub mod session_wm;
 pub mod storage;
@@ -133,3 +134,4 @@ pub use synthesis::types::{
 };
 pub use triple::{Triple, Predicate, TripleSource};
 pub use triple_extractor::{TripleExtractor, AnthropicTripleExtractor, OllamaTripleExtractor};
+pub use promotion::PromotionCandidate;

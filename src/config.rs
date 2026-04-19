@@ -18,6 +18,36 @@ pub struct TripleConfig {
     pub model: Option<String>,
 }
 
+/// Configuration for knowledge promotion detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromotionConfig {
+    /// Enable promotion detection (default: false, opt-in)
+    pub enabled: bool,
+    /// Minimum core_strength for a memory to be considered (default: 0.6)
+    pub min_core_strength: f64,
+    /// Minimum Hebbian link weight to count as connected (default: 0.3)
+    pub min_hebbian_weight: f64,
+    /// Minimum cluster size (default: 3)
+    pub min_cluster_size: usize,
+    /// Minimum time span in days across cluster members (default: 2.0)
+    pub min_time_span_days: f64,
+    /// Minimum average importance across cluster members (default: 0.4)
+    pub min_avg_importance: f64,
+}
+
+impl Default for PromotionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_core_strength: 0.6,
+            min_hebbian_weight: 0.3,
+            min_cluster_size: 3,
+            min_time_span_days: 2.0,
+            min_avg_importance: 0.4,
+        }
+    }
+}
+
 impl Default for TripleConfig {
     fn default() -> Self {
         Self {
@@ -223,6 +253,10 @@ pub struct MemoryConfig {
     /// LLM triple extraction configuration
     #[serde(default)]
     pub triple: TripleConfig,
+
+    /// Knowledge promotion configuration
+    #[serde(default)]
+    pub promotion: PromotionConfig,
 }
 
 fn default_entity_weight() -> f64 {
@@ -315,6 +349,7 @@ impl Default for MemoryConfig {
             adaptive_weights: default_adaptive_weights(),
             association: AssociationConfig::default(),
             triple: TripleConfig::default(),
+            promotion: PromotionConfig::default(),
         }
     }
 }

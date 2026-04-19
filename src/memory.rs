@@ -1651,6 +1651,22 @@ impl Memory {
             }
         }
 
+        // [ISS-008] Promotion detection phase
+        if self.config.promotion.enabled {
+            match self.detect_promotion_candidates() {
+                Ok(candidates) if !candidates.is_empty() => {
+                    log::info!("Promotion: {} candidates found", candidates.len());
+                    for c in &candidates {
+                        if let Err(e) = self.storage.store_promotion_candidate(c) {
+                            log::warn!("Failed to store promotion candidate: {}", e);
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("Promotion detection failed (non-fatal): {e}"),
+            }
+        }
+
         Ok(())
     }
 
@@ -1716,6 +1732,23 @@ impl Memory {
         }
 
         Ok(())
+    }
+
+    // === [ISS-008] Knowledge Promotion API ===
+
+    /// Detect knowledge clusters ready for promotion to persistent documents.
+    pub fn detect_promotion_candidates(&self) -> Result<Vec<crate::promotion::PromotionCandidate>, Box<dyn std::error::Error>> {
+        Ok(crate::promotion::detect_promotable_clusters(&self.storage, &self.config.promotion)?)
+    }
+
+    /// Get pending promotion suggestions.
+    pub fn pending_promotions(&self) -> Result<Vec<crate::promotion::PromotionCandidate>, Box<dyn std::error::Error>> {
+        Ok(self.storage.get_pending_promotions()?)
+    }
+
+    /// Approve or dismiss a promotion candidate.
+    pub fn resolve_promotion(&self, id: &str, status: &str) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(self.storage.resolve_promotion(id, status)?)
     }
 
     /// Forget a specific memory or prune all below threshold.

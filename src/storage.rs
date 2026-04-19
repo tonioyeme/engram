@@ -189,6 +189,9 @@ impl Storage {
         // Run migrations for triple extraction
         Self::migrate_triples(&conn)?;
         
+        // Run migrations for promotion candidates
+        Self::migrate_promotions(&conn)?;
+        
         Ok(Self { conn })
     }
     
@@ -694,7 +697,116 @@ impl Storage {
         
         Ok(())
     }
-    
+
+    /// Migrate schema for promotion candidates table (ISS-008).
+    fn migrate_promotions(conn: &Connection) -> SqlResult<()> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS promotion_candidates (
+                id TEXT PRIMARY KEY,
+                member_ids TEXT NOT NULL,
+                snippets TEXT NOT NULL,
+                avg_core_strength REAL NOT NULL,
+                avg_importance REAL NOT NULL,
+                time_span_days REAL NOT NULL,
+                internal_link_count INTEGER NOT NULL,
+                suggested_target TEXT NOT NULL,
+                summary TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                resolved_at TEXT
+            );
+            "#
+        )?;
+        Ok(())
+    }
+
+    /// Store a promotion candidate.
+    pub fn store_promotion_candidate(&self, candidate: &crate::promotion::PromotionCandidate) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO promotion_candidates (id, member_ids, snippets, avg_core_strength, avg_importance, time_span_days, internal_link_count, suggested_target, summary, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                candidate.id,
+                serde_json::to_string(&candidate.member_ids).unwrap_or_default(),
+                serde_json::to_string(&candidate.snippets).unwrap_or_default(),
+                candidate.avg_core_strength,
+                candidate.avg_importance,
+                candidate.time_span_days,
+                candidate.internal_link_count,
+                candidate.suggested_target,
+                candidate.summary,
+                candidate.status,
+                candidate.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get all pending promotion candidates.
+    pub fn get_pending_promotions(&self) -> Result<Vec<crate::promotion::PromotionCandidate>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, member_ids, snippets, avg_core_strength, avg_importance, time_span_days, internal_link_count, suggested_target, summary, status, created_at FROM promotion_candidates WHERE status = 'pending'"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let member_ids_json: String = row.get(1)?;
+            let snippets_json: String = row.get(2)?;
+            let created_at_str: String = row.get(10)?;
+            Ok(crate::promotion::PromotionCandidate {
+                id: row.get(0)?,
+                member_ids: serde_json::from_str(&member_ids_json).unwrap_or_default(),
+                snippets: serde_json::from_str(&snippets_json).unwrap_or_default(),
+                avg_core_strength: row.get(3)?,
+                avg_importance: row.get(4)?,
+                time_span_days: row.get(5)?,
+                internal_link_count: row.get::<_, i64>(6)? as usize,
+                suggested_target: row.get(7)?,
+                summary: row.get(8)?,
+                status: row.get(9)?,
+                created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Resolve a promotion candidate (mark as approved or dismissed).
+    pub fn resolve_promotion(&self, id: &str, status: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE promotion_candidates SET status = ?1, resolved_at = ?2 WHERE id = ?3",
+            rusqlite::params![status, chrono::Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+
+    /// Check if a cluster (by member IDs) has already been promoted (approved or pending).
+    pub fn is_cluster_already_promoted(&self, member_ids: &[String]) -> Result<bool, rusqlite::Error> {
+        // Check if any existing non-dismissed candidate has significant overlap with these member_ids
+        let mut stmt = self.conn.prepare(
+            "SELECT member_ids FROM promotion_candidates WHERE status != 'dismissed'"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let json: String = row.get(0)?;
+            Ok(json)
+        })?;
+
+        let input_set: std::collections::HashSet<&str> = member_ids.iter().map(|s| s.as_str()).collect();
+
+        for row in rows {
+            let json = row?;
+            if let Ok(existing_ids) = serde_json::from_str::<Vec<String>>(&json) {
+                let existing_set: std::collections::HashSet<&str> = existing_ids.iter().map(|s| s.as_str()).collect();
+                let overlap = input_set.intersection(&existing_set).count();
+                // If >50% overlap, consider it already promoted
+                let min_size = input_set.len().min(existing_set.len());
+                if min_size > 0 && overlap * 2 >= min_size {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Rebuild FTS index with CJK tokenization if not already done.
     /// Uses engram_meta 'fts_cjk_version' to track migration state.
     fn rebuild_fts_if_needed(conn: &Connection) -> SqlResult<()> {

@@ -382,6 +382,15 @@ impl Memory {
         }
     }
 
+    /// Feed an external interoceptive signal directly into the hub.
+    ///
+    /// Used by host agents (e.g., RustClaw) to inject runtime-sourced
+    /// signals (OperationalLoad, ExecutionStress, CognitiveFlow, ResourcePressure)
+    /// that originate outside of engram's own monitoring subsystems.
+    pub fn feed_interoceptive_signal(&mut self, signal: crate::interoceptive::InteroceptiveSignal) {
+        self.interoceptive_hub.process_signal(signal);
+    }
+
     /// Broadcast memory admission to the interoceptive hub (GWT global workspace).
     ///
     /// When memories enter working memory (via recall), this broadcasts

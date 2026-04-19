@@ -137,6 +137,23 @@ pub struct ClusterDiscoveryConfig {
     /// Minimum temporal spread among cluster members (default: 1 hour).
     #[serde(with = "duration_secs")]
     pub temporal_spread_minimum: Duration,
+    /// Max neighbors per node for k-NN edge sparsification.
+    /// `None` = adaptive: `clamp(sqrt(n), 5, 30)` where n = node count.
+    #[serde(default)]
+    pub max_neighbors_per_node: Option<usize>,
+    /// Number of Infomap optimization trials.
+    /// `None` = adaptive: 1 if edge density < 5, else 3.
+    #[serde(default)]
+    pub infomap_trials: Option<usize>,
+    /// Whether Infomap uses hierarchical (multi-level) clustering.
+    /// `None` = adaptive: true if node count > 2000, else false.
+    #[serde(default)]
+    pub infomap_hierarchical: Option<bool>,
+    /// Hot assign threshold: cosine similarity to nearest centroid.
+    /// Above this → assign to cluster. Below → pending.
+    /// `None` = default 0.6.
+    #[serde(default)]
+    pub hot_assign_threshold: Option<f64>,
 }
 
 impl Default for ClusterDiscoveryConfig {
@@ -151,6 +168,10 @@ impl Default for ClusterDiscoveryConfig {
             temporal_half_life_hours: 168.0,
             cooldown_cycles: 3,
             temporal_spread_minimum: Duration::from_secs(3600),
+            max_neighbors_per_node: None,
+            infomap_trials: None,
+            infomap_hierarchical: None,
+            hot_assign_threshold: None,
         }
     }
 }

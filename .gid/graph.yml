@@ -42,8 +42,8 @@ nodes:
   - extractor
   priority: 10
   metadata:
-    file: engramai/src/extractor.rs
     project: engramai
+    file: engramai/src/extractor.rs
 - id: a3-sql-cleanup
   title: 'A3: SQL 一次性清理 — 删存量重复 + 系统指令垃圾'
   status: done
@@ -112,13 +112,13 @@ nodes:
   - types
   priority: 20
   metadata:
+    iss: ISS-009
+    project: engramai
     files:
     - src/entities.rs
     - src/config.rs
     - Cargo.toml
     - src/lib.rs
-    iss: ISS-009
-    project: engramai
 - id: entity-unit-tests
   title: 'B1.2: EntityExtractor unit tests'
   status: done
@@ -139,9 +139,9 @@ nodes:
   priority: 20
   metadata:
     iss: ISS-009
+    project: engramai
     files:
     - src/entities.rs
-    project: engramai
 - id: entity-storage
   title: 'B1.3: Storage entity CRUD methods'
   status: done
@@ -164,10 +164,10 @@ nodes:
   - storage
   priority: 20
   metadata:
-    iss: ISS-009
-    project: engramai
     files:
     - src/storage.rs
+    project: engramai
+    iss: ISS-009
 - id: entity-add-raw
   title: 'B1.4: Integrate entity extraction into add_raw()'
   status: done
@@ -191,10 +191,10 @@ nodes:
   priority: 20
   metadata:
     iss: ISS-009
-    project: engramai
     files:
     - src/memory.rs
     - src/config.rs
+    project: engramai
 - id: entity-recall
   title: 'B1.5: Entity-aware recall channel'
   status: done
@@ -216,11 +216,11 @@ nodes:
   - recall
   priority: 20
   metadata:
-    iss: ISS-009
     files:
     - src/entities.rs
     - src/memory.rs
     project: engramai
+    iss: ISS-009
 - id: entity-backfill
   title: 'B1.6: Backfill CLI command for existing memories'
   status: done
@@ -244,8 +244,8 @@ nodes:
   metadata:
     files:
     - src/main.rs
-    project: engramai
     iss: ISS-009
+    project: engramai
 - id: entity-integration-tests
   title: 'B1.7: Entity indexing integration tests'
   status: done
@@ -288,8 +288,8 @@ nodes:
   - dedup
   priority: 25
   metadata:
-    project: engramai
     iss: ISS-003
+    project: engramai
 - id: b3-confidence
   title: 'B3: Confidence score — 多信号融合 recall confidence (ISS-007)'
   status: done
@@ -306,8 +306,8 @@ nodes:
   - confidence
   priority: 30
   metadata:
-    project: engramai
     iss: ISS-007
+    project: engramai
 - id: b4-recency
   title: 'B4: Recency 调参 — ACT-R decay analysis + tuning (ISS-002)'
   status: done
@@ -457,9 +457,9 @@ nodes:
   priority: 10
   type: task
   metadata:
-    goals: GOAL-comp.1
     design_ref: compilation/design.md §3.1
     file: src/compiler/discovery.rs
+    goals: GOAL-comp.1
 - id: kc-compilation-pipeline
   title: Compilation Pipeline (compile + provenance + failure handling)
   status: done
@@ -471,9 +471,9 @@ nodes:
   priority: 10
   type: task
   metadata:
-    file: src/compiler/pipeline.rs
     design_ref: compilation/design.md §3.2, §3.5
     goals: GOAL-comp.2, GOAL-comp.3, GOAL-comp.6
+    file: src/compiler/pipeline.rs
 - id: kc-incremental-trigger
   title: Incremental Trigger (change detection + recompile decision)
   status: done
@@ -485,8 +485,8 @@ nodes:
   priority: 10
   type: task
   metadata:
-    design_ref: compilation/design.md §3.3
     file: src/compiler/trigger.rs
+    design_ref: compilation/design.md §3.3
     goals: GOAL-comp.4, GOAL-comp.5
 - id: kc-topic-lifecycle
   title: Topic Lifecycle (merge + split)
@@ -513,9 +513,9 @@ nodes:
   priority: 30
   type: task
   metadata:
-    file: src/compiler/feedback.rs
     design_ref: compilation/design.md §3.5
     goals: GOAL-comp.8, GOAL-comp.9
+    file: src/compiler/feedback.rs
 - id: kc-quality-scorer
   title: Quality Scorer (coherence + coverage + freshness)
   status: done
@@ -527,9 +527,9 @@ nodes:
   priority: 50
   type: task
   metadata:
-    goals: GOAL-comp.10
-    design_ref: compilation/design.md §3.6
     file: src/compiler/quality.rs
+    design_ref: compilation/design.md §3.6
+    goals: GOAL-comp.10
 - id: kc-decay-engine
   title: Decay Engine (time + access decay)
   status: done
@@ -542,8 +542,8 @@ nodes:
   type: task
   metadata:
     goals: GOAL-maint.1
-    design_ref: maintenance/design.md §2.1
     file: src/compiler/decay.rs
+    design_ref: maintenance/design.md §2.1
 - id: kc-conflict-detector
   title: Conflict Detector (contradictions + duplicates)
   status: done
@@ -556,8 +556,8 @@ nodes:
   type: task
   metadata:
     goals: GOAL-maint.2, GOAL-maint.4
-    file: src/compiler/conflict.rs
     design_ref: maintenance/design.md §2.2
+    file: src/compiler/conflict.rs
 - id: kc-health-auditor
   title: Health Auditor (link integrity + health reports)
   status: done
@@ -570,8 +570,8 @@ nodes:
   type: task
   metadata:
     file: src/compiler/health.rs
-    goals: GOAL-maint.3, GOAL-maint.5, GOAL-maint.5b
     design_ref: maintenance/design.md §2.3
+    goals: GOAL-maint.3, GOAL-maint.5, GOAL-maint.5b
 - id: kc-export-engine
   title: Export Engine (JSON/Markdown/SQLite + privacy filter)
   status: done
@@ -583,8 +583,8 @@ nodes:
   priority: 10
   type: task
   metadata:
-    goals: GOAL-maint.6, GOAL-maint.7
     design_ref: maintenance/design.md §2.4
+    goals: GOAL-maint.6, GOAL-maint.7
     file: src/compiler/export.rs
 - id: kc-cli
   title: CLI Interface (knowledge subcommands)
@@ -597,9 +597,9 @@ nodes:
   priority: 10
   type: task
   metadata:
-    design_ref: maintenance/design.md §2.5
     file: src/compiler/cli.rs
     goals: GOAL-maint.8
+    design_ref: maintenance/design.md §2.5
 - id: kc-api
   title: Programmatic API (MaintenanceApi)
   status: done
@@ -611,9 +611,9 @@ nodes:
   priority: 50
   type: task
   metadata:
-    design_ref: maintenance/design.md §2.6
-    goals: GOAL-maint.9
     file: src/compiler/api.rs
+    goals: GOAL-maint.9
+    design_ref: maintenance/design.md §2.6
 - id: kc-privacy-guard
   title: Privacy Guard (levels + redaction + audit log)
   status: done
@@ -625,8 +625,8 @@ nodes:
   priority: 10
   type: task
   metadata:
-    file: src/compiler/privacy.rs
     design_ref: maintenance/design.md §2.7
+    file: src/compiler/privacy.rs
     goals: GOAL-maint.10, GOAL-maint.11
 - id: kc-maintenance-lock
   title: Maintenance Lock (multi-process safety)
@@ -639,9 +639,9 @@ nodes:
   priority: 30
   type: task
   metadata:
-    goals: GOAL-maint.12
-    file: src/compiler/lock.rs
     design_ref: maintenance/design.md §3
+    file: src/compiler/lock.rs
+    goals: GOAL-maint.12
 - id: kc-llm-provider
   title: LLM Provider (multi-provider + model router + token budget)
   status: done
@@ -654,8 +654,8 @@ nodes:
   type: task
   metadata:
     design_ref: platform/design.md §2.1
-    goals: GOAL-plat.1, GOAL-plat.2, GOAL-plat.3
     file: src/compiler/llm.rs
+    goals: GOAL-plat.1, GOAL-plat.2, GOAL-plat.3
 - id: kc-config
   title: Configuration Management (zero-config + TOML + resolution)
   status: done
@@ -681,9 +681,9 @@ nodes:
   priority: 5
   type: task
   metadata:
+    design_ref: platform/design.md §2.3
     file: src/compiler/embedding.rs
     goals: GOAL-plat.4, GOAL-plat.5, GOAL-plat.6
-    design_ref: platform/design.md §2.3
 - id: kc-import
   title: Import Pipeline (Markdown + Obsidian + URL + dedup)
   status: done
@@ -695,9 +695,9 @@ nodes:
   priority: 10
   type: task
   metadata:
-    goals: GOAL-plat.8, GOAL-plat.9, GOAL-plat.10, GOAL-plat.11
     file: src/compiler/import.rs
     design_ref: platform/design.md §2.4
+    goals: GOAL-plat.8, GOAL-plat.9, GOAL-plat.10, GOAL-plat.11
 - id: kc-intake
   title: Intake Pipeline (URL extraction + auto-import)
   status: done
@@ -709,9 +709,9 @@ nodes:
   priority: 10
   type: task
   metadata:
-    design_ref: platform/design.md §2.5
-    goals: GOAL-plat.12, GOAL-plat.13
     file: src/compiler/intake.rs
+    goals: GOAL-plat.12, GOAL-plat.13
+    design_ref: platform/design.md §2.5
 - id: kc-degradation
   title: Graceful Degradation (capability levels + fallback chain)
   status: done
@@ -772,9 +772,9 @@ nodes:
   - compilation
   priority: 8
   metadata:
-    design_ref: compilation/design.md §3.5
-    file: src/compiler/feedback.rs
     goals: GOAL-comp.7
+    file: src/compiler/feedback.rs
+    design_ref: compilation/design.md §3.5
 - id: kc-unit-tests
   title: KC Unit Tests (per-module)
   status: done
@@ -799,203 +799,64 @@ nodes:
   metadata:
     file: tests/knowledge_compiler.rs
     goals: GUARD-2 (correctness)
-- id: feat-rumination
-  title: L4 Rumination (自主思考) — synthesis-only 定时触发
-  status: done
-  description: engramai::Memory::ruminate() + RustClaw 定时器。Synthesis pipeline 独立于 consolidation 运行，不衰减记忆强度。
-  tags:
-  - engram
-  - L4
-  - rumination
-  - synthesis
-  type: feature
-- id: feat-interoceptive
-  title: L3 Interoceptive Hub (脑岛整合层)
+- id: cluster-scaling
+  title: 'Cluster Discovery Scaling: VP-tree ANN + Incremental Clustering'
   status: todo
-  description: '给 engram 装"脑岛"——把 5 个分散的信号源 (anomaly, accumulator, feedback, confidence, alignment) 整合成统一的内感受系统。三层架构：Signal Layer → Integration Layer → Regulation Layer。设计文档: INTEROCEPTIVE-LAYER.md'
+  description: '让 discover_clusters 从百条级扩展到十万条级。VP-tree ANN 补齐 embedding pair discovery 盲点，Hot/Warm/Cold 三层增量聚类避免全量 recluster。设计文档: DESIGN-cluster-scaling.md'
   tags:
-  - interoceptive
-  - L3
-  - neuroscience
+  - performance
+  - scaling
+  - clustering
   priority: 10
   type: feature
-- id: intero-types
-  title: 'Phase 1: 统一信号类型 (InteroceptiveSignal + types)'
+- id: cs-vptree
+  title: VP-tree implementation + ANN pair discovery
   status: done
-  description: |-
-    定义 InteroceptiveSignal 统一信号格式 + SignalSource enum + SignalContext。所有信号源的公共输出接口。包含：
-    - InteroceptiveSignal struct (source, domain, valence, arousal, timestamp, context)
-    - SignalSource enum (Anomaly, Feedback, Alignment, Confidence, Accumulator)
-    - SignalContext enum (触发信号的上下文)
-    - InteroceptiveState struct (domain_states, global_arousal, somatic_cache, signal_buffer)
-    - DomainState struct (valence_trend, anomaly_level, action_success_rate, alignment_score, confidence)
-    - RegulationAction enum (SoulUpdateSuggestion, RetrievalAdjustment, BehaviorShift, Alert)
-    - SomaticMarker struct
-
-    文件: src/interoceptive/types.rs (~120 行)
-    设计参考: INTEROCEPTIVE-LAYER.md §5.2
+  description: 在 cluster.rs 内实现 VpTree struct (~80行 Rust，零依赖)。L2 distance on normalized embeddings。build O(n log n), query_k_nearest O(log n) amortized。Step 3 增加 ANN pairs source：对每个候选记忆找 k 个 embedding 最近邻加入 candidate_pairs。k = sqrt(n).clamp(5, 30)。修复当前盲点：embedding signal 只在 scoring 用，不参与 pair discovery。
   tags:
-  - interoceptive
-  - phase-1
+  - ann
+  - vp-tree
+  - performance
+  priority: 10
+- id: cs-refactor-inner
+  title: Refactor discover_clusters_inner extraction
+  status: done
+  description: 把 discover_clusters() 核心逻辑 (Step 2-6) 提取到 discover_clusters_inner()。discover_clusters() 和新的 discover_clusters_subset() 共享内部实现。避免代码重复。全量测试不 regress。
+  tags:
+  - refactor
   priority: 20
-- id: intero-mod
-  title: 'Phase 1: 模块脚手架 (mod.rs + lib.rs)'
+- id: cs-storage
+  title: Storage tables + API for cluster state persistence
   status: done
-  description: |-
-    创建 src/interoceptive/mod.rs，导出 types + hub 模块。在 lib.rs 加 pub mod interoceptive。
-
-    文件: src/interoceptive/mod.rs (新), lib.rs (+1 行)
+  description: '新增 3 张 SQLite 表: cluster_state, cluster_assignments, cluster_centroids。在 Storage 上实现全套 CRUD: init_cluster_tables(), get_cluster_centroids(), assign_to_cluster(), update_centroid_incremental(), mark_cluster_dirty(), get_dirty_cluster_ids(), add_pending_memory(), get_pending_memory_ids(), get_cluster_members(), replace_clusters(), get_memories_by_ids(), clear_pending_and_dirty()。单元测试覆盖。'
   tags:
-  - interoceptive
-  - phase-1
+  - storage
+  - sqlite
   priority: 20
-- id: intero-signal-adapters
-  title: 'Phase 1: 信号适配器 (5 个模块 → InteroceptiveSignal)'
+- id: cs-hot-path
+  title: 'Hot path: assign new memory to nearest cluster'
   status: done
-  description: |-
-    给现有 5 个信号源模块各加一个方法输出 InteroceptiveSignal 格式，不改变原有行为：
-
-    1. anomaly.rs — BaselineTracker::to_signal() → InteroceptiveSignal (source=Anomaly, valence=-z_score_normalized, arousal=abs(z_score)/threshold)
-    2. bus/accumulator.rs — EmotionalAccumulator::to_signal(domain) → InteroceptiveSignal (source=Accumulator, valence=trend_valence)
-    3. bus/feedback.rs — BehaviorFeedback::to_signal(action) → InteroceptiveSignal (source=Feedback, valence=success_rate*2-1)
-    4. confidence.rs — ConfidenceScorer::to_signal() → InteroceptiveSignal (source=Confidence, valence=combined_confidence*2-1)
-    5. bus/alignment.rs — AlignmentScorer::to_signal() → InteroceptiveSignal (source=Alignment, valence=alignment_score*2-1)
-
-    每个约 15-20 行。纯 additive，不改现有行为。
-    设计参考: INTEROCEPTIVE-LAYER.md §6.1-6.5
+  description: '实现 assign_new_memory(): 新记忆进来 → 加载 cluster centroids → 找最近 centroid (cosine sim) → 超过 hot_assign_threshold (0.6) 归入 cluster + 增量更新 centroid → 否则加入 pending。O(C) 复杂度。on_memory_added() hook 集成到 add() 路径。'
   tags:
-  - interoceptive
-  - phase-1
+  - incremental
+  - hot-path
   priority: 30
-- id: intero-hub
-  title: 'Phase 2: InteroceptiveHub 核心 (信号整合 + 状态聚合)'
-  status: done
-  description: |-
-    InteroceptiveHub 核心实现 (~300-400 行)：
-
-    核心职责：
-    - 接收 InteroceptiveSignal，维护 signal_buffer (VecDeque, 滑动窗口)
-    - 维护 domain_states: HashMap<String, DomainState>，每次信号更新对应 domain 的状态
-    - 计算 global_arousal (所有 domain arousal 的加权平均)
-    - Somatic marker 缓存: 情境 hash → 历史情感记录 (Damasio 直觉)
-    - current_state() → InteroceptiveState 快照
-    - process_signal(signal) → Option<RegulationAction>
-    - tick() — 被定时调用，从所有信号源拉取最新信号，更新状态
-
-    关键设计约束：
-    - O(1) 或 O(log n)，不能成为瓶颈
-    - signal_buffer 上限 1000，超出 FIFO 淘汰
-    - somatic_cache LRU 淘汰
-
-    文件: src/interoceptive/hub.rs (~400 行)
-    设计参考: INTEROCEPTIVE-LAYER.md §5.1-5.2
+- id: cs-warm-path
+  title: 'Warm path: recluster dirty clusters + pending memories'
+  status: todo
+  description: '实现 recluster_dirty(): 取 dirty cluster IDs + pending memory IDs → 收集所有相关记忆 → 调 discover_clusters_subset() 局部 Infomap → 更新 assignments + centroids → 清除 dirty/pending 标记。触发条件: 每 100 条新增或 consolidate() 调用时。O(m log m) where m << n。'
   tags:
-  - interoceptive
-  - phase-2
-  priority: 30
-- id: intero-memory-api
-  title: 'Phase 2: Memory API (interoceptive_snapshot + tick)'
-  status: done
-  description: |-
-    在 Memory 上加 interoceptive_snapshot() 方法：
-
-    1. Memory struct 新增 interoceptive_hub: Option<InteroceptiveHub> 字段
-    2. Memory::new() 初始化 hub (读取现有模块状态)
-    3. Memory::interoceptive_snapshot() → InteroceptiveState
-    4. Memory::interoceptive_tick() — 拉取所有信号源，更新 hub 状态
-    5. Memory::interoceptive_regulate() → Vec<RegulationAction> — 获取调节建议
-
-    关键：hub 拿到的信号源引用来自 Memory 已有的 emotional_bus (accumulator, feedback, alignment) + anomaly_tracker + confidence_scorer。
-
-    文件: src/memory.rs (+60 行)
-    设计参考: INTEROCEPTIVE-LAYER.md §10
-  tags:
-  - interoceptive
-  - phase-2
+  - incremental
+  - warm-path
   priority: 40
-- id: intero-regulation
-  title: 'Phase 4: 调节层 (RegulationAction 生成规则)'
-  status: done
-  description: |-
-    基于 InteroceptiveState 生成 RegulationAction 的逻辑：
-
-    规则引擎 (不用 LLM)：
-    1. 情感趋势持续负向 (valence < -0.3 持续 5+ 信号) → SoulUpdateSuggestion
-    2. confidence 持续低 (< 0.4 持续 3+ 信号) → RetrievalAdjustment { expand_search: true }
-    3. 某 action 成功率 < 0.3 → BehaviorShift { action, recommendation }
-    4. 多个 domain 同时 anomaly_level > 2.0 → Alert { severity: High }
-    5. alignment < 0.3 持续 → SoulUpdateSuggestion
-
-    Regulation 的输出只是建议，不自动执行。由调用方（RustClaw hooks）决定是否采纳。
-
-    文件: src/interoceptive/regulation.rs (~150 行)
-    设计参考: INTEROCEPTIVE-LAYER.md §5.2 Layer 3
+- id: cs-consolidate
+  title: Cold path + consolidate() integration
+  status: todo
+  description: '改造 consolidate(): 三层判断 — pending 超 20% → cold (全量 recluster), pending > 0 → warm (局部 recluster), 否则用缓存 clusters。Cold path = 现有 discover_clusters() 不变。集成 hot/warm/cold 选择逻辑。全量 regression 测试 + benchmark (模拟 1000/5000/10000 条记忆)。'
   tags:
-  - interoceptive
-  - phase-4
+  - integration
+  - consolidate
   priority: 50
-- id: intero-broadcast
-  title: 'Phase 3: 广播机制 (SessionWorkingMemory → Hub)'
-  status: done
-  description: |-
-    SessionWorkingMemory 加入广播机制 (GWT 实现)：
-
-    - admit_with_broadcast() — 记忆进入工作记忆时广播到 hub
-    - hub.process_admission(memory_id) — 触发情感着色 + 对齐检查 + 异常检测
-    - Spreading activation via Hebbian neighbors (如果 hebbian network 可用)
-
-    注意：这是对 session_wm.rs 的改造，需要小心不破坏现有 admit/evict 逻辑。
-
-    文件: src/session_wm.rs (+50 行)
-    设计参考: INTEROCEPTIVE-LAYER.md §5.3
-  tags:
-  - interoceptive
-  - phase-3
-  priority: 50
-- id: intero-rustclaw-integration
-  title: 'Phase 5: RustClaw 集成 (hooks + tick + 闭环)'
-  status: done
-  description: |-
-    RustClaw 侧集成：
-
-    1. EngramRecallHook (BeforeInbound) — recall 时同时调用 hub.current_state()，内感受状态注入 system prompt
-    2. EngramStoreHook (BeforeOutbound) — 存储后调用 hub.process()，信号层各自检测 + 整合层更新
-    3. 后台 tick — 定时 (每 5 分钟或每次 heartbeat) 调用 memory.interoceptive_tick()
-    4. RegulationAction 处理 — 调节层输出发到 Telegram 或写入日志
-
-    文件: rustclaw/src/engram_hooks.rs (+40 行), 可能新增 interoceptive 相关 hook
-    设计参考: INTEROCEPTIVE-LAYER.md §10.1-10.5
-  tags:
-  - interoceptive
-  - phase-5
-  - rustclaw
-  priority: 60
-- id: intero-tests
-  title: 'Phase 5: 测试 (单元 + 集成)'
-  status: done
-  description: |-
-    端到端测试 + 单元测试：
-
-    单元测试 (~150 行):
-    - InteroceptiveSignal 构建 + 序列化
-    - DomainState 更新逻辑
-    - Hub signal_buffer FIFO 淘汰
-    - Somatic marker 缓存 LRU
-    - RegulationAction 规则触发 (每条规则至少 1 个 test case)
-    - 各 adapter 的 to_signal() 输出验证
-
-    集成测试 (~100 行):
-    - 完整信号流: anomaly 信号 → hub → 状态更新 → regulation action
-    - 多 domain 交叉: coding + trading 同时产生信号
-    - 滑动窗口趋势检测
-    - Memory.interoceptive_snapshot() 端到端
-
-    文件: src/interoceptive/types.rs (#[cfg(test)]), src/interoceptive/hub.rs (#[cfg(test)]), tests/interoceptive_test.rs (新)
-  tags:
-  - interoceptive
-  - phase-5
-  - testing
-  priority: 60
 edges:
 - from: a1-hook-filter
   to: phase-a
@@ -1411,66 +1272,36 @@ edges:
 - from: kc-integration-tests
   to: kc-import
   relation: depends_on
-- from: intero-signal-adapters
-  to: intero-types
-  relation: depends_on
-- from: intero-signal-adapters
-  to: intero-mod
-  relation: depends_on
-- from: intero-hub
-  to: intero-signal-adapters
-  relation: depends_on
-- from: intero-memory-api
-  to: intero-hub
-  relation: depends_on
-- from: intero-regulation
-  to: intero-hub
-  relation: depends_on
-- from: intero-broadcast
-  to: intero-hub
-  relation: depends_on
-- from: intero-rustclaw-integration
-  to: intero-memory-api
-  relation: depends_on
-- from: intero-rustclaw-integration
-  to: intero-regulation
-  relation: depends_on
-- from: intero-tests
-  to: intero-hub
-  relation: depends_on
-- from: intero-tests
-  to: intero-regulation
-  relation: depends_on
-- from: intero-tests
-  to: intero-signal-adapters
-  relation: depends_on
-- from: intero-tests
-  to: intero-memory-api
-  relation: depends_on
-- from: intero-types
-  to: feat-interoceptive
+- from: cs-vptree
+  to: cluster-scaling
   relation: subtask_of
-- from: intero-mod
-  to: feat-interoceptive
+- from: cs-refactor-inner
+  to: cluster-scaling
   relation: subtask_of
-- from: intero-signal-adapters
-  to: feat-interoceptive
+- from: cs-storage
+  to: cluster-scaling
   relation: subtask_of
-- from: intero-hub
-  to: feat-interoceptive
+- from: cs-hot-path
+  to: cluster-scaling
   relation: subtask_of
-- from: intero-memory-api
-  to: feat-interoceptive
+- from: cs-warm-path
+  to: cluster-scaling
   relation: subtask_of
-- from: intero-regulation
-  to: feat-interoceptive
+- from: cs-consolidate
+  to: cluster-scaling
   relation: subtask_of
-- from: intero-broadcast
-  to: feat-interoceptive
-  relation: subtask_of
-- from: intero-rustclaw-integration
-  to: feat-interoceptive
-  relation: subtask_of
-- from: intero-tests
-  to: feat-interoceptive
-  relation: subtask_of
+- from: cs-refactor-inner
+  to: cs-vptree
+  relation: depends_on
+- from: cs-hot-path
+  to: cs-storage
+  relation: depends_on
+- from: cs-warm-path
+  to: cs-refactor-inner
+  relation: depends_on
+- from: cs-warm-path
+  to: cs-hot-path
+  relation: depends_on
+- from: cs-consolidate
+  to: cs-warm-path
+  relation: depends_on

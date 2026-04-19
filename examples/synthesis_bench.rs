@@ -1,36 +1,20 @@
-//! Real-data synthesis benchmark.
-//!
-//! Runs cluster discovery on the real engram-memory.db to measure
-//! actual performance of the optimized synthesis pipeline.
-//!
-//! Usage:
-//!   cargo run --release --example synthesis_bench
-
+//! Full benchmark with per-phase timing.
 use std::time::Instant;
 
-use engramai::storage::Storage;
-use engramai::synthesis::cluster;
-use engramai::synthesis::types::ClusterDiscoveryConfig;
-
 fn main() {
-    env_logger::init();
-
     let db_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "/Users/potato/rustclaw/engram-memory.db".to_string());
 
     println!("=== Synthesis Cluster Discovery Benchmark ===");
-    println!("Database: {}", db_path);
+    println!("DB: {}", db_path);
 
-    // Open storage
-    let storage = Storage::new(&db_path).expect("Failed to open database");
+    let storage = engramai::storage::Storage::new(&db_path).expect("open");
 
-    // Count memories
-    let all = storage.all().expect("Failed to load memories");
+    let all = storage.all().expect("all");
     println!("Total memories: {}", all.len());
 
-    // Count memories that pass pre-filter
-    let config = ClusterDiscoveryConfig::default();
+    let config = engramai::synthesis::types::ClusterDiscoveryConfig::default();
     let candidates: Vec<_> = all
         .iter()
         .filter(|m| {
@@ -43,98 +27,36 @@ fn main() {
                     .unwrap_or(false)
         })
         .collect();
-    println!("Candidate memories (after pre-filter): {}", candidates.len());
+    println!("Candidates: {}", candidates.len());
 
-    // Count Hebbian links
-    let mut hebbian_count: usize = 0;
-    for m in &candidates {
-        if let Ok(links) = storage.get_hebbian_links_weighted(&m.id) {
-            hebbian_count += links.len();
-        }
-    }
-    println!("Hebbian links (involving candidates): {} (directed)", hebbian_count);
+    // Run discover_clusters with timing
+    println!("\n--- discover_clusters (full pipeline) ---");
+    let total_start = Instant::now();
+    let clusters = engramai::synthesis::cluster::discover_clusters(
+        &storage,
+        &config,
+        Some("ollama/nomic-embed-text"),
+    )
+    .expect("cluster discovery failed");
+    let total_elapsed = total_start.elapsed();
 
-    // Count embeddings
-    let embeddings = storage
-        .get_all_embeddings("ollama/nomic-embed-text")
-        .unwrap_or_default();
-    let embedded_candidates = candidates
-        .iter()
-        .filter(|m| embeddings.iter().any(|(id, _)| id == &m.id))
-        .count();
-    println!(
-        "Candidates with embeddings: {}/{}",
-        embedded_candidates,
-        candidates.len()
-    );
+    println!("[{:.3}s] Complete — {} clusters found", total_elapsed.as_secs_f64(), clusters.len());
 
-    println!("\n--- Running cluster discovery ---");
-
-    // Warm-up run
-    print!("Warm-up run... ");
-    let t0 = Instant::now();
-    let _ = cluster::discover_clusters(&storage, &config, Some("ollama/nomic-embed-text"));
-    println!("done in {:.3}s", t0.elapsed().as_secs_f64());
-
-    // Benchmark runs
-    let n_runs = 3;
-    let mut durations = Vec::new();
-    let mut last_clusters = Vec::new();
-
-    for i in 1..=n_runs {
-        print!("Run {}/{}... ", i, n_runs);
-        let t = Instant::now();
-        let clusters =
-            cluster::discover_clusters(&storage, &config, Some("ollama/nomic-embed-text"))
-                .expect("cluster discovery failed");
-        let elapsed = t.elapsed();
-        println!(
-            "{:.3}s — {} clusters found",
-            elapsed.as_secs_f64(),
-            clusters.len()
-        );
-        durations.push(elapsed);
-        last_clusters = clusters;
-    }
-
-    // Stats
-    let avg_ms =
-        durations.iter().map(|d| d.as_secs_f64() * 1000.0).sum::<f64>() / n_runs as f64;
-    let min_ms = durations
-        .iter()
-        .map(|d| d.as_secs_f64() * 1000.0)
-        .fold(f64::MAX, f64::min);
-    let max_ms = durations
-        .iter()
-        .map(|d| d.as_secs_f64() * 1000.0)
-        .fold(0.0_f64, f64::max);
-
-    println!("\n=== Results ===");
-    println!("Runs: {}", n_runs);
-    println!("Average: {:.1}ms", avg_ms);
-    println!("Min:     {:.1}ms", min_ms);
-    println!("Max:     {:.1}ms", max_ms);
-    println!("Clusters found: {}", last_clusters.len());
-
-    // Cluster details
-    if !last_clusters.is_empty() {
+    if !clusters.is_empty() {
         println!("\n--- Top 10 clusters ---");
-        for (i, c) in last_clusters.iter().take(10).enumerate() {
+        for (i, c) in clusters.iter().take(10).enumerate() {
             println!(
-                "  #{}: {} members, quality={:.3}, centroid={}, signal={:?}",
+                "  #{}: {} members, quality={:.3}, signal={:?}",
                 i + 1,
                 c.members.len(),
                 c.quality_score,
-                &c.centroid_id[..8.min(c.centroid_id.len())],
                 c.signals_summary.dominant_signal,
             );
         }
 
-        // Size distribution
-        let sizes: Vec<usize> = last_clusters.iter().map(|c| c.members.len()).collect();
+        let sizes: Vec<usize> = clusters.iter().map(|c| c.members.len()).collect();
         let total_clustered: usize = sizes.iter().sum();
-        println!("\n--- Size distribution ---");
-        println!("Total memories in clusters: {}", total_clustered);
+        println!("\nMemories in clusters: {} / {} candidates", total_clustered, candidates.len());
         println!(
             "Cluster sizes: min={}, max={}, median={}",
             sizes.iter().min().unwrap(),
@@ -147,16 +69,13 @@ fn main() {
         );
     }
 
-    println!("\n--- Performance context ---");
-    println!("N = {} candidates", candidates.len());
-    println!(
-        "N² = {} (brute-force pairs would be)",
-        (candidates.len() as u64) * (candidates.len() as u64)
-    );
-    println!("ISS-001 target: <10s for N=14000");
-    if avg_ms < 10_000.0 {
-        println!("✅ PASS — {:.1}ms < 10,000ms target", avg_ms);
+    println!("\n=== Performance ===");
+    println!("N = {}", candidates.len());
+    println!("Total time: {:.3}s", total_elapsed.as_secs_f64());
+    println!("ISS-001 target: <10s");
+    if total_elapsed.as_secs_f64() < 10.0 {
+        println!("✅ PASS — {:.3}s < 10s", total_elapsed.as_secs_f64());
     } else {
-        println!("❌ FAIL — {:.1}ms > 10,000ms target", avg_ms);
+        println!("❌ FAIL — {:.3}s > 10s", total_elapsed.as_secs_f64());
     }
 }

@@ -192,6 +192,9 @@ impl Storage {
         // Run migrations for promotion candidates
         Self::migrate_promotions(&conn)?;
         
+        // Run migrations for cluster state persistence
+        Self::migrate_cluster_state(&conn)?;
+        
         Ok(Self { conn })
     }
     
@@ -3146,6 +3149,276 @@ impl Storage {
         )?;
         Ok(())
     }
+
+    // ===========================================================================
+    // Cluster State Persistence (incremental clustering)
+    // ===========================================================================
+
+    /// Migrate schema for cluster state tables.
+    fn migrate_cluster_state(conn: &Connection) -> SqlResult<()> {
+        conn.execute_batch(r#"
+            CREATE TABLE IF NOT EXISTS cluster_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                last_full_cluster_at TEXT,
+                last_full_memory_count INTEGER DEFAULT 0,
+                version INTEGER DEFAULT 1
+            );
+            INSERT OR IGNORE INTO cluster_state (id) VALUES (1);
+
+            CREATE TABLE IF NOT EXISTS cluster_assignments (
+                memory_id TEXT PRIMARY KEY,
+                cluster_id TEXT NOT NULL,
+                assigned_at TEXT NOT NULL,
+                method TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 1.0
+            );
+
+            CREATE TABLE IF NOT EXISTS cluster_centroids (
+                cluster_id TEXT PRIMARY KEY,
+                centroid BLOB NOT NULL,
+                member_count INTEGER NOT NULL DEFAULT 0,
+                dirty INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cluster_pending (
+                memory_id TEXT PRIMARY KEY,
+                added_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_cluster_assignments_cluster ON cluster_assignments(cluster_id);
+        "#)?;
+        Ok(())
+    }
+
+    /// Initialize cluster tables (called by migrate, but can be called manually).
+    pub fn init_cluster_tables(&self) -> Result<(), rusqlite::Error> {
+        Self::migrate_cluster_state(&self.conn)
+    }
+
+    /// Get all cluster centroids as (cluster_id, centroid_vec).
+    pub fn get_cluster_centroids(&self) -> Result<Vec<(String, Vec<f32>)>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cluster_id, centroid FROM cluster_centroids"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            Ok((id, bytes_to_f32_vec(&bytes)))
+        })?;
+        rows.collect()
+    }
+
+    /// Assign a memory to a cluster.
+    pub fn assign_to_cluster(
+        &self, memory_id: &str, cluster_id: &str, method: &str, confidence: f64,
+    ) -> Result<(), rusqlite::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO cluster_assignments (memory_id, cluster_id, assigned_at, method, confidence)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![memory_id, cluster_id, now, method, confidence],
+        )?;
+        Ok(())
+    }
+
+    /// Incrementally update a centroid: new = (old * n + new_vec) / (n + 1)
+    pub fn update_centroid_incremental(
+        &self, cluster_id: &str, new_embedding: &[f32],
+    ) -> Result<(), rusqlite::Error> {
+        // Read current centroid + count
+        let result: Option<(Vec<u8>, i64)> = self.conn.query_row(
+            "SELECT centroid, member_count FROM cluster_centroids WHERE cluster_id = ?",
+            params![cluster_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+
+        match result {
+            Some((old_bytes, count)) => {
+                let old = bytes_to_f32_vec(&old_bytes);
+                let n = count as f32;
+                let new_centroid: Vec<f32> = old.iter().zip(new_embedding.iter())
+                    .map(|(o, e)| (o * n + e) / (n + 1.0))
+                    .collect();
+                let new_bytes: Vec<u8> = new_centroid.iter()
+                    .flat_map(|f| f.to_le_bytes())
+                    .collect();
+                self.conn.execute(
+                    "UPDATE cluster_centroids SET centroid = ?1, member_count = member_count + 1, updated_at = ?2 WHERE cluster_id = ?3",
+                    params![new_bytes, now, cluster_id],
+                )?;
+            }
+            None => {
+                // First member — centroid IS the embedding
+                let bytes: Vec<u8> = new_embedding.iter()
+                    .flat_map(|f| f.to_le_bytes())
+                    .collect();
+                self.conn.execute(
+                    "INSERT INTO cluster_centroids (cluster_id, centroid, member_count, dirty, updated_at)
+                     VALUES (?1, ?2, 1, 0, ?3)",
+                    params![cluster_id, bytes, now],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark a cluster as dirty (needs warm recluster).
+    pub fn mark_cluster_dirty(&self, cluster_id: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE cluster_centroids SET dirty = 1 WHERE cluster_id = ?",
+            params![cluster_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get IDs of all dirty clusters.
+    pub fn get_dirty_cluster_ids(&self) -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cluster_id FROM cluster_centroids WHERE dirty = 1"
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// Add a memory to the pending queue (not assigned to any cluster).
+    pub fn add_pending_memory(&self, memory_id: &str) -> Result<(), rusqlite::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO cluster_pending (memory_id, added_at) VALUES (?1, ?2)",
+            params![memory_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Get all pending memory IDs.
+    pub fn get_pending_memory_ids(&self) -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare("SELECT memory_id FROM cluster_pending")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// Get all memory IDs assigned to a specific cluster.
+    pub fn get_cluster_members(&self, cluster_id: &str) -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT memory_id FROM cluster_assignments WHERE cluster_id = ?"
+        )?;
+        let rows = stmt.query_map(params![cluster_id], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// Replace old clusters with new ones after warm/cold recluster.
+    /// Deletes assignments for old_cluster_ids, inserts new assignments from new_clusters.
+    pub fn replace_clusters(
+        &self, old_cluster_ids: &[String], new_clusters: &[(String, Vec<String>, Vec<f32>)],
+        // each tuple: (cluster_id, member_ids, centroid_vec)
+    ) -> Result<(), rusqlite::Error> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Delete old cluster assignments + centroids
+        for cid in old_cluster_ids {
+            tx.execute("DELETE FROM cluster_assignments WHERE cluster_id = ?", params![cid])?;
+            tx.execute("DELETE FROM cluster_centroids WHERE cluster_id = ?", params![cid])?;
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Insert new clusters
+        for (cluster_id, member_ids, centroid) in new_clusters {
+            // Insert centroid
+            let centroid_bytes: Vec<u8> = centroid.iter().flat_map(|f| f.to_le_bytes()).collect();
+            tx.execute(
+                "INSERT OR REPLACE INTO cluster_centroids (cluster_id, centroid, member_count, dirty, updated_at)
+                 VALUES (?1, ?2, ?3, 0, ?4)",
+                params![cluster_id, centroid_bytes, member_ids.len() as i64, now],
+            )?;
+
+            // Insert assignments
+            for mid in member_ids {
+                tx.execute(
+                    "INSERT OR REPLACE INTO cluster_assignments (memory_id, cluster_id, assigned_at, method, confidence)
+                     VALUES (?1, ?2, ?3, 'warm', 1.0)",
+                    params![mid, cluster_id, now],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get memories by a set of IDs.
+    pub fn get_memories_by_ids(&self, ids: &[String]) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Use individual queries to avoid SQL injection with dynamic IN clauses
+        let mut results = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(record) = self.get(id)? {
+                results.push(record);
+            }
+        }
+        Ok(results)
+    }
+
+    /// Clear all pending memories and dirty flags.
+    pub fn clear_pending_and_dirty(&self) -> Result<(), rusqlite::Error> {
+        self.conn.execute("DELETE FROM cluster_pending", [])?;
+        self.conn.execute("UPDATE cluster_centroids SET dirty = 0", [])?;
+        Ok(())
+    }
+
+    /// Save full cluster state after a cold recluster.
+    /// Replaces ALL cluster data with the provided clusters.
+    pub fn save_full_cluster_state(
+        &self, clusters: &[(String, Vec<String>, Vec<f32>)],
+    ) -> Result<(), rusqlite::Error> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Clear everything
+        tx.execute("DELETE FROM cluster_assignments", [])?;
+        tx.execute("DELETE FROM cluster_centroids", [])?;
+        tx.execute("DELETE FROM cluster_pending", [])?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Update cluster_state metadata
+        tx.execute(
+            "UPDATE cluster_state SET last_full_cluster_at = ?1, last_full_memory_count = ?2 WHERE id = 1",
+            params![now, clusters.iter().map(|(_, members, _)| members.len()).sum::<usize>() as i64],
+        )?;
+
+        // Insert all clusters
+        for (cluster_id, member_ids, centroid) in clusters {
+            let centroid_bytes: Vec<u8> = centroid.iter().flat_map(|f| f.to_le_bytes()).collect();
+            tx.execute(
+                "INSERT INTO cluster_centroids (cluster_id, centroid, member_count, dirty, updated_at)
+                 VALUES (?1, ?2, ?3, 0, ?4)",
+                params![cluster_id, centroid_bytes, member_ids.len() as i64, now],
+            )?;
+
+            for mid in member_ids {
+                tx.execute(
+                    "INSERT INTO cluster_assignments (memory_id, cluster_id, assigned_at, method, confidence)
+                     VALUES (?1, ?2, ?3, 'full', 1.0)",
+                    params![mid, cluster_id, now],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get the count of pending memories.
+    pub fn get_pending_count(&self) -> Result<usize, rusqlite::Error> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM cluster_pending", [], |row| row.get::<_, i64>(0)
+        ).map(|c| c as usize)
+    }
 }
 
 #[cfg(test)]
@@ -3458,5 +3731,176 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         assert_eq!(source_after, "corecall", "signal_source should be backfilled to 'corecall'");
+    }
+
+    // ===========================================================================
+    // Cluster State Persistence Tests
+    // ===========================================================================
+
+    #[test]
+    fn test_cluster_centroids_roundtrip() {
+        let storage = test_storage();
+        let centroid = vec![1.0f32, 2.0, 3.0];
+        storage.update_centroid_incremental("cluster_a", &centroid).unwrap();
+
+        let centroids = storage.get_cluster_centroids().unwrap();
+        assert_eq!(centroids.len(), 1);
+        assert_eq!(centroids[0].0, "cluster_a");
+        assert_eq!(centroids[0].1, vec![1.0f32, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_assign_to_cluster() {
+        let storage = test_storage();
+        storage.assign_to_cluster("mem_1", "cluster_a", "hot", 0.95).unwrap();
+
+        let members = storage.get_cluster_members("cluster_a").unwrap();
+        assert_eq!(members, vec!["mem_1".to_string()]);
+    }
+
+    #[test]
+    fn test_centroid_incremental_update() {
+        let storage = test_storage();
+        // Insert initial centroid [1, 0, 0]
+        storage.update_centroid_incremental("cluster_a", &[1.0, 0.0, 0.0]).unwrap();
+
+        // Incrementally update with [0, 1, 0]
+        // Expected: (old * 1 + new) / 2 = ([1,0,0] + [0,1,0]) / 2 = [0.5, 0.5, 0.0]
+        storage.update_centroid_incremental("cluster_a", &[0.0, 1.0, 0.0]).unwrap();
+
+        let centroids = storage.get_cluster_centroids().unwrap();
+        assert_eq!(centroids.len(), 1);
+        let (id, vec) = &centroids[0];
+        assert_eq!(id, "cluster_a");
+        assert!((vec[0] - 0.5).abs() < 1e-6, "expected 0.5, got {}", vec[0]);
+        assert!((vec[1] - 0.5).abs() < 1e-6, "expected 0.5, got {}", vec[1]);
+        assert!((vec[2] - 0.0).abs() < 1e-6, "expected 0.0, got {}", vec[2]);
+    }
+
+    #[test]
+    fn test_dirty_cluster_tracking() {
+        let storage = test_storage();
+        // Create a centroid first
+        storage.update_centroid_incremental("cluster_a", &[1.0, 0.0]).unwrap();
+        storage.update_centroid_incremental("cluster_b", &[0.0, 1.0]).unwrap();
+
+        // Mark one as dirty
+        storage.mark_cluster_dirty("cluster_a").unwrap();
+
+        let dirty = storage.get_dirty_cluster_ids().unwrap();
+        assert_eq!(dirty, vec!["cluster_a".to_string()]);
+
+        // Clear dirty flags
+        storage.clear_pending_and_dirty().unwrap();
+        let dirty = storage.get_dirty_cluster_ids().unwrap();
+        assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn test_pending_memory_tracking() {
+        let storage = test_storage();
+        storage.add_pending_memory("mem_1").unwrap();
+        storage.add_pending_memory("mem_2").unwrap();
+        // Duplicate should be ignored
+        storage.add_pending_memory("mem_1").unwrap();
+
+        let pending = storage.get_pending_memory_ids().unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(pending.contains(&"mem_1".to_string()));
+        assert!(pending.contains(&"mem_2".to_string()));
+
+        assert_eq!(storage.get_pending_count().unwrap(), 2);
+
+        // Clear pending
+        storage.clear_pending_and_dirty().unwrap();
+        let pending = storage.get_pending_memory_ids().unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(storage.get_pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_replace_clusters() {
+        let storage = test_storage();
+
+        // Create initial clusters
+        storage.update_centroid_incremental("old_c1", &[1.0, 0.0]).unwrap();
+        storage.assign_to_cluster("mem_1", "old_c1", "full", 1.0).unwrap();
+        storage.assign_to_cluster("mem_2", "old_c1", "full", 1.0).unwrap();
+
+        storage.update_centroid_incremental("old_c2", &[0.0, 1.0]).unwrap();
+        storage.assign_to_cluster("mem_3", "old_c2", "full", 1.0).unwrap();
+
+        // Replace old clusters with new ones
+        let new_clusters = vec![
+            ("new_c1".to_string(), vec!["mem_1".to_string(), "mem_3".to_string()], vec![0.5f32, 0.5]),
+        ];
+        storage.replace_clusters(
+            &["old_c1".to_string(), "old_c2".to_string()],
+            &new_clusters,
+        ).unwrap();
+
+        // Old clusters should be gone
+        assert!(storage.get_cluster_members("old_c1").unwrap().is_empty());
+        assert!(storage.get_cluster_members("old_c2").unwrap().is_empty());
+
+        // New cluster should exist
+        let members = storage.get_cluster_members("new_c1").unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members.contains(&"mem_1".to_string()));
+        assert!(members.contains(&"mem_3".to_string()));
+
+        // Centroid should be correct
+        let centroids = storage.get_cluster_centroids().unwrap();
+        let new_centroid = centroids.iter().find(|(id, _)| id == "new_c1").unwrap();
+        assert_eq!(new_centroid.1, vec![0.5f32, 0.5]);
+    }
+
+    #[test]
+    fn test_save_full_cluster_state() {
+        let storage = test_storage();
+
+        // Add some pre-existing data
+        storage.update_centroid_incremental("old_c", &[1.0]).unwrap();
+        storage.assign_to_cluster("mem_x", "old_c", "hot", 0.5).unwrap();
+        storage.add_pending_memory("mem_p").unwrap();
+
+        // Save full cluster state (replaces everything)
+        let clusters = vec![
+            ("c1".to_string(), vec!["m1".to_string(), "m2".to_string()], vec![1.0f32, 0.0]),
+            ("c2".to_string(), vec!["m3".to_string()], vec![0.0f32, 1.0]),
+        ];
+        storage.save_full_cluster_state(&clusters).unwrap();
+
+        // Old data should be gone
+        assert!(storage.get_cluster_members("old_c").unwrap().is_empty());
+        assert!(storage.get_pending_memory_ids().unwrap().is_empty());
+
+        // New data should be present
+        let members_c1 = storage.get_cluster_members("c1").unwrap();
+        assert_eq!(members_c1.len(), 2);
+        assert!(members_c1.contains(&"m1".to_string()));
+        assert!(members_c1.contains(&"m2".to_string()));
+
+        let members_c2 = storage.get_cluster_members("c2").unwrap();
+        assert_eq!(members_c2, vec!["m3".to_string()]);
+
+        let centroids = storage.get_cluster_centroids().unwrap();
+        assert_eq!(centroids.len(), 2);
+
+        // Verify cluster_state metadata was updated
+        let (last_at, count): (String, i64) = storage.conn.query_row(
+            "SELECT last_full_cluster_at, last_full_memory_count FROM cluster_state WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert!(!last_at.is_empty());
+        assert_eq!(count, 3); // m1, m2, m3
+    }
+
+    #[test]
+    fn test_get_memories_by_ids_empty() {
+        let storage = test_storage();
+        let result = storage.get_memories_by_ids(&[]).unwrap();
+        assert!(result.is_empty());
     }
 }

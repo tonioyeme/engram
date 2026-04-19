@@ -92,6 +92,300 @@ pub fn compute_composite_score(signals: &PairwiseSignals, weights: &ClusterWeigh
         + weights.temporal * signals.temporal_proximity
 }
 
+// ===========================================================================
+// VP-tree for approximate nearest-neighbor search
+// ===========================================================================
+
+// ===========================================================================
+// Hot path: assign new memory to nearest cluster
+// ===========================================================================
+
+/// Result of hot-assigning a new memory to the nearest cluster.
+#[derive(Debug, Clone)]
+pub enum HotAssignResult {
+    /// Memory was assigned to an existing cluster.
+    Assigned {
+        cluster_id: String,
+        confidence: f64,
+    },
+    /// No cluster was close enough; memory is pending for warm/cold recluster.
+    Pending,
+    /// No clusters exist yet; memory is pending.
+    NoClusters,
+}
+
+/// Cosine similarity between two vectors.
+/// For L2-normalized vectors, this is equivalent to dot product.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
+    let norm_a: f64 = a.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+    let norm_b: f64 = b.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    dot / (norm_a * norm_b)
+}
+
+/// Hot path: assign a new memory to the nearest existing cluster.
+///
+/// Loads all cluster centroids from storage, finds the one with highest
+/// cosine similarity to the new memory's embedding, and assigns if above
+/// threshold. Otherwise marks as pending for warm/cold recluster.
+///
+/// Complexity: O(C) where C = number of clusters (typically < 100).
+pub fn assign_new_memory(
+    storage: &Storage,
+    memory_id: &str,
+    embedding: &[f32],
+    config: &ClusterDiscoveryConfig,
+) -> Result<HotAssignResult, Box<dyn std::error::Error>> {
+    let centroids = storage.get_cluster_centroids()?;
+
+    if centroids.is_empty() {
+        storage.add_pending_memory(memory_id)?;
+        return Ok(HotAssignResult::NoClusters);
+    }
+
+    // Find nearest centroid by cosine similarity
+    let threshold = config.hot_assign_threshold.unwrap_or(0.6);
+    let mut best_cluster: Option<(&str, f64)> = None;
+
+    for (cluster_id, centroid) in &centroids {
+        let sim = cosine_similarity(embedding, centroid);
+        if let Some((_, best_sim)) = best_cluster {
+            if sim > best_sim {
+                best_cluster = Some((cluster_id.as_str(), sim));
+            }
+        } else {
+            best_cluster = Some((cluster_id.as_str(), sim));
+        }
+    }
+
+    if let Some((cluster_id, sim)) = best_cluster {
+        if sim >= threshold {
+            storage.assign_to_cluster(memory_id, cluster_id, "hot", sim)?;
+            storage.update_centroid_incremental(cluster_id, embedding)?;
+            storage.mark_cluster_dirty(cluster_id)?;
+            Ok(HotAssignResult::Assigned {
+                cluster_id: cluster_id.to_string(),
+                confidence: sim,
+            })
+        } else {
+            storage.add_pending_memory(memory_id)?;
+            Ok(HotAssignResult::Pending)
+        }
+    } else {
+        storage.add_pending_memory(memory_id)?;
+        Ok(HotAssignResult::Pending)
+    }
+}
+
+// ===========================================================================
+// VP-tree for approximate nearest-neighbor search
+// ===========================================================================
+
+/// L2 (Euclidean) distance between two vectors.
+fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f32>()
+        .sqrt()
+}
+
+/// Node in a Vantage-Point Tree.
+struct VpNode {
+    point_idx: usize,      // index into VpTree::points
+    threshold: f32,        // median distance (split boundary)
+    left: Option<usize>,   // index into VpTree::nodes
+    right: Option<usize>,  // index into VpTree::nodes
+}
+
+/// Vantage-Point Tree for nearest-neighbor search on L2-normalized embeddings.
+/// Distance metric: L2 (equivalent ranking to cosine for normalized vectors).
+struct VpTree {
+    nodes: Vec<VpNode>,
+    points: Vec<(usize, Vec<f32>)>, // (original_index, embedding)
+}
+
+impl VpTree {
+    /// Build a VP-tree from a set of points. O(n log n).
+    fn build(points: &[(usize, &[f32])]) -> VpTree {
+        let owned_points: Vec<(usize, Vec<f32>)> = points
+            .iter()
+            .map(|(idx, emb)| (*idx, emb.to_vec()))
+            .collect();
+        let mut tree = VpTree {
+            nodes: Vec::new(),
+            points: owned_points,
+        };
+        if tree.points.is_empty() {
+            return tree;
+        }
+        let indices: Vec<usize> = (0..tree.points.len()).collect();
+        tree.build_recursive(&indices);
+        tree
+    }
+
+    fn build_recursive(&mut self, indices: &[usize]) -> Option<usize> {
+        if indices.is_empty() {
+            return None;
+        }
+        // Pick first element as vantage point
+        let vp_idx = indices[0];
+        let rest = &indices[1..];
+        if rest.is_empty() {
+            let node_idx = self.nodes.len();
+            self.nodes.push(VpNode {
+                point_idx: vp_idx,
+                threshold: 0.0,
+                left: None,
+                right: None,
+            });
+            return Some(node_idx);
+        }
+
+        // Compute distances from vantage point to all others
+        let vp_emb = self.points[vp_idx].1.clone();
+        let mut dists: Vec<(usize, f32)> = rest
+            .iter()
+            .map(|&i| (i, l2_distance(&vp_emb, &self.points[i].1)))
+            .collect();
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Median distance = threshold
+        let median_pos = dists.len() / 2;
+        let threshold = dists[median_pos].1;
+
+        // Split: left = dist <= threshold, right = dist > threshold
+        let left_indices: Vec<usize> = dists[..=median_pos].iter().map(|(i, _)| *i).collect();
+        let right_indices: Vec<usize> = dists[median_pos + 1..].iter().map(|(i, _)| *i).collect();
+
+        let node_idx = self.nodes.len();
+        self.nodes.push(VpNode {
+            point_idx: vp_idx,
+            threshold,
+            left: None,
+            right: None,
+        });
+
+        let left = self.build_recursive(&left_indices);
+        let right = self.build_recursive(&right_indices);
+        self.nodes[node_idx].left = left;
+        self.nodes[node_idx].right = right;
+
+        Some(node_idx)
+    }
+
+}
+
+impl VpTree {
+    fn search_node(
+        &self,
+        node_idx: usize,
+        query: &[f32],
+        query_orig_idx: usize,
+        k: usize,
+        heap: &mut Vec<(f32, usize)>, // manually managed max-heap
+    ) {
+        let node = &self.nodes[node_idx];
+        let candidate = &self.points[node.point_idx];
+        let d = l2_distance(query, &candidate.1);
+
+        // Skip self
+        if candidate.0 != query_orig_idx {
+            if heap.len() < k {
+                heap.push((d, candidate.0));
+                // Bubble up to maintain max-heap
+                let mut i = heap.len() - 1;
+                while i > 0 {
+                    let parent = (i - 1) / 2;
+                    if heap[i].0 > heap[parent].0 {
+                        heap.swap(i, parent);
+                        i = parent;
+                    } else {
+                        break;
+                    }
+                }
+            } else if d < heap[0].0 {
+                // Replace max element
+                heap[0] = (d, candidate.0);
+                // Sift down
+                let mut i = 0;
+                loop {
+                    let left = 2 * i + 1;
+                    let right = 2 * i + 2;
+                    let mut largest = i;
+                    if left < heap.len() && heap[left].0 > heap[largest].0 {
+                        largest = left;
+                    }
+                    if right < heap.len() && heap[right].0 > heap[largest].0 {
+                        largest = right;
+                    }
+                    if largest != i {
+                        heap.swap(i, largest);
+                        i = largest;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if d <= node.threshold {
+            // Query is inside: search left (closer) first
+            if let Some(left) = node.left {
+                self.search_node(left, query, query_orig_idx, k, heap);
+            }
+            // Search right if it could contain closer points
+            let tau = if heap.len() < k { f32::INFINITY } else { heap[0].0 };
+            if d + tau > node.threshold {
+                if let Some(right) = node.right {
+                    self.search_node(right, query, query_orig_idx, k, heap);
+                }
+            }
+        } else {
+            // Query is outside: search right (closer) first
+            if let Some(right) = node.right {
+                self.search_node(right, query, query_orig_idx, k, heap);
+            }
+            // Search left if it could contain closer points
+            let tau = if heap.len() < k { f32::INFINITY } else { heap[0].0 };
+            if d - tau <= node.threshold {
+                if let Some(left) = node.left {
+                    self.search_node(left, query, query_orig_idx, k, heap);
+                }
+            }
+        }
+    }
+
+    fn query_k_nearest_impl(&self, query_idx: usize, k: usize) -> Vec<(usize, f32)> {
+        if self.nodes.is_empty() || k == 0 {
+            return Vec::new();
+        }
+
+        let query_internal = self
+            .points
+            .iter()
+            .position(|(orig, _)| *orig == query_idx);
+        let query_internal = match query_internal {
+            Some(i) => i,
+            None => return Vec::new(),
+        };
+        let query_emb = self.points[query_internal].1.clone();
+
+        let mut heap: Vec<(f32, usize)> = Vec::with_capacity(k);
+        self.search_node(0, &query_emb, query_idx, k, &mut heap);
+
+        let mut result: Vec<(usize, f32)> = heap.into_iter().map(|(d, idx)| (idx, d)).collect();
+        result.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        result
+    }
+}
+
 /// Discover clusters of related memories.
 ///
 /// Performance optimization: only compute pairwise scores for memory pairs
@@ -116,6 +410,45 @@ pub fn discover_clusters(
         return Ok(Vec::new());
     }
 
+    discover_clusters_inner(storage, &candidates, config, embedding_model)
+}
+
+/// Discover clusters from a subset of memories specified by ID.
+///
+/// Like [`discover_clusters`] but operates only on the given memory IDs
+/// instead of loading all memories from storage. Used by the warm
+/// (incremental) recluster path.
+pub fn discover_clusters_subset(
+    storage: &Storage,
+    memory_ids: &[String],
+    config: &ClusterDiscoveryConfig,
+    embedding_model: Option<&str>,
+) -> Result<Vec<MemoryCluster>, Box<dyn std::error::Error>> {
+    // Load only the specified memories
+    let records = storage.get_memories_by_ids(memory_ids)?;
+    let candidates: Vec<&MemoryRecord> = records
+        .iter()
+        .filter(|m| !is_synthesis_output(m))
+        .collect();
+
+    if candidates.len() < config.min_cluster_size {
+        return Ok(Vec::new());
+    }
+
+    discover_clusters_inner(storage, &candidates, config, embedding_model)
+}
+
+/// Shared implementation for cluster discovery (Steps 2-6).
+///
+/// Takes pre-filtered candidate memories and runs the full pipeline:
+/// signal map construction, candidate pair generation, composite scoring,
+/// Infomap community detection, and cluster building.
+fn discover_clusters_inner(
+    storage: &Storage,
+    candidates: &[&MemoryRecord],
+    config: &ClusterDiscoveryConfig,
+    embedding_model: Option<&str>,
+) -> Result<Vec<MemoryCluster>, Box<dyn std::error::Error>> {
     let candidate_ids: HashSet<&str> = candidates.iter().map(|m| m.id.as_str()).collect();
     let records: HashMap<String, &MemoryRecord> =
         candidates.iter().map(|m| (m.id.clone(), *m)).collect();
@@ -123,7 +456,7 @@ pub fn discover_clusters(
     // Step 2: Build signal maps (pre-compute for O(n) instead of O(n²) queries)
     // Hebbian: query all links involving candidates
     let mut hebbian_map: HashMap<(String, String), f64> = HashMap::new();
-    for m in &candidates {
+    for m in candidates {
         if let Ok(links) = storage.get_hebbian_links_weighted(&m.id) {
             for (neighbor, weight) in links {
                 if candidate_ids.contains(neighbor.as_str()) {
@@ -140,7 +473,7 @@ pub fn discover_clusters(
 
     // Entity: get entities for each candidate
     let mut entity_map: HashMap<String, HashSet<String>> = HashMap::new();
-    for m in &candidates {
+    for m in candidates {
         if let Ok(entities) = storage.get_entity_ids_for_memory(&m.id) {
             entity_map.insert(m.id.clone(), entities.into_iter().collect());
         }
@@ -188,6 +521,48 @@ pub fn discover_clusters(
         }
     }
 
+    // From embedding ANN (VP-tree k-nearest neighbors)
+    if !embedding_map.is_empty() {
+        // Build index mapping for VP-tree
+        let embedding_ids: Vec<String> = embedding_map.keys().cloned().collect();
+        let points: Vec<(usize, &[f32])> = embedding_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(i, id)| embedding_map.get(id).map(|emb| (i, emb.as_slice())))
+            .collect();
+
+        if points.len() >= 2 {
+            let vp_tree = VpTree::build(&points);
+            let ann_k = config.max_neighbors_per_node.unwrap_or_else(|| {
+                let adaptive = (points.len() as f64).sqrt().round() as usize;
+                adaptive.clamp(5, 30)
+            });
+
+            for (i, id) in embedding_ids.iter().enumerate() {
+                if candidate_ids.contains(id.as_str()) {
+                    let neighbors = vp_tree.query_k_nearest_impl(i, ann_k);
+                    for (j, _dist) in &neighbors {
+                        let neighbor_id = &embedding_ids[*j];
+                        if candidate_ids.contains(neighbor_id.as_str()) {
+                            let pair = if id < neighbor_id {
+                                (id.clone(), neighbor_id.clone())
+                            } else {
+                                (neighbor_id.clone(), id.clone())
+                            };
+                            candidate_pairs.insert(pair);
+                        }
+                    }
+                }
+            }
+
+            log::debug!(
+                "ANN pairs added: k={}, embedding_count={}",
+                ann_k,
+                points.len()
+            );
+        }
+    }
+
     // Step 4: Compute scores and build edge list
     let mut edges: Vec<(String, String, f64)> = Vec::new();
     for (id_a, id_b) in &candidate_pairs {
@@ -208,7 +583,28 @@ pub fn discover_clusters(
     }
 
     // Step 5: Infomap community detection
+    //
+    // Sparsify the edge list before feeding to Infomap: keep only the top-K
+    // strongest edges per node. This reduces Infomap runtime from O(E * trials)
+    // to manageable levels for large graphs while preserving local structure.
+    //
+    // Adaptive default: clamp(sqrt(n), 5, 30) — scales with graph size.
+    // Small graphs keep most edges; large graphs get aggressive pruning.
+    let n = candidate_ids.len();
+    let max_neighbors = config.max_neighbors_per_node.unwrap_or_else(|| {
+        let adaptive = (n as f64).sqrt().round() as usize;
+        adaptive.clamp(5, 30)
+    });
+    log::debug!(
+        "cluster sparsification: nodes={}, edges_before={}, max_neighbors={} ({})",
+        n,
+        edges.len(),
+        max_neighbors,
+        if config.max_neighbors_per_node.is_some() { "manual" } else { "adaptive" },
+    );
+    let edges = sparsify_edges(edges, max_neighbors);
     let clusters = infomap_communities(&edges, &candidate_ids, config);
+
 
     // Step 6: Build MemoryCluster structs
     let mut result: Vec<MemoryCluster> = Vec::new();
@@ -228,6 +624,36 @@ pub fn discover_clusters(
     });
 
     Ok(result)
+}
+
+/// Sparsify edge list by keeping only the top-K strongest edges per node.
+///
+/// This preserves local neighborhood structure while dramatically reducing
+/// the total edge count for Infomap. Each undirected edge (a,b) counts
+/// towards both a's and b's quota.
+fn sparsify_edges(
+    mut edges: Vec<(String, String, f64)>,
+    k: usize,
+) -> Vec<(String, String, f64)> {
+    // Sort edges by weight descending
+    edges.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut neighbor_count: HashMap<String, usize> = HashMap::new();
+    let mut kept = Vec::new();
+
+    for (a, b, w) in edges {
+        let count_a = neighbor_count.get(&a).copied().unwrap_or(0);
+        let count_b = neighbor_count.get(&b).copied().unwrap_or(0);
+
+        // Keep edge if either endpoint still has room
+        if count_a < k || count_b < k {
+            *neighbor_count.entry(a.clone()).or_insert(0) += 1;
+            *neighbor_count.entry(b.clone()).or_insert(0) += 1;
+            kept.push((a, b, w));
+        }
+    }
+
+    kept
 }
 
 /// Check if a memory is a synthesis output (via metadata).
@@ -277,7 +703,37 @@ fn infomap_communities(
         }
     }
 
-    let result = Infomap::new(&network).seed(42).run();
+    // Adaptive Infomap parameters:
+    // - trials: 1 for sparse graphs (density < 5), 3 for dense graphs
+    // - hierarchical: true for large graphs (>2000 nodes), false otherwise
+    // Manual config overrides adaptive defaults.
+    let edge_density = if id_list.is_empty() {
+        0.0
+    } else {
+        edges.len() as f64 / id_list.len() as f64
+    };
+    let trials = config.infomap_trials.unwrap_or_else(|| {
+        if edge_density < 5.0 { 1 } else { 3 }
+    });
+    let hierarchical = config.infomap_hierarchical.unwrap_or_else(|| {
+        id_list.len() > 2000
+    });
+
+    log::debug!(
+        "infomap params: nodes={}, edges={}, density={:.1}, trials={} ({}), hierarchical={} ({})",
+        id_list.len(),
+        edges.len(),
+        edge_density,
+        trials,
+        if config.infomap_trials.is_some() { "manual" } else { "adaptive" },
+        hierarchical,
+        if config.infomap_hierarchical.is_some() { "manual" } else { "adaptive" },
+    );
+    let result = Infomap::new(&network)
+        .seed(42)
+        .num_trials(trials)
+        .hierarchical(hierarchical)
+        .run();
 
     // Group node indices by module assignment.
     let mut modules: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -897,5 +1353,202 @@ mod tests {
                 .collect();
         let salience = compute_emotional_salience(&cluster, &members_map);
         assert_eq!(salience, 0.0);
+    }
+
+    // ===================================================================
+    // VP-tree tests
+    // ===================================================================
+
+    #[test]
+    fn test_l2_distance() {
+        let a = vec![1.0_f32, 0.0, 0.0];
+        let b = vec![0.0_f32, 1.0, 0.0];
+        let d = l2_distance(&a, &b);
+        assert!((d - std::f32::consts::SQRT_2).abs() < 1e-6);
+
+        // Same point → 0
+        assert!((l2_distance(&a, &a)).abs() < 1e-9);
+
+        // Known distance
+        let c = vec![3.0_f32, 4.0, 0.0];
+        let origin = vec![0.0_f32, 0.0, 0.0];
+        assert!((l2_distance(&c, &origin) - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_vp_tree_build_and_query() {
+        // 10 known 3D points
+        let raw: Vec<Vec<f32>> = vec![
+            vec![0.0, 0.0, 0.0], // 0
+            vec![1.0, 0.0, 0.0], // 1
+            vec![0.0, 1.0, 0.0], // 2
+            vec![0.0, 0.0, 1.0], // 3
+            vec![1.0, 1.0, 0.0], // 4
+            vec![1.0, 0.0, 1.0], // 5
+            vec![0.0, 1.0, 1.0], // 6
+            vec![1.0, 1.0, 1.0], // 7
+            vec![0.5, 0.5, 0.5], // 8  — center
+            vec![0.1, 0.1, 0.1], // 9  — near origin
+        ];
+        let points: Vec<(usize, &[f32])> =
+            raw.iter().enumerate().map(|(i, v)| (i, v.as_slice())).collect();
+        let tree = VpTree::build(&points);
+
+        // Query point 0 (origin), k=3
+        // Distances from origin:
+        //   9: sqrt(0.03) ≈ 0.173
+        //   8: sqrt(0.75) ≈ 0.866
+        //   1,2,3: 1.0 each
+        // So k=3 nearest = [9, 8, one of {1,2,3}]
+        let result = tree.query_k_nearest_impl(0, 3);
+        assert_eq!(result.len(), 3);
+        // First neighbor must be point 9
+        assert_eq!(result[0].0, 9);
+        // Second must be point 8
+        assert_eq!(result[1].0, 8);
+        // Third should be from {1, 2, 3} (all at distance 1.0)
+        assert!([1, 2, 3].contains(&result[2].0));
+    }
+
+    #[test]
+    fn test_vp_tree_single_point() {
+        let raw = vec![vec![1.0_f32, 2.0, 3.0]];
+        let points: Vec<(usize, &[f32])> = vec![(0, raw[0].as_slice())];
+        let tree = VpTree::build(&points);
+        let result = tree.query_k_nearest_impl(0, 3);
+        // Only one point, and it's the query → empty
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_vp_tree_two_points() {
+        let raw = vec![vec![0.0_f32, 0.0], vec![1.0_f32, 0.0]];
+        let points: Vec<(usize, &[f32])> = vec![(0, raw[0].as_slice()), (1, raw[1].as_slice())];
+        let tree = VpTree::build(&points);
+
+        let result = tree.query_k_nearest_impl(0, 5);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 1);
+        assert!((result[0].1 - 1.0).abs() < 1e-6);
+
+        let result = tree.query_k_nearest_impl(1, 5);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 0);
+    }
+
+    // =======================================================================
+    // Cosine similarity tests
+    // =======================================================================
+
+    #[test]
+    fn test_cosine_similarity_identical() {
+        let v = vec![1.0_f32, 2.0, 3.0];
+        let sim = cosine_similarity(&v, &v);
+        assert!((sim - 1.0).abs() < 1e-9, "identical vectors should have similarity 1.0, got {}", sim);
+    }
+
+    #[test]
+    fn test_cosine_similarity_orthogonal() {
+        let a = vec![1.0_f32, 0.0, 0.0];
+        let b = vec![0.0_f32, 1.0, 0.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!(sim.abs() < 1e-9, "orthogonal vectors should have similarity 0.0, got {}", sim);
+    }
+
+    #[test]
+    fn test_cosine_similarity_opposite() {
+        let a = vec![1.0_f32, 2.0, 3.0];
+        let b = vec![-1.0_f32, -2.0, -3.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!((sim - (-1.0)).abs() < 1e-9, "opposite vectors should have similarity -1.0, got {}", sim);
+    }
+
+    // =======================================================================
+    // Hot path assign_new_memory tests
+    // =======================================================================
+
+    use crate::storage::Storage;
+
+    fn test_storage() -> Storage {
+        let s = Storage::new(":memory:").unwrap();
+        s.init_cluster_tables().unwrap();
+        s
+    }
+
+    #[test]
+    fn test_assign_new_memory_no_clusters() {
+        let storage = test_storage();
+        let config = ClusterDiscoveryConfig::default();
+        let embedding = vec![1.0_f32, 0.0, 0.0];
+
+        let result = assign_new_memory(&storage, "mem-1", &embedding, &config).unwrap();
+        match result {
+            HotAssignResult::NoClusters => {} // expected
+            other => panic!("expected NoClusters, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_assign_new_memory_assigned() {
+        let storage = test_storage();
+        let config = ClusterDiscoveryConfig::default();
+
+        // Seed a centroid: [1.0, 0.0, 0.0]
+        let centroid = vec![1.0_f32, 0.0, 0.0];
+        storage.update_centroid_incremental("cluster-a", &centroid).unwrap();
+
+        // New memory very similar to the centroid
+        let embedding = vec![0.9_f32, 0.1, 0.0];
+        let result = assign_new_memory(&storage, "mem-1", &embedding, &config).unwrap();
+        match result {
+            HotAssignResult::Assigned { cluster_id, confidence } => {
+                assert_eq!(cluster_id, "cluster-a");
+                assert!(confidence >= 0.6, "confidence {} should be >= 0.6", confidence);
+            }
+            other => panic!("expected Assigned, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_assign_new_memory_pending() {
+        let storage = test_storage();
+        let config = ClusterDiscoveryConfig::default();
+
+        // Seed a centroid: [1.0, 0.0, 0.0]
+        let centroid = vec![1.0_f32, 0.0, 0.0];
+        storage.update_centroid_incremental("cluster-a", &centroid).unwrap();
+
+        // New memory nearly orthogonal → below threshold
+        let embedding = vec![0.0_f32, 1.0, 0.0];
+        let result = assign_new_memory(&storage, "mem-2", &embedding, &config).unwrap();
+        match result {
+            HotAssignResult::Pending => {} // expected
+            other => panic!("expected Pending, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_vp_tree_excludes_self() {
+        let raw = vec![
+            vec![0.0_f32, 0.0],
+            vec![1.0, 0.0],
+            vec![2.0, 0.0],
+            vec![3.0, 0.0],
+        ];
+        let points: Vec<(usize, &[f32])> =
+            raw.iter().enumerate().map(|(i, v)| (i, v.as_slice())).collect();
+        let tree = VpTree::build(&points);
+
+        for i in 0..4 {
+            let result = tree.query_k_nearest_impl(i, 10);
+            // Must not contain self
+            assert!(
+                !result.iter().any(|(idx, _)| *idx == i),
+                "query_k_nearest for point {} returned self in results",
+                i
+            );
+            // Should have exactly 3 neighbors (all others)
+            assert_eq!(result.len(), 3);
+        }
     }
 }

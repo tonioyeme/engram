@@ -3,7 +3,7 @@
 //! Combines signal scores, filters by threshold, enforces link budget,
 //! and persists associations to the database.
 
-use crate::association::signals::{SignalComputer, SignalScores};
+use crate::association::signals::SignalComputer;
 use crate::config::AssociationConfig;
 use crate::storage::Storage;
 
@@ -182,6 +182,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn store_memory_with_embedding(
         storage: &mut Storage,
         id: &str,

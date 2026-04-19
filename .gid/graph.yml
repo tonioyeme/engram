@@ -24,8 +24,8 @@ nodes:
   - filter
   priority: 10
   metadata:
-    file: rustclaw/src/engram_hooks.rs
     project: rustclaw
+    file: rustclaw/src/engram_hooks.rs
 - id: a2-extractor-negatives
   title: 'A2: Extractor prompt 加 negative examples'
   status: done
@@ -164,10 +164,10 @@ nodes:
   - storage
   priority: 20
   metadata:
+    iss: ISS-009
     files:
     - src/storage.rs
     project: engramai
-    iss: ISS-009
 - id: entity-add-raw
   title: 'B1.4: Integrate entity extraction into add_raw()'
   status: done
@@ -216,11 +216,11 @@ nodes:
   - recall
   priority: 20
   metadata:
+    iss: ISS-009
+    project: engramai
     files:
     - src/entities.rs
     - src/memory.rs
-    project: engramai
-    iss: ISS-009
 - id: entity-backfill
   title: 'B1.6: Backfill CLI command for existing memories'
   status: done
@@ -242,9 +242,9 @@ nodes:
   - cli
   priority: 20
   metadata:
+    iss: ISS-009
     files:
     - src/main.rs
-    iss: ISS-009
     project: engramai
 - id: entity-integration-tests
   title: 'B1.7: Entity indexing integration tests'
@@ -268,9 +268,9 @@ nodes:
   priority: 20
   metadata:
     project: engramai
-    iss: ISS-009
     files:
     - tests/entity_integration_test.rs
+    iss: ISS-009
 - id: b2-dedup
   title: 'B2: Dedup on write — embedding similarity + merge (ISS-003)'
   status: done
@@ -306,8 +306,8 @@ nodes:
   - confidence
   priority: 30
   metadata:
-    iss: ISS-007
     project: engramai
+    iss: ISS-007
 - id: b4-recency
   title: 'B4: Recency 调参 — ACT-R decay analysis + tuning (ISS-002)'
   status: done
@@ -324,8 +324,8 @@ nodes:
   - recency
   priority: 35
   metadata:
-    iss: ISS-002
     project: engramai
+    iss: ISS-002
 - id: iss-005-synthesis
   title: 'ISS-005: Knowledge Synthesis Engine'
   status: done
@@ -457,9 +457,9 @@ nodes:
   priority: 10
   type: task
   metadata:
-    design_ref: compilation/design.md §3.1
     file: src/compiler/discovery.rs
     goals: GOAL-comp.1
+    design_ref: compilation/design.md §3.1
 - id: kc-compilation-pipeline
   title: Compilation Pipeline (compile + provenance + failure handling)
   status: done
@@ -485,9 +485,9 @@ nodes:
   priority: 10
   type: task
   metadata:
-    file: src/compiler/trigger.rs
     design_ref: compilation/design.md §3.3
     goals: GOAL-comp.4, GOAL-comp.5
+    file: src/compiler/trigger.rs
 - id: kc-topic-lifecycle
   title: Topic Lifecycle (merge + split)
   status: done
@@ -499,9 +499,9 @@ nodes:
   priority: 50
   type: task
   metadata:
-    design_ref: compilation/design.md §3.4
     file: src/compiler/lifecycle.rs
     goals: GOAL-comp.4, GOAL-comp.5
+    design_ref: compilation/design.md §3.4
 - id: kc-feedback-processor
   title: 'KC Feedback: Point Feedback + Dry Run (src/compiler/feedback.rs)'
   status: done
@@ -513,9 +513,9 @@ nodes:
   priority: 30
   type: task
   metadata:
-    design_ref: compilation/design.md §3.5
-    goals: GOAL-comp.8, GOAL-comp.9
     file: src/compiler/feedback.rs
+    goals: GOAL-comp.8, GOAL-comp.9
+    design_ref: compilation/design.md §3.5
 - id: kc-quality-scorer
   title: Quality Scorer (coherence + coverage + freshness)
   status: done
@@ -527,9 +527,9 @@ nodes:
   priority: 50
   type: task
   metadata:
+    goals: GOAL-comp.10
     file: src/compiler/quality.rs
     design_ref: compilation/design.md §3.6
-    goals: GOAL-comp.10
 - id: kc-decay-engine
   title: Decay Engine (time + access decay)
   status: done
@@ -541,8 +541,8 @@ nodes:
   priority: 10
   type: task
   metadata:
-    goals: GOAL-maint.1
     file: src/compiler/decay.rs
+    goals: GOAL-maint.1
     design_ref: maintenance/design.md §2.1
 - id: kc-conflict-detector
   title: Conflict Detector (contradictions + duplicates)
@@ -555,9 +555,9 @@ nodes:
   priority: 10
   type: task
   metadata:
-    goals: GOAL-maint.2, GOAL-maint.4
     design_ref: maintenance/design.md §2.2
     file: src/compiler/conflict.rs
+    goals: GOAL-maint.2, GOAL-maint.4
 - id: kc-health-auditor
   title: Health Auditor (link integrity + health reports)
   status: done
@@ -569,8 +569,8 @@ nodes:
   priority: 30
   type: task
   metadata:
-    file: src/compiler/health.rs
     design_ref: maintenance/design.md §2.3
+    file: src/compiler/health.rs
     goals: GOAL-maint.3, GOAL-maint.5, GOAL-maint.5b
 - id: kc-export-engine
   title: Export Engine (JSON/Markdown/SQLite + privacy filter)
@@ -597,9 +597,9 @@ nodes:
   priority: 10
   type: task
   metadata:
+    design_ref: maintenance/design.md §2.5
     file: src/compiler/cli.rs
     goals: GOAL-maint.8
-    design_ref: maintenance/design.md §2.5
 - id: kc-api
   title: Programmatic API (MaintenanceApi)
   status: done
@@ -611,8 +611,8 @@ nodes:
   priority: 50
   type: task
   metadata:
-    file: src/compiler/api.rs
     goals: GOAL-maint.9
+    file: src/compiler/api.rs
     design_ref: maintenance/design.md §2.6
 - id: kc-privacy-guard
   title: Privacy Guard (levels + redaction + audit log)
@@ -625,8 +625,8 @@ nodes:
   priority: 10
   type: task
   metadata:
-    design_ref: maintenance/design.md §2.7
     file: src/compiler/privacy.rs
+    design_ref: maintenance/design.md §2.7
     goals: GOAL-maint.10, GOAL-maint.11
 - id: kc-maintenance-lock
   title: Maintenance Lock (multi-process safety)
@@ -681,9 +681,9 @@ nodes:
   priority: 5
   type: task
   metadata:
-    design_ref: platform/design.md §2.3
     file: src/compiler/embedding.rs
     goals: GOAL-plat.4, GOAL-plat.5, GOAL-plat.6
+    design_ref: platform/design.md §2.3
 - id: kc-import
   title: Import Pipeline (Markdown + Obsidian + URL + dedup)
   status: done
@@ -696,8 +696,8 @@ nodes:
   type: task
   metadata:
     file: src/compiler/import.rs
-    design_ref: platform/design.md §2.4
     goals: GOAL-plat.8, GOAL-plat.9, GOAL-plat.10, GOAL-plat.11
+    design_ref: platform/design.md §2.4
 - id: kc-intake
   title: Intake Pipeline (URL extraction + auto-import)
   status: done
@@ -710,8 +710,8 @@ nodes:
   type: task
   metadata:
     file: src/compiler/intake.rs
-    goals: GOAL-plat.12, GOAL-plat.13
     design_ref: platform/design.md §2.5
+    goals: GOAL-plat.12, GOAL-plat.13
 - id: kc-degradation
   title: Graceful Degradation (capability levels + fallback chain)
   status: done
@@ -723,9 +723,9 @@ nodes:
   priority: 10
   type: task
   metadata:
+    goals: GOAL-plat.3, GOAL-plat.14, GOAL-plat.15, GOAL-plat.16
     design_ref: platform/design.md §2.6
     file: src/compiler/degradation.rs
-    goals: GOAL-plat.3, GOAL-plat.14, GOAL-plat.15, GOAL-plat.16
 - id: kc-types
   title: KC Shared Types (TopicPage, CompilationRecord, etc.)
   status: done
@@ -772,9 +772,9 @@ nodes:
   - compilation
   priority: 8
   metadata:
-    goals: GOAL-comp.7
     file: src/compiler/feedback.rs
     design_ref: compilation/design.md §3.5
+    goals: GOAL-comp.7
 - id: kc-unit-tests
   title: KC Unit Tests (per-module)
   status: done
@@ -785,8 +785,8 @@ nodes:
   - testing
   priority: 9
   metadata:
-    file: src/compiler/tests/
     goals: GUARD-2 (correctness)
+    file: src/compiler/tests/
 - id: kc-integration-tests
   title: KC Integration Tests (end-to-end flows)
   status: done
@@ -801,7 +801,7 @@ nodes:
     goals: GUARD-2 (correctness)
 - id: cluster-scaling
   title: 'Cluster Discovery Scaling: VP-tree ANN + Incremental Clustering'
-  status: todo
+  status: done
   description: '让 discover_clusters 从百条级扩展到十万条级。VP-tree ANN 补齐 embedding pair discovery 盲点，Hot/Warm/Cold 三层增量聚类避免全量 recluster。设计文档: DESIGN-cluster-scaling.md'
   tags:
   - performance
@@ -851,11 +851,51 @@ nodes:
   priority: 40
 - id: cs-consolidate
   title: Cold path + consolidate() integration
-  status: todo
+  status: done
   description: '改造 consolidate(): 三层判断 — pending 超 20% → cold (全量 recluster), pending > 0 → warm (局部 recluster), 否则用缓存 clusters。Cold path = 现有 discover_clusters() 不变。集成 hot/warm/cold 选择逻辑。全量 regression 测试 + benchmark (模拟 1000/5000/10000 条记忆)。'
   tags:
   - integration
   - consolidate
+  priority: 50
+- id: f3-phase1
+  title: 'Phase 1: Decay Detection + Safe Forget (C5+C6)'
+  status: done
+  description: 'DB migration: add deleted_at column. Implement check_decay_and_flag(), soft_delete(), hard_delete_cascade(). Update search to exclude soft-deleted. Ebbinghaus decay threshold flagging.'
+  tags:
+  - feat-003
+  - memory-lifecycle
+  priority: 10
+- id: f3-phase2
+  title: 'Phase 2: Semantic Dedup + Intelligent Merge (C1+C2)'
+  status: done
+  description: find_entity_overlap(), dedup_scan(), merge_memories() with entity union, Hebbian link union, provenance chain.
+  tags:
+  - feat-003
+  - memory-lifecycle
+  priority: 20
+- id: f3-phase3
+  title: 'Phase 3: Co-occurrence Auto-create + Reconcile (C8+C3)'
+  status: inprogress
+  description: recent_recalls ring buffer, auto co-occurrence recording in recall path, reconcile scan for contradictions, apply API.
+  tags:
+  - feat-003
+  - memory-lifecycle
+  priority: 30
+- id: f3-phase4
+  title: 'Phase 4: Incremental Synthesis (C4)'
+  status: todo
+  description: should_resynthesize() staleness check, wire IncrementalState, skip clusters that haven't changed.
+  tags:
+  - feat-003
+  - memory-lifecycle
+  priority: 40
+- id: f3-phase5
+  title: 'Phase 5: Sleep Cycle Orchestration + Rebalance (C7+C9)'
+  status: todo
+  description: 5-phase sleep cycle, HealthReport metrics, rebalance_internal() repairs, SleepReport expansion.
+  tags:
+  - feat-003
+  - memory-lifecycle
   priority: 50
 edges:
 - from: a1-hook-filter
@@ -1304,4 +1344,16 @@ edges:
   relation: depends_on
 - from: cs-consolidate
   to: cs-warm-path
+  relation: depends_on
+- from: f3-phase2
+  to: f3-phase1
+  relation: depends_on
+- from: f3-phase3
+  to: f3-phase2
+  relation: depends_on
+- from: f3-phase4
+  to: f3-phase3
+  relation: depends_on
+- from: f3-phase5
+  to: f3-phase4
   relation: depends_on

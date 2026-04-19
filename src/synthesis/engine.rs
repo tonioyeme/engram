@@ -479,6 +479,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     struct FailingLlmProvider;
 
     impl SynthesisLlmProvider for FailingLlmProvider {

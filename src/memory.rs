@@ -1,7 +1,7 @@
 //! Main Memory API — simplified interface to Engram's cognitive models.
 
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::Write;
 use uuid::Uuid;
@@ -17,6 +17,7 @@ use crate::bus::{SubscriptionManager, Subscription, Notification};
 use crate::models::hebbian::{MemoryWithNamespace, record_cross_namespace_coactivation};
 use crate::session_wm::{SessionWorkingMemory, SessionRecallResult};
 use crate::synthesis::types::SynthesisEngine;
+use crate::lifecycle::{DecayReport, ForgetReport, LifecycleError, ReconcileCandidate, ReconcileReport};
 use crate::types::{AclEntry, CrossLink, HebbianLink, LayerStats, MemoryLayer, MemoryRecord, MemoryStats, MemoryType, Permission, RecallResult, RecallWithAssociationsResult, TypeStats};
 
 /// Report from a unified sleep cycle (consolidation + synthesis).
@@ -67,6 +68,15 @@ pub struct Memory {
     /// Cached emotion data from last LLM extraction: Vec<(valence, domain)>.
     /// One-shot: `take_last_emotions()` clears it.
     last_extraction_emotions: std::sync::Mutex<Option<Vec<(f64, String)>>>,
+    /// Recent recall timestamps for cross-recall co-occurrence detection (C8).
+    /// Bounded ring buffer: last 50 recalls.
+    recent_recalls: VecDeque<(String, std::time::Instant)>,
+    /// Last add result for metrics access. Reset each sleep_cycle.
+    last_add_result: Option<crate::lifecycle::AddResult>,
+    /// Dedup merge counter (reset each sleep_cycle).
+    dedup_merge_count: usize,
+    /// Dedup new-write counter (reset each sleep_cycle).
+    dedup_write_count: usize,
 }
 
 impl Memory {
@@ -111,6 +121,10 @@ impl Memory {
             interoceptive_hub: crate::interoceptive::InteroceptiveHub::new(),
             triple_extractor: None,
             last_extraction_emotions: std::sync::Mutex::new(None),
+            recent_recalls: VecDeque::new(),
+            last_add_result: None,
+            dedup_merge_count: 0,
+            dedup_write_count: 0,
         };
         
         // Auto-configure extractor from environment/config
@@ -160,6 +174,10 @@ impl Memory {
             interoceptive_hub: crate::interoceptive::InteroceptiveHub::new(),
             triple_extractor: None,
             last_extraction_emotions: std::sync::Mutex::new(None),
+            recent_recalls: VecDeque::new(),
+            last_add_result: None,
+            dedup_merge_count: 0,
+            dedup_write_count: 0,
         };
         
         // Auto-configure extractor from environment/config
@@ -210,6 +228,10 @@ impl Memory {
             interoceptive_hub: crate::interoceptive::InteroceptiveHub::new(),
             triple_extractor: None,
             last_extraction_emotions: std::sync::Mutex::new(None),
+            recent_recalls: VecDeque::new(),
+            last_add_result: None,
+            dedup_merge_count: 0,
+            dedup_write_count: 0,
         };
         
         // Auto-configure extractor from environment/config
@@ -265,6 +287,10 @@ impl Memory {
             interoceptive_hub: crate::interoceptive::InteroceptiveHub::new(),
             triple_extractor: None,
             last_extraction_emotions: std::sync::Mutex::new(None),
+            recent_recalls: VecDeque::new(),
+            last_add_result: None,
+            dedup_merge_count: 0,
+            dedup_write_count: 0,
         };
         
         // Auto-configure extractor from environment/config
@@ -472,9 +498,267 @@ impl Memory {
         neighbor_ids
     }
     
+    /// Get the last add result (Created or Merged).
+    pub fn last_add_result(&self) -> Option<&crate::lifecycle::AddResult> {
+        self.last_add_result.as_ref()
+    }
+
     /// Get a reference to the underlying storage connection.
     pub fn connection(&self) -> &rusqlite::Connection {
         self.storage.connection()
+    }
+
+    /// Get a reference to the underlying Storage.
+    pub fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
+    /// Get a mutable reference to the underlying Storage.
+    pub fn storage_mut(&mut self) -> &mut Storage {
+        &mut self.storage
+    }
+
+    /// Access recent recalls ring buffer (for testing/inspection).
+    pub fn recent_recalls(&self) -> &VecDeque<(String, std::time::Instant)> {
+        &self.recent_recalls
+    }
+
+    /// Mutable access to recent recalls (for testing).
+    pub fn recent_recalls_mut(&mut self) -> &mut VecDeque<(String, std::time::Instant)> {
+        &mut self.recent_recalls
+    }
+
+    /// Scan namespace for duplicate pairs above similarity threshold.
+    /// Returns candidates sorted by combined score (0.7 * embedding_sim + 0.3 * entity_jaccard).
+    pub fn reconcile(
+        &self,
+        namespace: &str,
+        max_scan: Option<usize>,
+    ) -> Result<Vec<ReconcileCandidate>, LifecycleError> {
+        let max_scan = max_scan.unwrap_or(1000);
+        let model_id = self.config.embedding.model_id();
+
+        // Load embeddings (bounded)
+        let embeddings = self.storage.get_embeddings_in_namespace(
+            Some(namespace), &model_id,
+        ).map_err(LifecycleError::Storage)?;
+
+        // Bound by max_scan
+        let embeddings: Vec<_> = embeddings.into_iter().take(max_scan).collect();
+
+        let mut candidates: Vec<ReconcileCandidate> = Vec::new();
+        let mut seen_pairs: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+
+        for (id_a, emb_a) in &embeddings {
+            let matches = self.storage.find_all_above_threshold(
+                emb_a, &model_id, Some(namespace), 0.85,
+            ).map_err(LifecycleError::Storage)?;
+
+            for (id_b, score) in matches {
+                if id_a == &id_b { continue; }
+                let pair = if id_a < &id_b {
+                    (id_a.clone(), id_b.clone())
+                } else {
+                    (id_b.clone(), id_a.clone())
+                };
+                if seen_pairs.contains(&pair) { continue; }
+                seen_pairs.insert(pair);
+
+                let entities_a = self.storage.get_entities_for_memory(id_a)
+                    .map_err(LifecycleError::Storage)?;
+                let entities_b = self.storage.get_entities_for_memory(&id_b)
+                    .map_err(LifecycleError::Storage)?;
+                let jaccard = jaccard_similarity_strings(&entities_a, &entities_b);
+
+                let preview_a = self.storage.get_memory_content_preview(id_a, 100)
+                    .map_err(LifecycleError::Storage)?;
+                let preview_b = self.storage.get_memory_content_preview(&id_b, 100)
+                    .map_err(LifecycleError::Storage)?;
+
+                candidates.push(ReconcileCandidate {
+                    id_a: id_a.clone(),
+                    id_b,
+                    similarity: score,
+                    entity_overlap: jaccard,
+                    content_preview_a: preview_a,
+                    content_preview_b: preview_b,
+                });
+            }
+        }
+
+        // Sort by combined score: 0.7 * similarity + 0.3 * entity_overlap
+        candidates.sort_by(|a, b| {
+            let score_a = 0.7 * a.similarity as f64 + 0.3 * a.entity_overlap;
+            let score_b = 0.7 * b.similarity as f64 + 0.3 * b.entity_overlap;
+            score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Ok(candidates)
+    }
+
+    /// Apply reconcile merges. If dry_run=true, just counts.
+    pub fn reconcile_apply(
+        &mut self,
+        candidates: &[ReconcileCandidate],
+        dry_run: bool,
+    ) -> Result<ReconcileReport, LifecycleError> {
+        let mut report = ReconcileReport {
+            scanned: candidates.len(),
+            candidates_found: candidates.len(),
+            merges_applied: 0,
+            dry_run,
+        };
+
+        if dry_run { return Ok(report); }
+
+        let mut merged_away: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for candidate in candidates {
+            if merged_away.contains(&candidate.id_a) || merged_away.contains(&candidate.id_b) {
+                continue;
+            }
+
+            // Keep the older memory, merge newer into it
+            let (keep_id, donor_id) = {
+                let a = self.storage.get(&candidate.id_a).map_err(LifecycleError::Storage)?;
+                let b = self.storage.get(&candidate.id_b).map_err(LifecycleError::Storage)?;
+                match (a, b) {
+                    (Some(a), Some(b)) => {
+                        if a.created_at <= b.created_at {
+                            (candidate.id_a.clone(), candidate.id_b.clone())
+                        } else {
+                            (candidate.id_b.clone(), candidate.id_a.clone())
+                        }
+                    }
+                    _ => continue, // one already gone
+                }
+            };
+
+            // Get donor content for merge
+            let donor_content = self.storage.get_memory_content_preview(&donor_id, 10000)
+                .map_err(LifecycleError::Storage)?;
+
+            // Use existing merge_memory_into
+            self.storage.merge_memory_into(&keep_id, &donor_content, 0.0, candidate.similarity)
+                .map_err(LifecycleError::Storage)?;
+
+            // Merge Hebbian links
+            let _ = self.storage.merge_hebbian_links(&donor_id, &keep_id);
+
+            // Record provenance
+            let _ = self.storage.append_merge_provenance(
+                &keep_id, &donor_id, candidate.similarity, false,
+            );
+
+            // Delete donor
+            self.storage.hard_delete_cascade(&donor_id)
+                .map_err(LifecycleError::Storage)?;
+
+            merged_away.insert(donor_id);
+            report.merges_applied += 1;
+        }
+
+        Ok(report)
+    }
+
+    // === Lifecycle: Decay Detection + Safe Forget (FEAT-003 C5+C6) ===
+
+    /// Check memories for decay using Ebbinghaus model and flag weak ones.
+    /// Called during sleep_cycle's forget phase.
+    pub fn check_decay_and_flag(
+        &mut self,
+        namespace: Option<&str>,
+    ) -> Result<DecayReport, LifecycleError> {
+        use crate::models::ebbinghaus;
+
+        let memories = self.storage.all_in_namespace(namespace)
+            .map_err(LifecycleError::Storage)?;
+        let now = Utc::now();
+        let mut report = DecayReport::default();
+
+        for record in &memories {
+            if record.pinned {
+                continue;
+            }
+            let effective = ebbinghaus::effective_strength(record, now);
+            if effective < 0.1 {
+                report.below_threshold += 1;
+                // Only auto-flag if rarely accessed (< 2 accesses)
+                if record.access_times.len() < 2 {
+                    self.storage.soft_delete(&record.id)
+                        .map_err(LifecycleError::Storage)?;
+                    report.flagged_for_forget += 1;
+                    log::debug!(
+                        "memory {} flagged for forget via Ebbinghaus decay (effective_strength={}, access_count={})",
+                        record.id,
+                        effective,
+                        record.access_times.len(),
+                    );
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Targeted forget: soft or hard delete a specific memory.
+    pub fn forget_targeted(
+        &mut self,
+        memory_id: &str,
+        soft: bool,
+    ) -> Result<(), LifecycleError> {
+        if soft {
+            self.storage.soft_delete(memory_id)
+                .map_err(LifecycleError::Storage)?;
+            log::info!("soft-deleted memory {}", memory_id);
+        } else {
+            self.storage.hard_delete_cascade(memory_id)
+                .map_err(LifecycleError::Storage)?;
+            log::info!("hard-deleted memory {} with cascade", memory_id);
+        }
+        Ok(())
+    }
+
+    /// Bulk forget: soft-delete weak memories, hard-delete old soft-deleted ones.
+    pub fn forget_bulk(&mut self) -> Result<ForgetReport, LifecycleError> {
+        let mut report = ForgetReport::default();
+        let now = Utc::now();
+
+        // Phase A: soft-delete weak memories (that aren't already soft-deleted)
+        let all = self.storage.all_in_namespace(None)  // active memories only
+            .map_err(LifecycleError::Storage)?;
+        report.scanned = all.len();
+
+        for record in &all {
+            if record.pinned { continue; }
+            let effective = crate::models::ebbinghaus::effective_strength(record, now);
+            if effective < self.config.forget_threshold {
+                self.storage.soft_delete(&record.id)
+                    .map_err(LifecycleError::Storage)?;
+                report.soft_deleted += 1;
+            }
+        }
+
+        // Phase B: hard-delete memories that were soft-deleted > 30 days ago
+        let deleted = self.storage.list_deleted(Some("*"))
+            .map_err(LifecycleError::Storage)?;
+        for record in &deleted {
+            // Parse deleted_at from DB column
+            if let Some(deleted_at_str) = self.storage.get_deleted_at(&record.id)
+                .map_err(LifecycleError::Storage)?
+            {
+                if let Ok(deleted_at) = chrono::DateTime::parse_from_rfc3339(&deleted_at_str) {
+                    let days_deleted = (now - deleted_at.with_timezone(&Utc)).num_days();
+                    if days_deleted > 30 {
+                        self.storage.hard_delete_cascade(&record.id)
+                            .map_err(LifecycleError::Storage)?;
+                        report.hard_deleted += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(report)
     }
     
     /// Set the agent ID for this memory instance.
@@ -831,36 +1115,77 @@ impl Memory {
             None
         };
 
-        // Step 2: Dedup check — if we have an embedding, check for near-duplicates
+        // Step 2: Dedup check — entity Jaccard + embedding similarity
         if self.config.dedup_enabled {
+            // Phase A: entity Jaccard pre-check (if entities are available)
+            if self.config.entity_config.enabled {
+                let entities = self.entity_extractor.extract(content);
+                let entity_names: Vec<String> = entities.iter()
+                    .map(|e| e.normalized.clone())
+                    .collect();
+                
+                if !entity_names.is_empty() {
+                    if let Ok(Some((candidate_id, _jaccard))) = 
+                        self.storage.find_entity_overlap(&entity_names, ns, 0.5) 
+                    {
+                        // Entity overlap found — confirm with embedding similarity
+                        if let Some(ref embedding) = pre_embedding {
+                            // Check similarity specifically against the candidate
+                            if let Ok(Some(candidate_emb)) = self.storage.get_embedding_for_memory(&candidate_id) {
+                                let sim = crate::embeddings::EmbeddingProvider::cosine_similarity(embedding, &candidate_emb);
+                                if sim as f64 >= self.config.dedup_threshold {
+                                    log::info!(
+                                        "Dedup (entity+embedding): merging into {} (jaccard={:.3}, sim={:.4})",
+                                        candidate_id, _jaccard, sim
+                                    );
+                                    let outcome = self.storage.merge_memory_into(
+                                        &candidate_id, content, importance, sim,
+                                    )?;
+                                    if outcome.content_updated {
+                                        log::info!(
+                                            "Dedup: content updated for {} (merge_count={})",
+                                            candidate_id, outcome.merge_count,
+                                        );
+                                    }
+                                    // Update entity links for the merged memory
+                                    for entity in &entities {
+                                        if let Ok(eid) = self.storage.upsert_entity(
+                                            &entity.normalized, entity.entity_type.as_str(), ns, None,
+                                        ) {
+                                            let _ = self.storage.link_memory_entity(&candidate_id, &eid, "mention");
+                                        }
+                                    }
+                                    self.last_add_result = Some(crate::lifecycle::AddResult::Merged { 
+                                        into: candidate_id.clone(), similarity: sim 
+                                    });
+                                    self.dedup_merge_count += 1;
+                                    return Ok(candidate_id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Phase B: embedding-only dedup (existing logic, catches cases without entities)
             if let Some(ref embedding) = pre_embedding {
                 let model_id = self.config.embedding.model_id();
                 if let Ok(Some((existing_id, similarity))) = self.storage.find_nearest_embedding(
-                    embedding,
-                    &model_id,
-                    Some(ns),
-                    self.config.dedup_threshold,
+                    embedding, &model_id, Some(ns), self.config.dedup_threshold,
                 ) {
-                    // Found a near-duplicate — merge instead of creating new
                     log::info!(
                         "Dedup: merging into existing memory {} (similarity: {:.4})",
                         existing_id, similarity
                     );
                     let outcome = self.storage.merge_memory_into(
-                        &existing_id,
-                        content,
-                        importance,
-                        similarity,
+                        &existing_id, content, importance, similarity,
                     )?;
                     if outcome.content_updated {
                         log::info!(
                             "Dedup: content updated for {} (merge_count={})",
-                            existing_id,
-                            outcome.merge_count,
+                            existing_id, outcome.merge_count,
                         );
                     }
-                    
-                    // Also update entity links for the existing memory
                     if self.config.entity_config.enabled {
                         let entities = self.entity_extractor.extract(content);
                         for entity in &entities {
@@ -871,7 +1196,10 @@ impl Memory {
                             }
                         }
                     }
-                    
+                    self.last_add_result = Some(crate::lifecycle::AddResult::Merged { 
+                        into: existing_id.clone(), similarity 
+                    });
+                    self.dedup_merge_count += 1;
                     return Ok(existing_id);
                 }
             }
@@ -898,6 +1226,8 @@ impl Memory {
         };
 
         self.storage.add(&record, ns)?;
+        self.last_add_result = Some(crate::lifecycle::AddResult::Created { id: id.clone() });
+        self.dedup_write_count += 1;
         
         // Step 4: Store pre-computed embedding (avoid double-embed)
         // Keep a reference for Step 6 (association discovery) before consuming
@@ -1355,6 +1685,34 @@ impl Memory {
                 )?;
             }
 
+            // Cross-recall co-occurrence detection (C8 / GOAL-17)
+            // Track which memories are recalled across separate queries.
+            // If two memories are recalled within 30 seconds (across different queries),
+            // record their co-activation to strengthen Hebbian links.
+            {
+                let now_instant = std::time::Instant::now();
+                for result in &results {
+                    // Check against previously recalled memories within 30s window
+                    for (prev_id, prev_time) in &self.recent_recalls {
+                        if prev_id == &result.record.id { continue; }
+                        if now_instant.duration_since(*prev_time) <= std::time::Duration::from_secs(30) {
+                            // Within 30s window → record co-activation
+                            let _ = self.storage.record_coactivation_ns(
+                                prev_id,
+                                &result.record.id,
+                                self.config.hebbian_threshold,
+                                ns,
+                            );
+                        }
+                    }
+                    // Add this result to the ring buffer
+                    self.recent_recalls.push_back((result.record.id.clone(), now_instant));
+                    if self.recent_recalls.len() > 50 {
+                        self.recent_recalls.pop_front();
+                    }
+                }
+            }
+
             Ok(results)
         } else {
             // No embedding provider, use FTS fallback
@@ -1619,6 +1977,34 @@ impl Memory {
                 self.config.hebbian_threshold,
                 ns,
             )?;
+        }
+
+        // Cross-recall co-occurrence detection (C8 / GOAL-17)
+        // Track which memories are recalled across separate queries.
+        // If two memories are recalled within 30 seconds (across different queries),
+        // record their co-activation to strengthen Hebbian links.
+        {
+            let now_instant = std::time::Instant::now();
+            for result in &results {
+                // Check against previously recalled memories within 30s window
+                for (prev_id, prev_time) in &self.recent_recalls {
+                    if prev_id == &result.record.id { continue; }
+                    if now_instant.duration_since(*prev_time) <= std::time::Duration::from_secs(30) {
+                        // Within 30s window → record co-activation
+                        let _ = self.storage.record_coactivation_ns(
+                            prev_id,
+                            &result.record.id,
+                            self.config.hebbian_threshold,
+                            ns,
+                        );
+                    }
+                }
+                // Add this result to the ring buffer
+                self.recent_recalls.push_back((result.record.id.clone(), now_instant));
+                if self.recent_recalls.len() > 50 {
+                    self.recent_recalls.pop_front();
+                }
+            }
         }
 
         Ok(results)
@@ -3950,4 +4336,14 @@ mod confidence_tests {
         // B should now be in working memory (primed by spreading activation).
         assert!(wm.contains(&id_b), "id_b should be in WM after spreading");
     }
+}
+
+/// Jaccard similarity between two string sets.
+fn jaccard_similarity_strings(a: &[String], b: &[String]) -> f64 {
+    if a.is_empty() && b.is_empty() { return 0.0; }
+    let set_a: std::collections::HashSet<&str> = a.iter().map(|s| s.as_str()).collect();
+    let set_b: std::collections::HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
+    let intersection = set_a.intersection(&set_b).count();
+    let union = set_a.union(&set_b).count();
+    if union == 0 { 0.0 } else { intersection as f64 / union as f64 }
 }

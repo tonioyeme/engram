@@ -39,6 +39,7 @@ fn make_storage() -> Storage {
     Storage::new(":memory:").expect("create storage")
 }
 
+#[allow(dead_code)]
 fn make_memory() -> Memory {
     Memory::new(":memory:", Some(MemoryConfig::default())).expect("create memory")
 }

@@ -100,6 +100,7 @@ pub mod embeddings;
 pub mod extractor;
 pub mod hybrid_search;
 pub mod interoceptive;
+pub mod lifecycle;
 pub mod memory;
 pub mod models;
 pub mod promotion;
@@ -137,3 +138,4 @@ pub use synthesis::types::{
 pub use triple::{Triple, Predicate, TripleSource};
 pub use triple_extractor::{TripleExtractor, AnthropicTripleExtractor, OllamaTripleExtractor};
 pub use promotion::PromotionCandidate;
+pub use lifecycle::{DecayReport, ForgetReport, AddResult, LifecycleError};

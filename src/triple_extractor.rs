@@ -105,7 +105,7 @@ impl TokenProvider for StaticToken {
 
 /// Extracts triples using the Anthropic Claude API.
 pub struct AnthropicTripleExtractor {
-    api_key: String,
+    _api_key: String,
     model: String,
     is_oauth: bool,
     client: reqwest::blocking::Client,
@@ -121,7 +121,7 @@ impl AnthropicTripleExtractor {
             .expect("failed to create HTTP client");
 
         Self {
-            api_key: api_key.to_string(),
+            _api_key: api_key.to_string(),
             model: "claude-haiku-4-5-20251001".to_string(),
             is_oauth,
             client,
@@ -144,7 +144,7 @@ impl AnthropicTripleExtractor {
             .expect("failed to create HTTP client");
 
         Self {
-            api_key: String::new(),
+            _api_key: String::new(),
             model: "claude-haiku-4-5-20251001".to_string(),
             is_oauth,
             client,

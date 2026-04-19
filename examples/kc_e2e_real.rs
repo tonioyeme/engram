@@ -7,8 +7,7 @@ use chrono::{DateTime, Utc, NaiveDateTime};
 use rusqlite::Connection;
 
 use engramai::compiler::{
-    SqliteKnowledgeStore, KnowledgeStore,
-    TopicId, TopicStatus, KcConfig,
+    SqliteKnowledgeStore, KnowledgeStore, TopicStatus, KcConfig,
 };
 use engramai::compiler::api::MaintenanceApi;
 use engramai::compiler::compilation::MemorySnapshot;
@@ -300,6 +299,7 @@ fn epoch_to_datetime(epoch: f64) -> DateTime<Utc> {
         .unwrap_or_else(|| Utc::now())
 }
 
+#[allow(dead_code)]
 fn parse_datetime(s: &str) -> DateTime<Utc> {
     // Try RFC3339 first, then common SQLite formats
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {

@@ -101,7 +101,7 @@ fn f64_to_datetime(ts: f64) -> DateTime<Utc> {
 }
 
 /// Get the current time as a Unix float (seconds since epoch).
-fn now_f64() -> f64 {
+pub fn now_f64() -> f64 {
     datetime_to_f64(&Utc::now())
 }
 
@@ -194,6 +194,21 @@ impl Storage {
         
         // Run migrations for cluster state persistence
         Self::migrate_cluster_state(&conn)?;
+        
+        // Add deleted_at column for soft-delete
+        match conn.execute(
+            "ALTER TABLE memories ADD COLUMN deleted_at TEXT DEFAULT NULL",
+            [],
+        ) {
+            Ok(_) => {},
+            Err(e) if e.to_string().contains("duplicate column name") => {},
+            Err(e) => return Err(e),
+        }
+
+        // Index for soft-delete filter performance
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memories_deleted_at ON memories(deleted_at);"
+        )?;
         
         Ok(Self { conn })
     }
@@ -938,7 +953,7 @@ impl Storage {
 
     /// Get all memories.
     pub fn all(&self) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
-        let mut stmt = self.conn.prepare("SELECT * FROM memories")?;
+        let mut stmt = self.conn.prepare("SELECT * FROM memories WHERE deleted_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             let id: String = row.get("id")?;
             let access_times = self.get_access_times(&id).unwrap_or_default();
@@ -1142,7 +1157,7 @@ impl Storage {
         
         if ns == "*" {
             let mut stmt = self.conn.prepare(
-                "SELECT * FROM memories WHERE memory_type = ? ORDER BY importance DESC LIMIT ?"
+                "SELECT * FROM memories WHERE memory_type = ? AND deleted_at IS NULL ORDER BY importance DESC LIMIT ?"
             )?;
             
             let rows = stmt.query_map(params![memory_type.to_string(), limit as i64], |row| {
@@ -1154,7 +1169,7 @@ impl Storage {
             rows.collect()
         } else {
             let mut stmt = self.conn.prepare(
-                "SELECT * FROM memories WHERE memory_type = ? AND namespace = ? ORDER BY importance DESC LIMIT ?"
+                "SELECT * FROM memories WHERE memory_type = ? AND namespace = ? AND deleted_at IS NULL ORDER BY importance DESC LIMIT ?"
             )?;
             
             let rows = stmt.query_map(params![memory_type.to_string(), ns, limit as i64], |row| {
@@ -1206,7 +1221,7 @@ impl Storage {
             r#"
             SELECT m.* FROM memories m
             JOIN memories_fts f ON m.rowid = f.rowid
-            WHERE memories_fts MATCH ?
+            WHERE memories_fts MATCH ? AND m.deleted_at IS NULL
             ORDER BY rank LIMIT ?
             "#,
         )?;
@@ -1258,7 +1273,7 @@ impl Storage {
     pub fn search_by_type(&self, memory_type: MemoryType) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
         let mut stmt = self
             .conn
-            .prepare("SELECT * FROM memories WHERE memory_type = ?")?;
+            .prepare("SELECT * FROM memories WHERE memory_type = ? AND deleted_at IS NULL")?;
         
         let rows = stmt.query_map(params![memory_type.to_string()], |row| {
             let id: String = row.get("id")?;
@@ -1373,6 +1388,67 @@ impl Storage {
         )?;
         
         Ok(pruned)
+    }
+
+    /// Transfer Hebbian links from donor to target during merge.
+    /// - Repoints donor links to target
+    /// - If link already exists on target, keeps max weight
+    /// - Drops self-links (source==target after repoint)
+    /// - Deletes all donor links after transfer
+    pub fn merge_hebbian_links(
+        &mut self,
+        donor_id: &str,
+        target_id: &str,
+    ) -> Result<usize, rusqlite::Error> {
+        // Get all links involving the donor
+        let links = self.get_hebbian_links_weighted(donor_id)?;
+        let mut transferred = 0;
+        
+        for (other_id, weight) in &links {
+            // Skip self-links
+            if other_id == target_id {
+                continue;
+            }
+            
+            // Check if target already has a link to this other memory
+            let existing_weight: Option<f64> = self.conn.query_row(
+                "SELECT strength FROM hebbian_links WHERE \
+                 (source_id = ?1 AND target_id = ?2) OR (source_id = ?2 AND target_id = ?1)",
+                params![target_id, other_id],
+                |row| row.get(0),
+            ).optional()?;
+            
+            match existing_weight {
+                Some(existing) => {
+                    // Update to max weight
+                    let max_weight = existing.max(*weight);
+                    self.conn.execute(
+                        "UPDATE hebbian_links SET strength = ?1 WHERE \
+                         (source_id = ?2 AND target_id = ?3) OR (source_id = ?3 AND target_id = ?2)",
+                        params![max_weight, target_id, other_id],
+                    )?;
+                }
+                None => {
+                    // Create new link from target to other
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO hebbian_links \
+                         (source_id, target_id, strength, coactivation_count, \
+                          temporal_forward, temporal_backward, direction, created_at, namespace) \
+                         VALUES (?1, ?2, ?3, 1, 0, 0, 'bidirectional', ?4, 'default')",
+                        params![target_id, other_id, weight, now_f64()],
+                    )?;
+                }
+            }
+            transferred += 1;
+        }
+        
+        // Delete all donor links
+        self.conn.execute(
+            "DELETE FROM hebbian_links WHERE source_id = ?1 OR target_id = ?1",
+            params![donor_id],
+        )?;
+        
+        Ok(transferred)
     }
 
     /// Decay Hebbian links with differential rates based on signal source.
@@ -1507,7 +1583,7 @@ impl Storage {
                 r#"
                 SELECT m.* FROM memories m
                 JOIN memories_fts f ON m.rowid = f.rowid
-                WHERE memories_fts MATCH ?
+                WHERE memories_fts MATCH ? AND m.deleted_at IS NULL
                 ORDER BY rank LIMIT ?
                 "#,
             )?;
@@ -1525,7 +1601,7 @@ impl Storage {
                 r#"
                 SELECT m.* FROM memories m
                 JOIN memories_fts f ON m.rowid = f.rowid
-                WHERE memories_fts MATCH ? AND m.namespace = ?
+                WHERE memories_fts MATCH ? AND m.namespace = ? AND m.deleted_at IS NULL
                 ORDER BY rank LIMIT ?
                 "#,
             )?;
@@ -1548,7 +1624,7 @@ impl Storage {
             return self.all();
         }
         
-        let mut stmt = self.conn.prepare("SELECT * FROM memories WHERE namespace = ?")?;
+        let mut stmt = self.conn.prepare("SELECT * FROM memories WHERE namespace = ? AND deleted_at IS NULL")?;
         let rows = stmt.query_map(params![ns], |row| {
             let id: String = row.get("id")?;
             let access_times = self.get_access_times(&id).unwrap_or_default();
@@ -1658,7 +1734,9 @@ impl Storage {
     pub fn get_all_embeddings(&self, model: &str) -> Result<Vec<(String, Vec<f32>)>, rusqlite::Error> {
         let model = Self::normalize_model_id(model);
         let mut stmt = self.conn.prepare(
-            "SELECT memory_id, embedding FROM memory_embeddings WHERE model = ?"
+            r#"SELECT e.memory_id, e.embedding FROM memory_embeddings e
+            JOIN memories m ON e.memory_id = m.id
+            WHERE e.model = ? AND m.deleted_at IS NULL"#
         )?;
         
         let rows = stmt.query_map(params![model], |row| {
@@ -1690,7 +1768,7 @@ impl Storage {
             r#"
             SELECT e.memory_id, e.embedding FROM memory_embeddings e
             JOIN memories m ON e.memory_id = m.id
-            WHERE m.namespace = ? AND e.model = ?
+            WHERE m.namespace = ? AND e.model = ? AND m.deleted_at IS NULL
             "#
         )?;
         
@@ -1704,6 +1782,87 @@ impl Storage {
     }
     
     /// Delete embedding for a specific (memory_id, model) pair.
+    // === Soft-Delete / Lifecycle Methods ===
+
+    /// Get a reference to the underlying connection (for tests).
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Soft delete: set deleted_at timestamp.
+    pub fn soft_delete(&self, id: &str) -> Result<(), rusqlite::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE memories SET deleted_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
+    /// Hard delete with full cascade across all related tables.
+    pub fn hard_delete_cascade(&self, id: &str) -> Result<(), rusqlite::Error> {
+        // Delete from all related tables first
+        self.conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?1", params![id])?;
+        self.conn.execute("DELETE FROM access_log WHERE memory_id = ?1", params![id])?;
+        self.conn.execute("DELETE FROM hebbian_links WHERE source_id = ?1 OR target_id = ?1", params![id])?;
+        self.conn.execute("DELETE FROM memory_entities WHERE memory_id = ?1", params![id])?;
+        self.conn.execute("DELETE FROM synthesis_provenance WHERE source_id = ?1 OR insight_id = ?1", params![id])?;
+        // FTS cleanup
+        let rowid: Result<i64, _> = self.conn.query_row(
+            "SELECT rowid FROM memories WHERE id = ?", params![id], |row| row.get(0),
+        );
+        if let Ok(rowid) = rowid {
+            let _ = self.conn.execute("DELETE FROM memories_fts WHERE rowid = ?", params![rowid]);
+        }
+        // Finally the memory itself
+        self.conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// List soft-deleted memories, optionally filtered by namespace.
+    pub fn list_deleted(&self, namespace: Option<&str>) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
+        let ns = namespace.unwrap_or("default");
+        if ns == "*" {
+            let mut stmt = self.conn.prepare("SELECT * FROM memories WHERE deleted_at IS NOT NULL")?;
+            let rows = stmt.query_map([], |row| {
+                let id: String = row.get("id")?;
+                let access_times = self.get_access_times(&id).unwrap_or_default();
+                self.row_to_record(row, access_times)
+            })?;
+            rows.collect()
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT * FROM memories WHERE namespace = ? AND deleted_at IS NOT NULL"
+            )?;
+            let rows = stmt.query_map(params![ns], |row| {
+                let id: String = row.get("id")?;
+                let access_times = self.get_access_times(&id).unwrap_or_default();
+                self.row_to_record(row, access_times)
+            })?;
+            rows.collect()
+        }
+    }
+
+    /// Count soft-deleted memories.
+    pub fn count_soft_deleted(&self) -> Result<usize, rusqlite::Error> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE deleted_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Get the deleted_at timestamp for a memory.
+    pub fn get_deleted_at(&self, id: &str) -> Result<Option<String>, rusqlite::Error> {
+        let result: Option<String> = self.conn.query_row(
+            "SELECT deleted_at FROM memories WHERE id = ?",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(result)
+    }
+
     pub fn delete_embedding(&mut self, memory_id: &str, model: &str) -> Result<(), rusqlite::Error> {
         let model = Self::normalize_model_id(model);
         self.conn.execute(
@@ -2606,6 +2765,37 @@ impl Storage {
         Ok(best)
     }
     
+    /// Find ALL memories with embedding similarity above threshold in namespace.
+    /// Unlike find_nearest_embedding which returns top-1, this returns all matches.
+    pub fn find_all_above_threshold(
+        &self,
+        embedding: &[f32],
+        model: &str,
+        namespace: Option<&str>,
+        threshold: f64,
+    ) -> Result<Vec<(String, f32)>, rusqlite::Error> {
+        let stored = self.get_embeddings_in_namespace(namespace, model)?;
+        let mut matches = Vec::new();
+        for (id, stored_emb) in &stored {
+            let sim = crate::EmbeddingProvider::cosine_similarity(embedding, stored_emb);
+            if sim as f64 >= threshold {
+                matches.push((id.clone(), sim));
+            }
+        }
+        matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(matches)
+    }
+
+    /// Get first N chars of a memory's content.
+    pub fn get_memory_content_preview(&self, id: &str, max_chars: usize) -> Result<String, rusqlite::Error> {
+        let content: String = self.conn.query_row(
+            "SELECT content FROM memories WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )?;
+        Ok(content.chars().take(max_chars).collect())
+    }
+
     /// Merge a duplicate memory's metadata into an existing memory.
     ///
     /// Strategy (from ISS-003, upgraded with smart merge):
@@ -2931,6 +3121,142 @@ impl Storage {
                 |row| row.get(0),
             )
             .optional()
+    }
+
+    /// Find the best entity overlap match for a set of entities in a namespace.
+    /// Returns (memory_id, jaccard_score) for the best match above threshold.
+    pub fn find_entity_overlap(
+        &self,
+        entity_names: &[String],
+        namespace: &str,
+        threshold: f64,
+    ) -> Result<Option<(String, f64)>, rusqlite::Error> {
+        if entity_names.is_empty() {
+            return Ok(None);
+        }
+        
+        // Build IN clause placeholders
+        let placeholders: Vec<String> = entity_names.iter().enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
+        let in_clause = placeholders.join(", ");
+        
+        // Query: find memory_ids that share entities, grouped with overlap count
+        // Filter by namespace via JOIN on memories table
+        let sql = format!(
+            r#"
+            SELECT me.memory_id, COUNT(DISTINCT e.name) as overlap_count
+            FROM memory_entities me
+            JOIN entities e ON me.entity_id = e.id
+            JOIN memories m ON me.memory_id = m.id
+            WHERE e.name IN ({})
+              AND m.namespace = ?{}
+              AND m.deleted_at IS NULL
+            GROUP BY me.memory_id
+            ORDER BY overlap_count DESC
+            LIMIT 10
+            "#,
+            in_clause,
+            entity_names.len() + 1
+        );
+        
+        let mut stmt = self.conn.prepare(&sql)?;
+        
+        // Build params: entity names + namespace
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        for name in entity_names {
+            params_vec.push(Box::new(name.clone()));
+        }
+        params_vec.push(Box::new(namespace.to_string()));
+        
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter()
+            .map(|p| p.as_ref())
+            .collect();
+        
+        let mut best: Option<(String, f64)> = None;
+        
+        let mut rows = stmt.query(param_refs.as_slice())?;
+        let input_count = entity_names.len();
+        
+        while let Some(row) = rows.next()? {
+            let memory_id: String = row.get(0)?;
+            let overlap_count: usize = row.get::<_, i64>(1)? as usize;
+            
+            // Get total entity count for this memory to compute Jaccard
+            let target_count: usize = self.conn.query_row(
+                "SELECT COUNT(*) FROM memory_entities WHERE memory_id = ?",
+                params![memory_id],
+                |r| r.get::<_, i64>(0),
+            )? as usize;
+            
+            // Jaccard = intersection / union
+            let union_count = input_count + target_count - overlap_count;
+            if union_count == 0 { continue; }
+            let jaccard = overlap_count as f64 / union_count as f64;
+            
+            if jaccard >= threshold {
+                match &best {
+                    Some((_, best_score)) if jaccard <= *best_score => {},
+                    _ => { best = Some((memory_id, jaccard)); }
+                }
+            }
+        }
+        
+        Ok(best)
+    }
+
+    /// Append merge provenance with full source_id tracking.
+    /// Called after merge_memory_into() when the donor ID is known.
+    pub fn append_merge_provenance(
+        &self,
+        target_id: &str,
+        source_id: &str,
+        similarity: f32,
+        content_updated: bool,
+    ) -> Result<(), rusqlite::Error> {
+        let metadata_str: Option<String> = self.conn.query_row(
+            "SELECT metadata FROM memories WHERE id = ?",
+            params![target_id],
+            |row| row.get(0),
+        )?;
+        
+        let mut metadata: serde_json::Value = metadata_str
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        
+        if !metadata.is_object() {
+            metadata = serde_json::json!({});
+        }
+        
+        let epoch_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let entry = serde_json::json!({
+            "source_id": source_id,
+            "ts": epoch_secs,
+            "sim": similarity,
+            "content_updated": content_updated,
+        });
+        
+        let mut history = metadata.get("merge_history")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        history.push(entry);
+        // Cap at 10 (FIFO)
+        while history.len() > 10 { history.remove(0); }
+        
+        metadata["merge_history"] = serde_json::Value::Array(history);
+        
+        let metadata_str = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
+        self.conn.execute(
+            "UPDATE memories SET metadata = ? WHERE id = ?",
+            params![metadata_str, target_id],
+        )?;
+        
+        Ok(())
     }
 
     /// Record a write-time discovered association (multi-signal Hebbian link).
@@ -3498,7 +3824,7 @@ mod tests {
 
     #[test]
     fn test_record_association_new() {
-        let storage = test_storage();
+        let _storage = test_storage();
         // Need to create memories first for FK constraints
         let mut storage_mut = Storage::new(":memory:").unwrap();
         let now = Utc::now();

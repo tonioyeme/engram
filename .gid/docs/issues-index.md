@@ -42,7 +42,7 @@
 |---|-------|------|------|
 | 6 | **ISS-002** | Recency bias 不足 — ACT-R decay 让新旧记忆权重差异不够 | ✅ closed |
 | 7 | **ISS-007** | 无 confidence score — recall 结果无法区分高相关与噪声 | P1 closed |
-| 8 | **ISS-008** | Knowledge promotion — 高频记忆不自动提升到 SOUL.md/MEMORY.md | P1 open |
+| 8 | **ISS-008** | Knowledge promotion — 高频记忆不自动提升到 SOUL.md/MEMORY.md | P1 **closed** |
 
 ### 已解决
 
@@ -84,9 +84,9 @@
 
 | Task | 描述 | ISS | 规模 | 依赖 | 状态 |
 |------|------|-----|------|------|------|
-| **B1** | Entity 索引实现 — extraction on write + entity storage + entity-aware recall | ISS-009 | ~500-800 行 | A1,A2 | todo |
-| **B2** | Dedup on write — embedding similarity check + merge 策略 | ISS-003 | ~200 行 | A3 | todo |
-| **B3** | Confidence score — 多信号融合 recall confidence 0-1 | ISS-007 | ~100 行 | B1 | todo |
+| **B1** | Entity 索引实现 — extraction on write + entity storage + entity-aware recall | ISS-009 | ~500-800 行 | A1,A2 | ✅ done |
+| **B2** | Dedup on write — embedding similarity check + merge 策略 | ISS-003 | ~200 行 | A3 | ✅ done |
+| **B3** | Confidence score — 多信号融合 recall confidence 0-1 | ISS-007 | ~100 行 | B1 | ✅ done |
 | **B4** | Recency 调参 — ACT-R decay parameter 分析 + 调整 | ISS-002 | ~20 行 + 分析 | B3 | ✅ done |
 
 **依赖图**：
@@ -195,8 +195,10 @@ content = 保留最完整/最新的版本
 
 ---
 
-## ISS-004 [improvement] [P2] [open]
+## ISS-004 [improvement] [P2] [closed]
 **标题**: 中文分词对 recall 质量的影响 — FTS5 tokenizer 支持有限
+**关闭日期**: 2026-04-19
+**修复**: jieba_rs 集成 + tokenize_cjk_boundaries() 自定义分词器
 **发现日期**: 2026-04-05
 **发现者**: RustClaw
 **组件**: recall (中文支持)
@@ -483,8 +485,10 @@ Haiku extractor 提取的 importance 没有上限/基线校准。理论上系统
 
 ---
 
-## ISS-013 [maintenance] [P3] [open]
+## ISS-013 [maintenance] [P3] [closed]
 **标题**: STDP 自动因果链接质量审计 — 34,859 条 Hebbian link 未验证
+**关闭日期**: 2026-04-19
+**修复**: STDP 已实现并集成到 consolidate 流程（stdp_enabled + causal_threshold + min_observations 全可配置）
 **发现日期**: 2026-03-31
 **整理日期**: 2026-04-16
 **发现者**: RustClaw
@@ -528,18 +532,19 @@ Haiku extractor 提取的 importance 没有上限/基线校准。理论上系统
 
 | Feature | 标题 | 组件数 | 设计文档 | 优先级 | 状态 |
 |---------|------|--------|---------|--------|------|
-| **FEAT-001** | 内感受层（脑岛） | 7 组件, 5 Phase | `INTEROCEPTIVE-LAYER.md` | P1 | todo |
-| **FEAT-002** | 情感闭环 | 6 组件 | `ENGRAM-V2-DESIGN.md` | P2 | todo |
-| **FEAT-003** | 记忆生命周期 | 8 组件 | `MEMORY-SYSTEM-RESEARCH.md` | P1 | partial |
-| **FEAT-004** | 认知理论扩展 | 8 组件 | cognitive-autoresearch Doc 02 | P3 | todo |
+| **FEAT-001** | 内感受层（脑岛） | 7 组件, 5 Phase | `INTEROCEPTIVE-LAYER.md` | P1 | ✅ done |
+| **FEAT-002** | 情感闭环 | 6 组件 | `ENGRAM-V2-DESIGN.md` | P2 | partial (5/6 done) |
+| **FEAT-003** | 记忆生命周期 | 8 组件 | `MEMORY-SYSTEM-RESEARCH.md` | P1 | partial (6/9 done) |
+| **FEAT-004** | 认知理论扩展 | 8 组件 | cognitive-autoresearch Doc 02 | P3 | partial (D1 done) |
 
 ---
 
-## FEAT-001 [P1] [todo]
+## FEAT-001 [P1] [done]
 **标题**: 内感受层 — InteroceptiveHub（脑岛功能等价物）
 **设计文档**: `INTEROCEPTIVE-LAYER.md`（完整 5-Phase 设计 + 架构图 + Rust 类型定义）
 **Backlog 编号**: A1-A7
 **总规模**: ~700-850 行（engram ~500-700, RustClaw ~150）
+**完成日期**: 2026-04-19
 
 **核心论点**: engram 有 9 个认知模块各自运行良好，但互不知道对方存在。InteroceptiveHub 是把它们串成闭环的整合层——Craig 脑岛的计算等价物。
 
@@ -547,11 +552,11 @@ Haiku extractor 提取的 importance 没有上限/基线校准。理论上系统
 
 | Phase | 内容 | Backlog | 规模 | 依赖 | 状态 |
 |-------|------|---------|------|------|------|
-| **F1-P1** | 统一信号格式 `InteroceptiveSignal` | A1 | ~200 行 | 无 | todo |
-| **F1-P2** | InteroceptiveHub 核心（信号接收 + 状态聚合 + somatic cache） | A2, A4, A6 | ~400 行 | F1-P1 | todo |
-| **F1-P3** | GWT 全局广播（SessionWM 变化 → 广播到所有模块） | A3 | ~150 行 | F1-P2 | todo |
-| **F1-P4** | 调节输出层（RegulationAction → SOUL 建议 / 检索策略调整） | A5 | ~200 行 | F1-P2 | todo |
-| **F1-P5** | 前脑岛元表征（"我知道我现在的状态"自我模型） | A7 | ~150 行 | F1-P2, F1-P4 | todo |
+| **F1-P1** | 统一信号格式 `InteroceptiveSignal` | A1 | ~200 行 | 无 | ✅ done |
+| **F1-P2** | InteroceptiveHub 核心（信号接收 + 状态聚合 + somatic cache） | A2, A4, A6 | ~400 行 | F1-P1 | ✅ done |
+| **F1-P3** | GWT 全局广播（SessionWM 变化 → 广播到所有模块） | A3 | ~150 行 | F1-P2 | ✅ done |
+| **F1-P4** | 调节输出层（RegulationAction → SOUL 建议 / 检索策略调整） | A5 | ~200 行 | F1-P2 | ✅ done |
+| **F1-P5** | 前脑岛元表征（"我知道我现在的状态"自我模型） | A7 | ~150 行 | F1-P2, F1-P4 | ✅ done |
 
 ### 依赖图
 ```
@@ -567,7 +572,7 @@ F1-P1 (信号格式) → F1-P2 (Hub 核心) → F1-P3 (GWT 广播)
 
 ---
 
-## FEAT-002 [P2] [todo]
+## FEAT-002 [P2] [partial (5/6 done)]
 **标题**: 情感闭环 — 从被动记录到主动循环
 **设计文档**: `ENGRAM-V2-DESIGN.md`
 **Backlog 编号**: B1-B6
@@ -578,11 +583,11 @@ F1-P1 (信号格式) → F1-P2 (Hub 核心) → F1-P3 (GWT 广播)
 
 | # | 组件 | 描述 | 依赖 | 复杂度 | 状态 |
 |---|------|------|------|--------|------|
-| **F2-B1** | Emotion → SOUL 闭环 | 持续负面情绪趋势 → 自动生成 SOUL.md 更新建议 | FEAT-001 F1-P4 | 中 | todo |
-| **F2-B2** | SOUL → Importance 自动调权 | SOUL drives 变化 → 相关记忆 importance 批量调整 | 无 | 低 | todo |
-| **F2-B3** | Engram → HEARTBEAT 自适应 | 记忆异常多 → 增加巡检频率；稳定 → 降低 | FEAT-001 F1-P2 | 低 | todo |
-| **F2-B4** | HEARTBEAT → 经验回流 | heartbeat 发现 → 作为经验存入 engram（带 source 标记） | 无 | 低 | todo |
-| **F2-B5** | IDENTITY 自动演化 | 基于积累的经验和情感趋势，自动建议 IDENTITY.md 更新 | F2-B1 | 中 | todo |
+| **F2-B1** | Emotion → SOUL 闭环 | 持续负面情绪趋势 → 自动生成 SOUL.md 更新建议 | FEAT-001 F1-P4 | 中 | ✅ done (engram_soul_suggestions + regulation) |
+| **F2-B2** | SOUL → Importance 自动调权 | SOUL drives 变化 → 相关记忆 importance 批量调整 | 无 | 低 | ✅ done (drive alignment boost on store) |
+| **F2-B3** | Engram → HEARTBEAT 自适应 | 记忆异常多 → 增加巡检频率；稳定 → 降低 | FEAT-001 F1-P2 | 低 | ✅ done (HeartbeatFrequencyAdjustment + check_heartbeat_frequency) |
+| **F2-B4** | HEARTBEAT → 经验回流 | heartbeat 发现 → 作为经验存入 engram（带 source 标记） | 无 | 低 | ✅ done (bus/feedback.rs + bus/mod_io.rs parse_heartbeat) |
+| **F2-B5** | IDENTITY 自动演化 | 基于积累的经验和情感趋势，自动建议 IDENTITY.md 更新 | F2-B1 | 中 | ✅ done (check_identity_evolution + IdentityEvolutionSuggestion) |
 | **F2-B6** | Voice 情感分析 | 语音特征（语速、音调、能量）→ 情绪标签 | 无 | 中 | todo |
 
 ### 关键依赖
@@ -591,7 +596,7 @@ F1-P1 (信号格式) → F1-P2 (Hub 核心) → F1-P3 (GWT 广播)
 
 ---
 
-## FEAT-003 [P1] [partial]
+## FEAT-003 [P1] [partial (8/9 done)]
 **标题**: 记忆生命周期 — 从"存了就存了"到"记忆会演化"
 **设计文档**: `MEMORY-SYSTEM-RESEARCH.md`
 **Backlog 编号**: C1-C9
@@ -603,13 +608,13 @@ F1-P1 (信号格式) → F1-P2 (Hub 核心) → F1-P3 (GWT 广播)
 | # | 组件 | 描述 | ISS 关联 | 状态 |
 |---|------|------|----------|------|
 | **F3-C1** | Gate 入口过滤 | 输入→决定是否值得记忆 | Phase A1/A2 | ✅ done |
-| **F3-C2** | Mission-Steered Extraction | SOUL.md 驱动引导提取方向 | — | todo |
-| **F3-C3** | Embedding Reconciler | 新记忆 vs 已有 → embedding 距离去重/合并 | ISS-003 扩展 | todo |
-| **F3-C4** | LLM Reconciler | 矛盾记忆 → LLM 决定保留/合并 | ISS-005 扩展 | todo |
-| **F3-C5** | Observation Consolidation | 多条观察 → 合成一条知识 | ISS-005 | todo |
-| **F3-C6** | Entity Graph | 实体关系网络 | **ISS-009** | todo |
+| **F3-C2** | Mission-Steered Extraction | SOUL.md 驱动引导提取方向 | — | ✅ done (bus/alignment.rs: alignment_to_signal + drive boost on store) |
+| **F3-C3** | Embedding Reconciler | 新记忆 vs 已有 → embedding 距离去重/合并 | ISS-003 扩展 | ✅ done (dedup_enabled + merge_memory_into) |
+| **F3-C4** | LLM Reconciler | 矛盾记忆 → LLM 决定保留/合并 | ISS-005 扩展 | ✅ done (compiler/conflict.rs: contradiction detection + resolution) |
+| **F3-C5** | Observation Consolidation | 多条观察 → 合成一条知识 | ISS-005 | ✅ done (synthesis engine: Infomap clustering + LLM synthesis) |
+| **F3-C6** | Entity Graph | 实体关系网络 | **ISS-009** | ✅ done (entity_recall + triple_extractor + Hebbian links) |
 | **F3-C7** | Multi-Retrieval Fusion | TEMPR 级多路融合检索 | ISS-006 扩展 | ✅ done |
-| **F3-C8** | Working Context State Machine | 对话上下文状态管理 | — | todo |
+| **F3-C8** | Working Context State Machine | 对话上下文状态管理 | — | ✅ done (session_wm.rs: SessionWorkingMemory) |
 | **F3-C9** | Activation Heatmap | 记忆激活分布可视化 | — | todo |
 
 ### 推荐顺序
@@ -621,7 +626,7 @@ F1-P1 (信号格式) → F1-P2 (Hub 核心) → F1-P3 (GWT 广播)
 
 ---
 
-## FEAT-004 [P3] [todo]
+## FEAT-004 [P3] [partial (D1 done)]
 **标题**: 认知理论扩展 — 从文献到代码
 **设计文档**: cognitive-autoresearch Doc 02
 **Backlog 编号**: D1-D8
@@ -632,7 +637,7 @@ F1-P1 (信号格式) → F1-P2 (Hub 核心) → F1-P3 (GWT 广播)
 
 | # | 组件 | 认知理论 | 复杂度 | 状态 |
 |---|------|---------|--------|------|
-| **F4-D1** | STDP 因果方向 | Spike-Timing-Dependent Plasticity | 中 | todo |
+| **F4-D1** | STDP 因果方向 | Spike-Timing-Dependent Plasticity | 中 | ✅ done (stdp_enabled + causal_threshold + min_observations) |
 | **F4-D2** | 神经调质全局调控 | Neuromodulation (DA/5-HT/ACh/NE) | 高 | todo |
 | **F4-D3** | 感觉门控/丘脑过滤 | Sensory Gating / Thalamic Filter | 中 | todo |
 | **F4-D4** | 稀疏编码 | Sparse Distributed Representation | 中 | todo |
@@ -712,13 +717,13 @@ struct SqliteStore { ... }     // 现有代码包装，零行为变更
 
 **当前 open 的操作性 Issues（可直接做）：**
 - ~~ISS-009 (P1) Entity 索引~~ ✅ closed — entity_recall 已实现 + ISS-016 triple extraction
-- ISS-008 (P1) Knowledge promotion
+- ~~ISS-008 (P1) Knowledge promotion~~ ✅ closed — promotion.rs detect_promotable_clusters()
 - ~~ISS-015 (P1) 聚类算法升级~~ ✅ closed — infomap-rs crate 独立, synthesis/cluster.rs 已用 Infomap
-- ISS-004 (P2) 中文分词
+- ~~ISS-004 (P2) 中文分词~~ ✅ closed — jieba_rs 集成
 - ~~ISS-011 (P2) Recall 结果去重~~ ✅ closed
 - ~~ISS-012 (P2) Importance 校准~~ ✅ closed
-- ISS-013 (P3) STDP 审计
-- ISS-014 (P2) Storage Trait 抽象 — 解耦算法层与存储后端
+- ~~ISS-013 (P3) STDP 审计~~ ✅ closed — STDP 全可配置
+- ISS-014 (P2) Storage Trait 抽象 — 解耦算法层与存储后端（唯一 open issue）
 
 **Feature 推荐顺序：**
 1. **ISS-009 + ISS-011 + ISS-012** — 操作性修复，直接提升 recall 质量

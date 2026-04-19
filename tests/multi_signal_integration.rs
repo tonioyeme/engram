@@ -118,7 +118,7 @@ fn test_differential_decay_in_consolidation() {
         None,
     ).unwrap();
 
-    let id_b = mem.add(
+    let _id_b = mem.add(
         "Building a web server in Rust is straightforward",
         MemoryType::Factual,
         Some(0.5),

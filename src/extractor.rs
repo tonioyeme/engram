@@ -20,10 +20,21 @@ pub struct ExtractedFact {
     /// Confidence level: "confident", "likely", "uncertain"
     #[serde(default = "default_confidence")]
     pub confidence: String,
+    /// Emotional valence: -1.0 (very negative) to 1.0 (very positive). 0.0 = neutral.
+    /// Required from LLM extraction — no fallback to keyword matching.
+    #[serde(default)]
+    pub valence: f64,
+    /// Domain this fact belongs to: "coding", "trading", "research", "communication", "general".
+    #[serde(default = "default_domain")]
+    pub domain: String,
 }
 
 fn default_confidence() -> String {
     "likely".to_string()
+}
+
+fn default_domain() -> String {
+    "general".to_string()
 }
 
 /// Trait for memory extraction — converts raw text into structured facts.
@@ -71,7 +82,11 @@ STILL extract from these (they contain real information):
 - Short messages that contain actual decisions: "ok 那就用方案B" — extract the decision, not the "ok"
 
 Respond with ONLY a JSON array (no markdown, no explanation):
-[{"content": "...", "memory_type": "...", "importance": 0.X, "confidence": "confident|likely|uncertain"}]
+[{"content": "...", "memory_type": "...", "importance": 0.X, "confidence": "confident|likely|uncertain", "valence": 0.X, "domain": "..."}]
+
+Additional required fields:
+- valence (REQUIRED): emotional valence of this specific fact, from -1.0 (very negative) to 1.0 (very positive). 0.0 = purely neutral/informational. Consider the speaker's emotional state and context, not just keywords. Examples: frustration with a bug = -0.5, excitement about a working feature = 0.7, neutral status report = 0.0, mixed feelings = use the dominant emotion for this specific fact.
+- domain (REQUIRED): which domain this fact belongs to. One of: "coding", "trading", "research", "communication", "general". Choose the most specific applicable domain.
 
 Conversation:
 "#;

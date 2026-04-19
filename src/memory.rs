@@ -64,6 +64,9 @@ pub struct Memory {
     interoceptive_hub: crate::interoceptive::InteroceptiveHub,
     /// Optional LLM-based triple extractor for knowledge graph enrichment
     triple_extractor: Option<Box<dyn crate::triple_extractor::TripleExtractor>>,
+    /// Cached emotion data from last LLM extraction: Vec<(valence, domain)>.
+    /// One-shot: `take_last_emotions()` clears it.
+    last_extraction_emotions: std::sync::Mutex<Option<Vec<(f64, String)>>>,
 }
 
 impl Memory {
@@ -107,6 +110,7 @@ impl Memory {
             synthesis_llm_provider: None,
             interoceptive_hub: crate::interoceptive::InteroceptiveHub::new(),
             triple_extractor: None,
+            last_extraction_emotions: std::sync::Mutex::new(None),
         };
         
         // Auto-configure extractor from environment/config
@@ -155,6 +159,7 @@ impl Memory {
             synthesis_llm_provider: None,
             interoceptive_hub: crate::interoceptive::InteroceptiveHub::new(),
             triple_extractor: None,
+            last_extraction_emotions: std::sync::Mutex::new(None),
         };
         
         // Auto-configure extractor from environment/config
@@ -204,6 +209,7 @@ impl Memory {
             synthesis_llm_provider: None,
             interoceptive_hub: crate::interoceptive::InteroceptiveHub::new(),
             triple_extractor: None,
+            last_extraction_emotions: std::sync::Mutex::new(None),
         };
         
         // Auto-configure extractor from environment/config
@@ -258,6 +264,7 @@ impl Memory {
             synthesis_llm_provider: None,
             interoceptive_hub: crate::interoceptive::InteroceptiveHub::new(),
             triple_extractor: None,
+            last_extraction_emotions: std::sync::Mutex::new(None),
         };
         
         // Auto-configure extractor from environment/config
@@ -294,6 +301,20 @@ impl Memory {
     /// injection into system prompts or inspection.
     pub fn interoceptive_snapshot(&self) -> crate::interoceptive::InteroceptiveState {
         self.interoceptive_hub.current_state()
+    }
+
+    // ── Extraction Emotion Cache ───────────────────────────────────────
+
+    /// Take the emotion data from the most recent LLM extraction.
+    ///
+    /// Returns `None` if no extraction has occurred since the last call.
+    /// This is one-shot: calling it clears the cache.
+    ///
+    /// Each entry is `(valence, domain)` — one per extracted fact.
+    /// A single user message may produce multiple facts with different
+    /// valences and domains.
+    pub fn take_last_emotions(&self) -> Option<Vec<(f64, String)>> {
+        self.last_extraction_emotions.lock().unwrap().take()
     }
 
     /// Run an interoceptive tick: pull signals from all attached subsystems
@@ -670,9 +691,17 @@ impl Memory {
                         content.chars().take(40).collect::<String>());
                     let mut last_id = String::new();
                     for fact in &facts {
-                        log::info!("  → [{}] (imp={:.1}) {}", fact.memory_type, fact.importance,
+                        log::info!("  → [{}] (imp={:.1}, val={:.2}, dom={}) {}", 
+                            fact.memory_type, fact.importance, fact.valence, fact.domain,
                             fact.content.chars().take(80).collect::<String>());
                     }
+                    
+                    // Cache emotion data from extraction for downstream consumers
+                    let emotions: Vec<(f64, String)> = facts.iter()
+                        .map(|f| (f.valence, f.domain.clone()))
+                        .collect();
+                    *self.last_extraction_emotions.lock().unwrap() = Some(emotions);
+                    
                     for fact in facts {
                         // Convert extracted memory_type string to MemoryType enum
                         let fact_type = Self::parse_memory_type(&fact.memory_type)

@@ -102,6 +102,7 @@ pub mod hybrid_search;
 pub mod interoceptive;
 pub mod lifecycle;
 pub mod memory;
+pub mod metacognition;
 pub mod models;
 pub mod promotion;
 pub mod query_classifier;
@@ -138,4 +139,5 @@ pub use synthesis::types::{
 pub use triple::{Triple, Predicate, TripleSource};
 pub use triple_extractor::{TripleExtractor, AnthropicTripleExtractor, OllamaTripleExtractor};
 pub use promotion::PromotionCandidate;
+pub use metacognition::{MetaCognitionTracker, MetaCognitionReport, ParameterSuggestion, RecallEvent, SynthesisEvent};
 pub use lifecycle::{DecayReport, ForgetReport, AddResult, LifecycleError, PhaseReport, HealthReport, RebalanceReport};

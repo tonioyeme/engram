@@ -87,6 +87,8 @@ pub struct Memory {
     dedup_merge_count: usize,
     /// Dedup new-write counter (reset each sleep_cycle).
     dedup_write_count: usize,
+    /// Meta-cognition tracker for self-monitoring (lazy-init when enabled).
+    metacognition: Option<crate::metacognition::MetaCognitionTracker>,
 }
 
 impl Memory {
@@ -135,10 +137,14 @@ impl Memory {
             last_add_result: None,
             dedup_merge_count: 0,
             dedup_write_count: 0,
+            metacognition: None,
         };
         
         // Auto-configure extractor from environment/config
         mem.auto_configure_extractor();
+
+        // Initialize meta-cognition tracker if enabled
+        mem.init_metacognition_if_enabled();
         
         Ok(mem)
     }
@@ -188,6 +194,7 @@ impl Memory {
             last_add_result: None,
             dedup_merge_count: 0,
             dedup_write_count: 0,
+            metacognition: None,
         };
         
         // Auto-configure extractor from environment/config
@@ -242,6 +249,7 @@ impl Memory {
             last_add_result: None,
             dedup_merge_count: 0,
             dedup_write_count: 0,
+            metacognition: None,
         };
         
         // Auto-configure extractor from environment/config
@@ -301,6 +309,7 @@ impl Memory {
             last_add_result: None,
             dedup_merge_count: 0,
             dedup_write_count: 0,
+            metacognition: None,
         };
         
         // Auto-configure extractor from environment/config
@@ -316,6 +325,49 @@ impl Memory {
         config: Option<MemoryConfig>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Self::with_empathy_bus(path, workspace_dir, config)
+    }
+
+    /// Initialize the meta-cognition tracker if enabled in config.
+    fn init_metacognition_if_enabled(&mut self) {
+        if self.config.metacognition_enabled && self.metacognition.is_none() {
+            match crate::metacognition::MetaCognitionTracker::new(self.storage.conn()) {
+                Ok(mut tracker) => {
+                    if let Err(e) = tracker.load_history(self.storage.conn()) {
+                        log::warn!("Failed to load metacognition history: {}", e);
+                    }
+                    self.metacognition = Some(tracker);
+                }
+                Err(e) => {
+                    log::warn!("Failed to initialize metacognition tracker: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Get a meta-cognition report with current metrics.
+    ///
+    /// Returns None if metacognition is not enabled.
+    pub fn metacognition_report(&self) -> Option<crate::metacognition::MetaCognitionReport> {
+        self.metacognition.as_ref().map(|t| t.report())
+    }
+
+    /// Get parameter adjustment suggestions based on observed patterns.
+    ///
+    /// Returns None if metacognition is not enabled.
+    pub fn parameter_suggestions(&self) -> Option<Vec<crate::metacognition::ParameterSuggestion>> {
+        self.metacognition.as_ref().map(|t| t.parameter_suggestions(&self.config))
+    }
+
+    /// Submit external feedback for the most recent recall.
+    ///
+    /// `score`: 0.0 (useless) to 1.0 (perfect). Returns Ok(true) if feedback
+    /// was attached, Ok(false) if no pending recall event, None if metacognition disabled.
+    pub fn feedback_recall(&mut self, score: f64) -> Option<Result<bool, Box<dyn std::error::Error>>> {
+        if let Some(ref mut tracker) = self.metacognition {
+            Some(tracker.feedback_event(self.storage.conn(), score))
+        } else {
+            None
+        }
     }
     
     /// Get a reference to the Empathy Bus, if attached.
@@ -799,12 +851,15 @@ impl Memory {
             .filter(|r| crate::models::ebbinghaus::effective_strength(r, now) < 0.1)
             .count();
 
+        let stale = self.storage.count_stale_clusters()
+            .map_err(LifecycleError::Storage)?;
+
         Ok(HealthReport {
             total_memories: total,
             per_namespace: per_ns,
             below_threshold: below,
             orphan_memories: orphans,
-            stale_clusters: 0,  // TODO: implement stale cluster counting
+            stale_clusters: stale,
             dangling_hebbian_links: dangling,
             soft_deleted: soft_del,
         })
@@ -1646,6 +1701,7 @@ impl Memory {
         namespace: Option<&str>,
     ) -> Result<Vec<RecallResult>, Box<dyn std::error::Error>> {
         let now = Utc::now();
+        let recall_start = std::time::Instant::now();
         let context = context.unwrap_or_default();
         let min_conf = min_confidence.unwrap_or(0.0);
         let ns = namespace.unwrap_or("default");
@@ -1738,6 +1794,10 @@ impl Memory {
                 0.0
             };
             
+            // Somatic channel (7th) — emotional memory bias
+            let somatic_scores = self.somatic_scores(query, &candidates);
+            let raw_somatic_weight = self.config.somatic_weight;
+            
             // Base weights (from config)
             let raw_fts_weight = self.config.fts_weight;
             let raw_emb_weight = self.config.embedding_weight;
@@ -1753,10 +1813,11 @@ impl Memory {
             let adj_entity = raw_entity_weight * query_analysis.weight_modifiers.entity;
             let adj_temporal = raw_temporal_weight * query_analysis.weight_modifiers.temporal;
             let adj_hebbian = raw_hebbian_weight * query_analysis.weight_modifiers.hebbian;
+            let adj_somatic = raw_somatic_weight * query_analysis.weight_modifiers.somatic;
             
             // Runtime normalization — always divide by sum
-            let total_weight = adj_fts + adj_emb + adj_actr + adj_entity + adj_temporal + adj_hebbian;
-            let (fts_weight, emb_weight, actr_weight, ent_weight, temp_weight, hebb_weight) = if total_weight > 0.0 {
+            let total_weight = adj_fts + adj_emb + adj_actr + adj_entity + adj_temporal + adj_hebbian + adj_somatic;
+            let (fts_weight, emb_weight, actr_weight, ent_weight, temp_weight, hebb_weight, som_weight) = if total_weight > 0.0 {
                 (
                     adj_fts / total_weight,
                     adj_emb / total_weight,
@@ -1764,15 +1825,16 @@ impl Memory {
                     adj_entity / total_weight,
                     adj_temporal / total_weight,
                     adj_hebbian / total_weight,
+                    adj_somatic / total_weight,
                 )
             } else {
-                let n = 1.0 / 6.0;
-                (n, n, n, n, n, n)
+                let n = 1.0 / 7.0;
+                (n, n, n, n, n, n, n)
             };
             
             log::debug!(
-                "C7 recall weights: fts={:.3} emb={:.3} actr={:.3} entity={:.3} temporal={:.3} hebbian={:.3} (query_type={:?})",
-                fts_weight, emb_weight, actr_weight, ent_weight, temp_weight, hebb_weight,
+                "C7 recall weights: fts={:.3} emb={:.3} actr={:.3} entity={:.3} temporal={:.3} hebbian={:.3} somatic={:.3} (query_type={:?})",
+                fts_weight, emb_weight, actr_weight, ent_weight, temp_weight, hebb_weight, som_weight,
                 query_analysis.query_type,
             );
             
@@ -1816,13 +1878,17 @@ impl Memory {
                     // Hebbian channel (6th) — graph connectivity
                     let hebbian_score = hebbian_scores.get(&record.id).copied().unwrap_or(0.0);
                     
-                    // Combined: 6-channel fusion
+                    // Somatic channel (7th) — emotional memory bias (Damasio)
+                    let somatic_score = somatic_scores.get(&record.id).copied().unwrap_or(0.0);
+                    
+                    // Combined: 7-channel fusion
                     let combined_score = (fts_weight * fts_score)
                         + (emb_weight * embedding_score as f64)
                         + (actr_weight * activation_normalized)
                         + (ent_weight * entity_score)
                         + (temp_weight * temporal_score)
-                        + (hebb_weight * hebbian_score);
+                        + (hebb_weight * hebbian_score)
+                        + (som_weight * somatic_score);
                     
                     (record, combined_score, activation)
                 })
@@ -1921,10 +1987,18 @@ impl Memory {
                 }
             }
 
+            // Update somatic markers with emotional feedback from recall results
+            self.update_somatic_after_recall(query, &results);
+
+            // Meta-cognition: record this recall event
+            self.record_metacognition_recall(query, &results, recall_start, true);
+
             Ok(results)
         } else {
             // No embedding provider, use FTS fallback
-            self.recall_fts(query, limit, &context, min_conf, ns, now)
+            let results = self.recall_fts(query, limit, &context, min_conf, ns, now)?;
+            self.record_metacognition_recall(query, &results, recall_start, false);
+            Ok(results)
         }
     }
 
@@ -1949,6 +2023,40 @@ impl Memory {
         Ok(records)
     }
     
+    /// Record a recall event to the meta-cognition tracker (if enabled).
+    fn record_metacognition_recall(
+        &mut self,
+        query: &str,
+        results: &[RecallResult],
+        start: std::time::Instant,
+        used_embedding: bool,
+    ) {
+        if let Some(ref mut tracker) = self.metacognition {
+            let mean_conf = if results.is_empty() {
+                0.0
+            } else {
+                results.iter().map(|r| r.confidence).sum::<f64>() / results.len() as f64
+            };
+            let max_conf = results
+                .iter()
+                .map(|r| r.confidence)
+                .fold(0.0_f64, f64::max);
+            let event = crate::metacognition::RecallEvent {
+                timestamp: chrono::Utc::now().timestamp(),
+                query: query.to_string(),
+                result_count: results.len(),
+                mean_confidence: mean_conf,
+                max_confidence: max_conf,
+                latency_ms: start.elapsed().as_millis() as u64,
+                used_embedding,
+                feedback_score: None,
+            };
+            if let Err(e) = tracker.record_recall(self.storage.conn(), event) {
+                log::warn!("Metacognition recall record failed: {}", e);
+            }
+        }
+    }
+
     /// Entity-based recall: extract entities from query, look up matching entities,
     /// return memory→score mapping (0.0-1.0 normalized).
     ///
@@ -2039,6 +2147,104 @@ impl Memory {
         }
     }
     
+    /// Somatic marker channel scoring (7th channel — Damasio's somatic marker hypothesis).
+    ///
+    /// For each candidate memory, computes how much the current situation's emotional
+    /// "gut feeling" should bias its recall ranking. The somatic marker for the query
+    /// situation provides an intensity signal: strongly emotional situations (positive
+    /// or negative) boost emotionally relevant memories.
+    ///
+    /// Score composition:
+    /// - Base = abs(marker_valence) — emotional intensity of the situation
+    /// - Emotional type memories get full intensity
+    /// - High-importance memories (≥0.7) get 70% intensity
+    /// - Other memories get 30% intensity (faint background signal)
+    /// - Encounter count adds confidence: min(encounter_count / 5, 1.0) scaling
+    ///
+    /// Returns scores normalized to 0.0-1.0 for each candidate.
+    fn somatic_scores(
+        &mut self,
+        query: &str,
+        candidates: &[MemoryRecord],
+    ) -> HashMap<String, f64> {
+        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+        
+        // Hash the query to create a situation identifier
+        let mut hasher = DefaultHasher::new();
+        query.hash(&mut hasher);
+        let situation_hash = hasher.finish();
+        
+        // Look up or create the somatic marker for this query situation.
+        // We use 0.0 as current valence for new situations — neutral until
+        // emotional memories are actually recalled and processed.
+        let marker = self.interoceptive_hub.somatic_lookup(situation_hash, 0.0);
+        let marker_intensity = marker.valence.abs();
+        let encounter_confidence = (marker.encounter_count as f64 / 5.0).min(1.0);
+        
+        // If the marker has no emotional charge (new situation with 0 valence),
+        // return empty scores — somatic channel is silent for novel situations.
+        if marker_intensity < 0.01 {
+            return HashMap::new();
+        }
+        
+        let mut scores = HashMap::new();
+        
+        for record in candidates {
+            // Determine emotional relevance of this memory
+            let emotional_relevance = match record.memory_type {
+                crate::types::MemoryType::Emotional => 1.0,  // Full somatic boost
+                _ if record.importance >= 0.7 => 0.7,        // High-importance: notable
+                _ => 0.3,                                      // Faint background signal
+            };
+            
+            // Somatic score: intensity × relevance × confidence
+            let score = marker_intensity * emotional_relevance * encounter_confidence;
+            scores.insert(record.id.clone(), score.min(1.0));
+        }
+        
+        scores
+    }
+    
+    /// Update somatic markers after recall completes.
+    ///
+    /// When emotional memories are successfully recalled, their valence
+    /// feeds back into the somatic marker for this situation — reinforcing
+    /// the emotional association (Damasio's "as-if body loop").
+    fn update_somatic_after_recall(
+        &mut self,
+        query: &str,
+        results: &[RecallResult],
+    ) {
+        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+        
+        // Only update if any recalled memories are emotional
+        let emotional_valences: Vec<f64> = results.iter()
+            .filter(|r| r.record.memory_type == crate::types::MemoryType::Emotional)
+            .map(|r| {
+                // Use importance as a proxy for valence direction:
+                // High importance (>0.5) → positive valence, low → negative
+                // This is a heuristic — memories don't store explicit valence yet
+                (r.record.importance - 0.5) * 2.0  // Maps [0,1] → [-1,1]
+            })
+            .collect();
+        
+        if emotional_valences.is_empty() {
+            return;
+        }
+        
+        // Average emotional valence from recalled memories
+        let avg_valence = emotional_valences.iter().sum::<f64>() / emotional_valences.len() as f64;
+        
+        let mut hasher = DefaultHasher::new();
+        query.hash(&mut hasher);
+        let situation_hash = hasher.finish();
+        
+        // Feed this emotional signal back into the somatic marker
+        self.interoceptive_hub.somatic_lookup(situation_hash, avg_valence);
+    }
+
     /// Hebbian channel scoring for C7 Multi-Retrieval Fusion.
     ///
     /// For each candidate, checks how many other candidates it's Hebbian-linked to.
@@ -2137,6 +2343,10 @@ impl Memory {
             .filter(|r| r.superseded_by.is_none())
             .collect();
         
+        // Somatic channel scoring (also active in FTS-only path)
+        let somatic_scores = self.somatic_scores(query, &fts_candidates);
+        let somatic_w = self.config.somatic_weight;
+        
         let mut scored: Vec<_> = fts_candidates
             .into_iter()
             .map(|record| {
@@ -2149,7 +2359,12 @@ impl Memory {
                     self.config.importance_weight,
                     self.config.contradiction_penalty,
                 );
-                (record, activation)
+                
+                // Add somatic boost to activation score
+                let somatic_boost = somatic_scores.get(&record.id).copied().unwrap_or(0.0) * somatic_w;
+                let boosted_activation = activation + somatic_boost;
+                
+                (record, boosted_activation)
             })
             .filter(|(_, act)| *act > f64::NEG_INFINITY)
             .collect();
@@ -2221,6 +2436,9 @@ impl Memory {
                 }
             }
         }
+
+        // Update somatic markers with emotional feedback from FTS recall results
+        self.update_somatic_after_recall(query, &results);
 
         Ok(results)
     }
@@ -3809,6 +4027,21 @@ impl Memory {
         self.dedup_merge_count = 0;
         self.dedup_write_count = 0;
         self.last_add_result = None;
+
+        // Meta-cognition: record synthesis event
+        if let Some(ref mut tracker) = self.metacognition {
+            let synth_ref = &synthesis;
+            let event = crate::metacognition::SynthesisEvent {
+                timestamp: chrono::Utc::now().timestamp(),
+                clusters_found: synth_ref.as_ref().map(|s| s.clusters_found).unwrap_or(0),
+                insights_created: synth_ref.as_ref().map(|s| s.insights_created.len()).unwrap_or(0),
+                duration_ms: cycle_start.elapsed().as_millis() as u64,
+                error_count: synth_ref.as_ref().map(|s| s.errors.len()).unwrap_or(0),
+            };
+            if let Err(e) = tracker.record_synthesis(self.storage.conn(), event) {
+                log::warn!("Metacognition synthesis record failed: {}", e);
+            }
+        }
 
         Ok(SleepReport {
             consolidation_ok: true,

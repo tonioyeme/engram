@@ -4076,6 +4076,27 @@ impl Storage {
         rows.collect()
     }
 
+    /// Count clusters where >50% of members have been deleted or superseded.
+    pub fn count_stale_clusters(&self) -> Result<usize, rusqlite::Error> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM (
+                SELECT ca.cluster_id,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN m.id IS NULL
+                                OR m.deleted_at IS NOT NULL
+                                OR (m.superseded_by IS NOT NULL AND m.superseded_by != '')
+                           THEN 1 ELSE 0 END) AS gone
+                FROM cluster_assignments ca
+                LEFT JOIN memories m ON ca.memory_id = m.id
+                GROUP BY ca.cluster_id
+                HAVING CAST(gone AS REAL) / total > 0.5
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     /// Clean up access_log entries for deleted/non-existent memories.
     pub fn cleanup_orphaned_access_log(&self) -> Result<usize, rusqlite::Error> {
         self.conn.execute(

@@ -334,6 +334,44 @@ mod tests {
     }
 
     #[test]
+    fn test_health_stale_clusters() {
+        let mut mem = test_memory();
+        // Create 4 memories for 2 clusters
+        let id_a = mem.add("cluster alpha member 1", MemoryType::Factual, Some(0.5), None, None).unwrap();
+        let id_b = mem.add("cluster alpha member 2", MemoryType::Factual, Some(0.5), None, None).unwrap();
+        let id_c = mem.add("cluster beta member 1", MemoryType::Factual, Some(0.5), None, None).unwrap();
+        let id_d = mem.add("cluster beta member 2", MemoryType::Factual, Some(0.5), None, None).unwrap();
+        let id_e = mem.add("cluster beta member 3", MemoryType::Factual, Some(0.5), None, None).unwrap();
+        // A replacement memory for supersession
+        let id_replacement = mem.add("replacement for beta member", MemoryType::Factual, Some(0.5), None, None).unwrap();
+
+        // Assign to clusters
+        mem.storage().assign_to_cluster(&id_a, "cluster-alpha", "test", 1.0).unwrap();
+        mem.storage().assign_to_cluster(&id_b, "cluster-alpha", "test", 1.0).unwrap();
+        mem.storage().assign_to_cluster(&id_c, "cluster-beta", "test", 1.0).unwrap();
+        mem.storage().assign_to_cluster(&id_d, "cluster-beta", "test", 1.0).unwrap();
+        mem.storage().assign_to_cluster(&id_e, "cluster-beta", "test", 1.0).unwrap();
+
+        // No stale clusters yet
+        let report = mem.health().unwrap();
+        assert_eq!(report.stale_clusters, 0, "No clusters should be stale initially");
+
+        // Soft-delete both members of cluster-alpha → 100% gone → stale
+        mem.storage_mut().soft_delete(&id_a).unwrap();
+        mem.storage_mut().soft_delete(&id_b).unwrap();
+
+        let report = mem.health().unwrap();
+        assert_eq!(report.stale_clusters, 1, "cluster-alpha should be stale (100% deleted)");
+
+        // Supersede 2 of 3 members in cluster-beta → 66% gone → stale
+        mem.storage_mut().supersede(&id_c, &id_replacement).unwrap();
+        mem.storage_mut().supersede(&id_d, &id_replacement).unwrap();
+
+        let report = mem.health().unwrap();
+        assert_eq!(report.stale_clusters, 2, "Both clusters should be stale now");
+    }
+
+    #[test]
     fn test_rebalance_cleans_orphaned_access_log() {
         let mut mem = test_memory();
         let id = mem.add("rebalance access log test", MemoryType::Factual, Some(0.5), None, None).unwrap();

@@ -242,6 +242,13 @@ pub struct MemoryConfig {
     #[serde(default = "default_hebbian_recall_weight")]
     pub hebbian_recall_weight: f64,
 
+    /// Weight for somatic marker channel in hybrid recall (0.0-1.0).
+    /// Somatic markers (Damasio) bias recall toward emotionally significant memories.
+    /// Memories associated with strong positive or negative emotional contexts
+    /// get boosted — the system "remembers" emotionally charged situations.
+    #[serde(default = "default_somatic_weight")]
+    pub somatic_weight: f64,
+
     /// Enable query-type adaptive weight adjustment (default: true)
     #[serde(default = "default_adaptive_weights")]
     pub adaptive_weights: bool,
@@ -257,6 +264,12 @@ pub struct MemoryConfig {
     /// Knowledge promotion configuration
     #[serde(default)]
     pub promotion: PromotionConfig,
+
+    /// Enable meta-cognition self-monitoring (default: false).
+    /// When enabled, recall and synthesis events are tracked for metrics
+    /// and parameter adjustment suggestions.
+    #[serde(default)]
+    pub metacognition_enabled: bool,
 }
 
 fn default_entity_weight() -> f64 {
@@ -297,6 +310,10 @@ fn default_temporal_weight() -> f64 {
 
 fn default_hebbian_recall_weight() -> f64 {
     0.10
+}
+
+fn default_somatic_weight() -> f64 {
+    0.08
 }
 
 fn default_adaptive_weights() -> bool {
@@ -346,10 +363,12 @@ impl Default for MemoryConfig {
             auto_extract_importance_cap: default_auto_extract_importance_cap(),
             temporal_weight: default_temporal_weight(),
             hebbian_recall_weight: default_hebbian_recall_weight(),
+            somatic_weight: default_somatic_weight(),
             adaptive_weights: default_adaptive_weights(),
             association: AssociationConfig::default(),
             triple: TripleConfig::default(),
             promotion: PromotionConfig::default(),
+            metacognition_enabled: false,
         }
     }
 }

@@ -39,6 +39,7 @@ pub struct ChannelWeightModifiers {
     pub entity: f64,
     pub temporal: f64,
     pub hebbian: f64,
+    pub somatic: f64,
 }
 
 /// A time range for temporal filtering.
@@ -69,6 +70,7 @@ impl ChannelWeightModifiers {
             entity: 1.0,
             temporal: 1.0,
             hebbian: 1.0,
+            somatic: 1.0,
         }
     }
 
@@ -80,6 +82,7 @@ impl ChannelWeightModifiers {
             entity: 1.0,
             temporal: 3.0,
             hebbian: 1.0,
+            somatic: 1.0,
         }
     }
 
@@ -91,6 +94,7 @@ impl ChannelWeightModifiers {
             entity: 2.0,
             temporal: 1.0,
             hebbian: 1.0,
+            somatic: 1.0,
         }
     }
 
@@ -102,6 +106,7 @@ impl ChannelWeightModifiers {
             entity: 1.0,
             temporal: 1.0,
             hebbian: 1.0,
+            somatic: 1.0,
         }
     }
 }

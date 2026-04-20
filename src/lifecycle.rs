@@ -96,7 +96,6 @@ pub struct RebalanceReport {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::Memory;
     use crate::types::MemoryType;
 

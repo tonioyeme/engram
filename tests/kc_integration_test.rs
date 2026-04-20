@@ -1,4 +1,3 @@
-#![cfg(feature = "kc")]
 
 //! End-to-end integration tests for the Knowledge Compiler (KC).
 //!
@@ -66,6 +65,7 @@ fn make_memory(id: &str, content: &str) -> MemorySnapshot {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         tags: vec![],
+        embedding: None,
     }
 }
 

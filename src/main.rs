@@ -1866,31 +1866,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match cmd {
                 KnowledgeCommand::Query { search, limit, format } => {
-                    let topics = kc_store.list_topic_pages()
-                        .map_err(|e| format!("Failed to list topics: {}", e))?;
-                    let search_lower = search.to_lowercase();
-                    let matched: Vec<_> = topics.iter()
-                        .filter(|t| {
-                            t.title.to_lowercase().contains(&search_lower)
-                                || t.content.to_lowercase().contains(&search_lower)
-                                || t.summary.to_lowercase().contains(&search_lower)
-                        })
-                        .take(limit)
-                        .collect();
+                    let api = MaintenanceApi::new(
+                        SqliteKnowledgeStore::open(&cli.database)
+                            .map_err(|e| format!("Failed to open store: {}", e))?,
+                        kc_config.clone(),
+                    );
+                    let opts = engramai::compiler::api::QueryOpts {
+                        limit,
+                        include_archived: false,
+                    };
+                    let results = api.query(&search, &opts)
+                        .map_err(|e| format!("Query failed: {}", e))?;
 
                     match format {
                         OutputFormat::Json => {
-                            println!("{}", serde_json::to_string_pretty(&matched)?);
+                            println!("{}", serde_json::to_string_pretty(&results)?);
                         }
                         _ => {
-                            if matched.is_empty() {
+                            if results.is_empty() {
                                 println!("No topics matching '{}'.", search);
                             } else {
-                                println!("Knowledge topics matching '{}' ({}):", search, matched.len());
-                                for t in &matched {
-                                    println!("  [{}] {} (v{}, {:?})", t.id, t.title, t.version, t.status);
-                                    if !t.summary.is_empty() {
-                                        let preview: String = t.summary.chars().take(80).collect();
+                                println!("Knowledge topics matching '{}' ({}):", search, results.len());
+                                for r in &results {
+                                    println!("  [{}] {} ({:?}, relevance: {:.1})", r.topic_id, r.title, r.status, r.relevance);
+                                    if !r.summary.is_empty() {
+                                        let preview: String = r.summary.chars().take(80).collect();
                                         println!("    {}", preview);
                                     }
                                 }
@@ -2179,7 +2179,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     if repair {
-                        println!("\n⚠️  Auto-repair is not yet implemented. Use 'engram knowledge health' for recommendations.");
+                        println!("\nAuto-repair:");
+                        let mut repaired = 0usize;
+                        let mut failed = 0usize;
+                        let mut all_topics_mut = kc_store.list_topic_pages()
+                            .map_err(|e| format!("Failed to list topics for repair: {}", e))?;
+                        for topic in &mut all_topics_mut {
+                            let entries = auditor.audit_links(topic, &kc_store)
+                                .map_err(|e| format!("Audit failed for {}: {}", topic.id, e))?;
+                            let problematic: Vec<_> = entries.into_iter()
+                                .filter(|e| e.status == LinkStatus::Broken || e.status == LinkStatus::Stale)
+                                .collect();
+                            for entry in &problematic {
+                                let action = auditor.suggest_repair(entry, topic);
+                                match auditor.repair_link(topic, entry, &action, &kc_store) {
+                                    Ok(result) => {
+                                        println!("  ✅ {}", result.details);
+                                        repaired += 1;
+                                    }
+                                    Err(e) => {
+                                        println!("  ❌ Failed to repair {} in {}: {}", entry.memory_id, topic.id, e);
+                                        failed += 1;
+                                    }
+                                }
+                            }
+                        }
+                        if repaired == 0 && failed == 0 {
+                            println!("  No broken or stale links to repair.");
+                        } else {
+                            println!("  Repaired: {}, Failed: {}", repaired, failed);
+                        }
                     }
                 }
 

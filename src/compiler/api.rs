@@ -38,7 +38,7 @@ impl Default for QueryOpts {
 }
 
 /// A single query result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct QueryResult {
     pub topic_id: TopicId,
     pub title: String,

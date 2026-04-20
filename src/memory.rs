@@ -3686,13 +3686,20 @@ impl Memory {
         )?;
 
         let mut gate_results = Vec::new();
+
+        // Pre-load all memories ONCE and build a HashMap index for O(1) lookups.
+        // Previously storage.all() was called inside the per-cluster loop — O(C×N).
+        let all_memories = self.storage.all()?;
+        let memory_index: std::collections::HashMap<String, MemoryRecord> = all_memories
+            .into_iter()
+            .map(|m| (m.id.clone(), m))
+            .collect();
+
         for cluster_data in &clusters {
-            let all_memories = self.storage.all()?;
-            let member_set: std::collections::HashSet<&str> =
-                cluster_data.members.iter().map(|s| s.as_str()).collect();
-            let members: Vec<MemoryRecord> = all_memories
-                .into_iter()
-                .filter(|m| member_set.contains(m.id.as_str()))
+            let members: Vec<MemoryRecord> = cluster_data
+                .members
+                .iter()
+                .filter_map(|id| memory_index.get(id).cloned())
                 .collect();
 
             let covered_pct = self.storage.check_coverage(&cluster_data.members)?;

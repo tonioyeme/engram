@@ -973,6 +973,34 @@ impl Storage {
         rows.collect()
     }
 
+    /// Get memories by a list of IDs (batch fetch).
+    ///
+    /// More efficient than `all()` when you only need specific memories.
+    /// Uses SQL `WHERE id IN (...)` for a single query instead of loading
+    /// everything and filtering in Rust.
+    pub fn get_by_ids(&self, ids: &[&str]) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build parameterized IN clause: WHERE id IN (?1, ?2, ?3, ...)
+        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "SELECT * FROM memories WHERE id IN ({}) AND deleted_at IS NULL AND (superseded_by IS NULL OR superseded_by = '')",
+            placeholders.join(", ")
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let id: String = row.get("id")?;
+            let access_times = self.get_access_times(&id).unwrap_or_default();
+            self.row_to_record(row, access_times)
+        })?;
+
+        rows.collect()
+    }
+
     /// Update an existing memory.
     ///
     /// Uses an IMMEDIATE transaction to ensure atomicity of the memory update

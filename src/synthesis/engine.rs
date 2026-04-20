@@ -3,7 +3,7 @@
 //! Ties cluster discovery, gate check, insight generation, and provenance
 //! into a single pipeline. Implements [`SynthesisEngine`] as `DefaultSynthesisEngine`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use chrono::Utc;
@@ -273,6 +273,16 @@ impl SynthesisEngine for DefaultSynthesisEngine {
         let mut llm_calls_remaining = settings.max_llm_calls_per_run;
         let mut insights_remaining = settings.max_insights_per_consolidation;
 
+        // Pre-load all memories ONCE and build a HashMap index for O(1) lookups.
+        // Previously storage.all() was called inside the per-cluster loop, making
+        // it O(C×N) where C=clusters, N=total memories. With 13K memories this
+        // caused 443-second synthesis runs.
+        let all_memories = storage.all()?;
+        let memory_index: HashMap<String, MemoryRecord> = all_memories
+            .into_iter()
+            .map(|m| (m.id.clone(), m))
+            .collect();
+
         // Step 4: Process each cluster
         for cluster_data in &clusters {
             // --- Incremental staleness check (C4) ---
@@ -293,13 +303,11 @@ impl SynthesisEngine for DefaultSynthesisEngine {
                 }
             }
 
-            // Load members
-            let all_memories = storage.all()?;
-            let member_set: HashSet<&str> =
-                cluster_data.members.iter().map(|s| s.as_str()).collect();
-            let members: Vec<MemoryRecord> = all_memories
-                .into_iter()
-                .filter(|m| member_set.contains(m.id.as_str()))
+            // Look up cluster members from the pre-built index (O(M) per cluster)
+            let members: Vec<MemoryRecord> = cluster_data
+                .members
+                .iter()
+                .filter_map(|id| memory_index.get(id).cloned())
                 .collect();
 
             // Pre-compute gate inputs

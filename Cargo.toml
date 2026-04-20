@@ -50,7 +50,7 @@ dirs = "5"
 jieba-rs = "0.8.1"
 
 # Community detection for topic discovery
-infomap-rs = { path = "../infomap-rs" }
+infomap-rs = { version = "0.1.0", path = "../infomap-rs" }
 
 [dev-dependencies]
 tempfile = "3.13"

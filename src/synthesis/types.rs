@@ -243,7 +243,7 @@ pub struct GateConfig {
     pub gate_quality_threshold: f64,
     /// Quality score above which synthesis is deferred instead of skipped (default: 0.6).
     pub defer_quality_threshold: f64,
-    /// Cosine similarity threshold for duplicate detection (default: 0.92).
+    /// Cosine similarity threshold for duplicate detection (default: 0.95).
     pub duplicate_similarity: f64,
     /// Minimum number of distinct memory types in a cluster (default: 2).
     pub min_type_diversity: usize,
@@ -259,7 +259,7 @@ impl Default for GateConfig {
             min_cluster_size: 3,
             gate_quality_threshold: 0.4,
             defer_quality_threshold: 0.6,
-            duplicate_similarity: 0.92,
+            duplicate_similarity: 0.95,
             min_type_diversity: 2,
             cost_threshold: 0.05,
             premium_threshold: 0.8,
@@ -449,6 +449,24 @@ pub struct IncrementalState {
     pub last_run: DateTime<Utc>,
     /// How many times this cluster has been synthesized.
     pub run_count: usize,
+    /// When this cluster was last attempted (gate-checked), regardless of outcome.
+    /// Defaults to `last_run` for backward compatibility with pre-existing state.
+    #[serde(default = "default_attempt_timestamp")]
+    pub last_attempt_timestamp: DateTime<Utc>,
+    /// How many times this cluster has been attempted (gate-checked), regardless of outcome.
+    /// Includes successful synthesis, deferred, skipped, and auto-updated attempts.
+    #[serde(default)]
+    pub attempt_count: usize,
+    /// Member snapshot at the time of the last attempt (may differ from last_member_snapshot
+    /// which is only updated on successful synthesis).
+    #[serde(default)]
+    pub last_attempt_members: HashSet<String>,
+}
+
+/// Default for backward compatibility: returns Unix epoch so old states without
+/// `last_attempt_timestamp` are treated as never-attempted.
+fn default_attempt_timestamp() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0).unwrap()
 }
 
 /// Configuration for incremental/staleness detection.

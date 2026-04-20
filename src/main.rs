@@ -486,6 +486,63 @@ enum Commands {
         id: String,
     },
 
+    // === Memory Supersession ===
+
+    /// Correct a wrong memory: store replacement and supersede the old one
+    Correct {
+        /// ID of the memory to correct
+        old_id: String,
+
+        /// New (correct) content
+        new_content: String,
+
+        /// Override importance (0.0-1.0)
+        #[arg(long, short = 'i')]
+        importance: Option<f64>,
+
+        /// Override memory type
+        #[arg(long, short = 't')]
+        r#type: Option<MemoryTypeArg>,
+    },
+
+    /// Correct all memories matching a query (bulk supersession)
+    CorrectBulk {
+        /// Search query to find wrong memories
+        query: String,
+
+        /// New (correct) content to replace them with
+        new_content: String,
+
+        /// Namespace to search
+        #[arg(long, short = 'n')]
+        ns: Option<String>,
+
+        /// Max memories to supersede
+        #[arg(long, short = 'l', default_value = "10")]
+        limit: usize,
+
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// List all superseded memories
+    Superseded {
+        /// Filter by namespace
+        #[arg(long, short = 'n')]
+        ns: Option<String>,
+
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+
+    /// Restore a superseded memory to active recall
+    Unsupersede {
+        /// Memory ID to restore
+        memory_id: String,
+    },
+
     /// Knowledge compiler — compile, query, maintain knowledge
     #[command(subcommand)]
     Knowledge(KnowledgeCommand),
@@ -1723,6 +1780,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("    {} — original importance: {:.2}, restored: {}", 
                     src.memory_id, src.original_importance, if src.restored { "✅" } else { "❌" });
             }
+        }
+
+        // ── Memory Supersession Commands ──────────────────────────
+
+        Commands::Correct { old_id, new_content, importance, r#type } => {
+            let type_override = r#type.map(|t| t.into());
+            let new_id = mem.correct(&old_id, &new_content, importance, type_override)?;
+            println!("✅ Corrected memory {} → {}", old_id, new_id);
+        }
+
+        Commands::CorrectBulk { query, new_content, ns, limit, yes } => {
+            // First, show what would be superseded
+            let ns_ref = ns.as_deref();
+            let matches = mem.recall_from_namespace(&query, limit, None, None, ns_ref)?;
+            if matches.is_empty() {
+                println!("❌ No matching memories found for query: {}", query);
+                return Ok(());
+            }
+
+            println!("Found {} matching memories:", matches.len());
+            for (i, m) in matches.iter().enumerate() {
+                let content_preview: String = m.record.content.chars().take(80).collect();
+                println!("  {}. [{}] {} (score: {:.2})", 
+                    i + 1, m.record.id, content_preview, m.confidence);
+            }
+            println!("\nWill supersede all with: \"{}\"", new_content);
+
+            if !yes {
+                print!("\nProceed? [y/N] ");
+                use std::io::Write;
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+            }
+
+            let result = mem.correct_bulk(&query, &new_content, ns_ref, limit)?;
+            println!("✅ Bulk corrected {} memories → {}", result.superseded_count, result.new_id);
+            for id in &result.superseded_ids {
+                println!("  ⊘ {}", id);
+            }
+        }
+
+        Commands::Superseded { ns, json } => {
+            let infos = mem.list_superseded(ns.as_deref())?;
+            if json {
+                let items: Vec<serde_json::Value> = infos.iter().map(|info| {
+                    serde_json::json!({
+                        "id": info.superseded.id,
+                        "content": info.superseded.content,
+                        "superseded_by": info.superseded_by_id,
+                        "chain_head": info.chain_head,
+                        "created_at": info.superseded.created_at.to_rfc3339(),
+                    })
+                }).collect();
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else {
+                if infos.is_empty() {
+                    println!("No superseded memories found.");
+                } else {
+                    println!("Superseded memories ({}):", infos.len());
+                    for info in &infos {
+                        let content_preview: String = info.superseded.content.chars().take(60).collect();
+                        let chain = info.chain_head.as_deref().unwrap_or("⚠️ cycle");
+                        println!("  ⊘ {} → {} (head: {})", info.superseded.id, info.superseded_by_id, chain);
+                        println!("    \"{}\"", content_preview);
+                    }
+                }
+            }
+        }
+
+        Commands::Unsupersede { memory_id } => {
+            mem.unsupersede(&memory_id)?;
+            println!("✅ Restored memory {} to active recall", memory_id);
         }
 
         Commands::Knowledge(cmd) => {

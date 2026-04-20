@@ -123,7 +123,7 @@ pub use extractor::{MemoryExtractor, ExtractedFact, AnthropicExtractor, Anthropi
 pub use memory::{Memory, SleepReport, is_insight};
 pub use storage::EmbeddingStats;
 pub use storage::EntityRecord;
-pub use types::{AclEntry, CrossLink, HebbianLink, MemoryLayer, MergeOutcome, MemoryRecord, MemoryStats, MemoryType, Permission, RecallResult, RecallWithAssociationsResult};
+pub use types::{AclEntry, CrossLink, HebbianLink, MemoryLayer, MergeOutcome, MemoryRecord, MemoryStats, MemoryType, Permission, RecallResult, RecallWithAssociationsResult, SupersessionError, SupersessionInfo, BulkCorrectionResult};
 
 // Re-export new modules
 pub use anomaly::{BaselineTracker, Baseline, AnomalyResult};
@@ -138,4 +138,4 @@ pub use synthesis::types::{
 pub use triple::{Triple, Predicate, TripleSource};
 pub use triple_extractor::{TripleExtractor, AnthropicTripleExtractor, OllamaTripleExtractor};
 pub use promotion::PromotionCandidate;
-pub use lifecycle::{DecayReport, ForgetReport, AddResult, LifecycleError};
+pub use lifecycle::{DecayReport, ForgetReport, AddResult, LifecycleError, PhaseReport, HealthReport, RebalanceReport};

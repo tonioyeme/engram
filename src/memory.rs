@@ -17,7 +17,7 @@ use crate::bus::{SubscriptionManager, Subscription, Notification};
 use crate::models::hebbian::{MemoryWithNamespace, record_cross_namespace_coactivation};
 use crate::session_wm::{SessionWorkingMemory, SessionRecallResult};
 use crate::synthesis::types::SynthesisEngine;
-use crate::lifecycle::{DecayReport, ForgetReport, LifecycleError, ReconcileCandidate, ReconcileReport};
+use crate::lifecycle::{DecayReport, ForgetReport, LifecycleError, ReconcileCandidate, ReconcileReport, PhaseReport};
 use crate::types::{AclEntry, CrossLink, HebbianLink, LayerStats, MemoryLayer, MemoryRecord, MemoryStats, MemoryType, Permission, RecallResult, RecallWithAssociationsResult, TypeStats};
 
 /// Report from a unified sleep cycle (consolidation + synthesis).
@@ -27,6 +27,16 @@ pub struct SleepReport {
     pub consolidation_ok: bool,
     /// Synthesis report (None if synthesis not enabled or failed non-fatally).
     pub synthesis: Option<crate::synthesis::types::SynthesisReport>,
+    /// Per-phase timing reports.
+    pub phases: Vec<crate::lifecycle::PhaseReport>,
+    /// Decay check report (if run).
+    pub decay: Option<crate::lifecycle::DecayReport>,
+    /// Forget report (if run).
+    pub forget: Option<crate::lifecycle::ForgetReport>,
+    /// Rebalance repair report (if run).
+    pub rebalance: Option<crate::lifecycle::RebalanceReport>,
+    /// Total sleep cycle duration in milliseconds.
+    pub duration_ms: u64,
 }
 
 /// Check if a memory record is a synthesis insight.
@@ -760,7 +770,200 @@ impl Memory {
 
         Ok(report)
     }
-    
+
+    /// Health check: inspect memory system integrity.
+    pub fn health(&self) -> Result<crate::lifecycle::HealthReport, LifecycleError> {
+        use crate::lifecycle::HealthReport;
+
+        let total = self.storage.count_memories_in_namespace(None)
+            .map_err(LifecycleError::Storage)?;
+        let namespaces = self.storage.list_namespaces()
+            .map_err(LifecycleError::Storage)?;
+        let mut per_ns = std::collections::HashMap::new();
+        for ns in &namespaces {
+            let count = self.storage.count_memories_in_namespace(Some(ns))
+                .map_err(LifecycleError::Storage)?;
+            per_ns.insert(ns.clone(), count);
+        }
+        let orphans = self.storage.count_orphan_memories()
+            .map_err(LifecycleError::Storage)?;
+        let dangling = self.storage.count_dangling_hebbian()
+            .map_err(LifecycleError::Storage)?;
+        let soft_del = self.storage.count_soft_deleted()
+            .map_err(LifecycleError::Storage)?;
+
+        // Count memories below decay threshold
+        let all = self.storage.all_in_namespace(None).map_err(LifecycleError::Storage)?;
+        let now = Utc::now();
+        let below = all.iter()
+            .filter(|r| crate::models::ebbinghaus::effective_strength(r, now) < 0.1)
+            .count();
+
+        Ok(HealthReport {
+            total_memories: total,
+            per_namespace: per_ns,
+            below_threshold: below,
+            orphan_memories: orphans,
+            stale_clusters: 0,  // TODO: implement stale cluster counting
+            dangling_hebbian_links: dangling,
+            soft_deleted: soft_del,
+        })
+    }
+
+    /// Rebalance: repair integrity issues.
+    pub fn rebalance(&mut self) -> Result<crate::lifecycle::RebalanceReport, LifecycleError> {
+        self.rebalance_internal()
+    }
+
+    fn rebalance_internal(&mut self) -> Result<crate::lifecycle::RebalanceReport, LifecycleError> {
+        let mut report = crate::lifecycle::RebalanceReport::default();
+
+        // 1. Remove orphaned access_log entries
+        report.access_log_cleaned = self.storage.cleanup_orphaned_access_log()
+            .map_err(LifecycleError::Storage)?;
+
+        // 2. Repair dangling Hebbian links
+        report.hebbian_repaired = self.storage.cleanup_dangling_hebbian()
+            .map_err(LifecycleError::Storage)?;
+
+        // 3. Cleanup entity_links for deleted memories
+        report.entity_links_cleaned = self.storage.cleanup_orphaned_entity_links()
+            .map_err(LifecycleError::Storage)?;
+
+        // Note: embedding rebuilding requires EmbeddingProvider which is optional.
+        // Skip for now — embeddings are rebuilt on next recall if missing.
+
+        report.repairs = report.access_log_cleaned
+            + report.hebbian_repaired
+            + report.entity_links_cleaned;
+
+        Ok(report)
+    }
+
+    // ── Supersession: High-Level API (Step 5) ──────────────────────────
+
+    /// Correct a single memory: create a replacement and supersede the old one.
+    ///
+    /// This is the recommended way to fix wrong memories. It:
+    /// 1. Fetches the old memory to inherit type/importance/namespace
+    /// 2. Stores the new content as a fresh memory
+    /// 3. Marks the old memory as superseded by the new one
+    ///
+    /// Returns the new memory's ID.
+    pub fn correct(
+        &mut self,
+        old_id: &str,
+        new_content: &str,
+        importance_override: Option<f64>,
+        memory_type_override: Option<MemoryType>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        // 1. Fetch old memory
+        let old = self.storage.get(old_id)?
+            .ok_or_else(|| format!("Memory not found: {}", old_id))?;
+
+        // 2. Determine type and importance
+        let memory_type = memory_type_override.unwrap_or(old.memory_type);
+        let importance = importance_override.unwrap_or_else(|| old.importance.max(0.5));
+
+        // 3. Get namespace of old memory
+        let namespace = self.storage.get_namespace(old_id)?;
+        let ns_ref = namespace.as_deref();
+
+        // 4. Store the new memory in the same namespace
+        let new_id = self.add_to_namespace(
+            new_content,
+            memory_type,
+            Some(importance),
+            Some("correction"),
+            None,
+            ns_ref,
+        )?;
+
+        // 5. Supersede old → new
+        self.storage.supersede(old_id, &new_id)
+            .map_err(|e| format!("Supersession failed after storing new memory: {}", e))?;
+
+        log::info!("Corrected memory {} → {} in namespace {:?}", old_id, new_id, ns_ref);
+        Ok(new_id)
+    }
+
+    /// Correct multiple memories matching a query: find them, create a replacement,
+    /// and supersede all matches.
+    ///
+    /// The confirmation step (showing matches before applying) is handled at the
+    /// CLI layer, not here. This method is unconditional.
+    ///
+    /// Returns a `BulkCorrectionResult` with the new ID and all superseded IDs.
+    pub fn correct_bulk(
+        &mut self,
+        query: &str,
+        new_content: &str,
+        namespace: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::types::BulkCorrectionResult, Box<dyn std::error::Error>> {
+        // 1. Find matching memories via recall
+        let matches = self.recall_from_namespace(query, limit, None, None, namespace)?;
+        if matches.is_empty() {
+            return Err("No matching memories found for correction".into());
+        }
+
+        // 2. Determine memory type from the highest-scored match
+        let best_match = &matches[0];
+        let memory_type = best_match.record.memory_type;
+
+        // 3. Store the new correction memory
+        let new_id = self.add_to_namespace(
+            new_content,
+            memory_type,
+            Some(0.7), // Corrections get moderate-high importance
+            Some("bulk_correction"),
+            None,
+            namespace,
+        )?;
+
+        // 4. Supersede all matching memories
+        let ids: Vec<String> = matches.iter().map(|r| r.record.id.clone()).collect();
+        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let count = self.storage.supersede_bulk(&id_refs, &new_id)
+            .map_err(|e| format!("Bulk supersession failed: {}", e))?;
+
+        log::info!("Bulk corrected {} memories → {} (query: '{}')", count, new_id, query);
+
+        Ok(crate::types::BulkCorrectionResult {
+            new_id,
+            superseded_count: count,
+            superseded_ids: ids,
+        })
+    }
+
+    /// List all superseded memories (observability).
+    ///
+    /// Returns superseded records with their replacement ID and chain head.
+    pub fn list_superseded(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<crate::types::SupersessionInfo>, Box<dyn std::error::Error>> {
+        let pairs = self.storage.list_superseded(namespace)?;
+        let mut results = Vec::with_capacity(pairs.len());
+        for (record, replacement_id) in pairs {
+            let chain_head = self.storage.resolve_chain_head(&replacement_id)?;
+            results.push(crate::types::SupersessionInfo {
+                superseded: record,
+                superseded_by_id: replacement_id,
+                chain_head,
+            });
+        }
+        Ok(results)
+    }
+
+    /// Undo a supersession, restoring a memory to active recall.
+    pub fn unsupersede(&mut self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.storage.unsupersede(id)
+            .map_err(|e| format!("Unsupersede failed: {}", e))?;
+        log::info!("Restored memory {} to active recall", id);
+        Ok(())
+    }
+
     /// Set the agent ID for this memory instance.
     /// 
     /// This is used for ACL checks when storing and recalling memories.
@@ -1222,6 +1425,7 @@ impl Memory {
             source: source.unwrap_or("").to_string(),
             contradicts: None,
             contradicted_by: None,
+            superseded_by: None,
             metadata,
         };
 
@@ -1517,6 +1721,9 @@ impl Memory {
                 }
             }
             
+            // Defense-in-depth: filter out any superseded memories that slipped through SQL filter
+            candidates.retain(|r| r.superseded_by.is_none());
+            
             // Hebbian channel (6th channel): score candidates by Hebbian connectivity
             let candidate_ids: Vec<String> = candidates.iter().map(|r| r.id.clone()).collect();
             let hebbian_scores = if self.config.hebbian_enabled {
@@ -1735,7 +1942,9 @@ impl Memory {
         limit: usize,
         namespace: Option<&str>,
     ) -> Result<Vec<MemoryRecord>, Box<dyn std::error::Error>> {
-        let records = self.storage.fetch_recent(limit, namespace)?;
+        let mut records = self.storage.fetch_recent(limit, namespace)?;
+        // Defense-in-depth: filter out any superseded memories that slipped through SQL filter
+        records.retain(|r| r.superseded_by.is_none());
         Ok(records)
     }
     
@@ -1921,6 +2130,11 @@ impl Memory {
         now: chrono::DateTime<Utc>,
     ) -> Result<Vec<RecallResult>, Box<dyn std::error::Error>> {
         let fts_candidates = self.storage.search_fts_ns(query, limit * 3, Some(ns))?;
+        
+        // Defense-in-depth: filter out any superseded memories that slipped through SQL filter
+        let fts_candidates: Vec<_> = fts_candidates.into_iter()
+            .filter(|r| r.superseded_by.is_none())
+            .collect();
         
         let mut scored: Vec<_> = fts_candidates
             .into_iter()
@@ -2544,9 +2758,13 @@ impl Memory {
             })
             .collect();
         
+        // Defense-in-depth: filter out any superseded memories that slipped through
+        let recall_results: Vec<_> = recall_results.into_iter()
+            .filter(|r| r.record.superseded_by.is_none())
+            .collect();
+        
         Ok(recall_results)
-    }
-    
+    }    
     /// Uses Hebbian links to find memories that frequently co-occur.
     /// Note: this finds *associations*, not true causal relationships.
     /// LLMs can infer causality from the associated context.
@@ -2598,6 +2816,7 @@ impl Memory {
             // Score and filter
             let mut scored: Vec<_> = causal_memories
                 .into_iter()
+                .filter(|r| r.superseded_by.is_none()) // Defense-in-depth
                 .map(|record| {
                     let activation = retrieval_activation(
                         &record,
@@ -3106,6 +3325,7 @@ impl Memory {
         // Score each candidate with ACT-R activation
         let mut scored: Vec<_> = candidates
             .into_iter()
+            .filter(|r| r.superseded_by.is_none()) // Defense-in-depth
             .map(|record| {
                 let activation = retrieval_activation(
                     &record,
@@ -3492,6 +3712,8 @@ impl Memory {
             clusters_auto_updated: 0,
             clusters_deferred: gate_results.iter().filter(|g| matches!(g.decision, crate::synthesis::types::GateDecision::Defer { .. })).count(),
             clusters_skipped: gate_results.iter().filter(|g| matches!(g.decision, crate::synthesis::types::GateDecision::Skip { .. })).count(),
+            synthesis_runs_full: 0,
+            synthesis_runs_incremental: 0,
             insights_created: Vec::new(),
             sources_demoted: Vec::new(),
             errors: Vec::new(),
@@ -3500,24 +3722,47 @@ impl Memory {
         })
     }
 
-    /// Unified sleep cycle: consolidate, then synthesize.
+    /// Unified sleep cycle: consolidate, synthesize, decay, forget, rebalance.
     ///
-    /// This is the recommended way to run both consolidation and synthesis in sequence.
+    /// This is the recommended way to run the full memory maintenance pipeline.
     /// Consolidation always runs; synthesis only runs if enabled via settings.
     pub fn sleep_cycle(
         &mut self,
         days: f64,
         namespace: Option<&str>,
     ) -> Result<SleepReport, Box<dyn std::error::Error>> {
-        // Phase 1: Synaptic consolidation (existing)
-        self.consolidate_namespace(days, namespace)?;
+        use std::time::Instant;
+        let cycle_start = Instant::now();
+        let mut phases = Vec::new();
 
-        // Phase 2: Knowledge synthesis (if enabled)
+        // Phase 1: Synaptic consolidation (existing)
+        let t = Instant::now();
+        self.consolidate_namespace(days, namespace)?;
+        phases.push(PhaseReport {
+            name: "consolidate".to_string(),
+            duration_ms: t.elapsed().as_millis() as u64,
+            count: 0,
+        });
+
+        // Phase 2: Knowledge synthesis (if enabled, now incremental via C4)
+        let t = Instant::now();
         let synthesis = if self.synthesis_settings.as_ref().map_or(false, |s| s.enabled) {
             match self.synthesize() {
-                Ok(report) => Some(report),
+                Ok(report) => {
+                    phases.push(PhaseReport {
+                        name: "synthesis".to_string(),
+                        duration_ms: t.elapsed().as_millis() as u64,
+                        count: report.insights_created.len(),
+                    });
+                    Some(report)
+                }
                 Err(e) => {
                     log::warn!("Synthesis in sleep cycle failed (non-fatal): {e}");
+                    phases.push(PhaseReport {
+                        name: "synthesis".to_string(),
+                        duration_ms: t.elapsed().as_millis() as u64,
+                        count: 0,
+                    });
                     None
                 }
             }
@@ -3525,9 +3770,46 @@ impl Memory {
             None
         };
 
+        // Phase 3: Decay check (C5) — flag weak memories
+        let t = Instant::now();
+        let decay = self.check_decay_and_flag(namespace)?;
+        phases.push(PhaseReport {
+            name: "decay".to_string(),
+            duration_ms: t.elapsed().as_millis() as u64,
+            count: decay.flagged_for_forget,
+        });
+
+        // Phase 4: Forget (C6) — soft-delete + hard-delete old
+        let t = Instant::now();
+        let forget = self.forget_bulk()?;
+        phases.push(PhaseReport {
+            name: "forget".to_string(),
+            duration_ms: t.elapsed().as_millis() as u64,
+            count: forget.soft_deleted + forget.hard_deleted,
+        });
+
+        // Phase 5: Rebalance (C9) — repair integrity
+        let t = Instant::now();
+        let rebalance = self.rebalance_internal()?;
+        phases.push(PhaseReport {
+            name: "rebalance".to_string(),
+            duration_ms: t.elapsed().as_millis() as u64,
+            count: rebalance.repairs,
+        });
+
+        // Reset per-cycle counters
+        self.dedup_merge_count = 0;
+        self.dedup_write_count = 0;
+        self.last_add_result = None;
+
         Ok(SleepReport {
             consolidation_ok: true,
             synthesis,
+            phases,
+            decay: Some(decay),
+            forget: Some(forget),
+            rebalance: Some(rebalance),
+            duration_ms: cycle_start.elapsed().as_millis() as u64,
         })
     }
 
@@ -3847,6 +4129,7 @@ mod confidence_tests {
                 source: "test".to_string(),
                 contradicts: None,
                 contradicted_by: None,
+            superseded_by: None,
                 metadata: None,
             },
             activation: 0.5,
@@ -3902,6 +4185,7 @@ mod confidence_tests {
                 source: "test".to_string(),
                 contradicts: None,
                 contradicted_by: None,
+            superseded_by: None,
                 metadata: None,
             },
             activation: 0.5,
@@ -3955,6 +4239,7 @@ mod confidence_tests {
                 source: "test".to_string(),
                 contradicts: None,
                 contradicted_by: None,
+            superseded_by: None,
                 metadata: None,
             },
             activation: 0.5,
@@ -4006,6 +4291,7 @@ mod confidence_tests {
                 source: "test".to_string(),
                 contradicts: None,
                 contradicted_by: None,
+            superseded_by: None,
                 metadata: None,
             },
             activation: 0.5,
@@ -4058,6 +4344,7 @@ mod confidence_tests {
                 source: "test".to_string(),
                 contradicts: None,
                 contradicted_by: None,
+            superseded_by: None,
                 metadata: None,
             },
             activation: 0.5,
@@ -4109,6 +4396,7 @@ mod confidence_tests {
             source: "test".to_string(),
             contradicts: None,
             contradicted_by: None,
+            superseded_by: None,
             metadata: None,
         }
     }

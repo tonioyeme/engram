@@ -28,6 +28,7 @@ fn make_record(id: &str, content: &str, importance: f64) -> MemoryRecord {
         source: "test".to_string(),
         contradicts: None,
         contradicted_by: None,
+        superseded_by: None,
         metadata: None,
     }
 }

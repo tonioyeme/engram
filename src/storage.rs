@@ -210,6 +210,16 @@ impl Storage {
             "CREATE INDEX IF NOT EXISTS idx_memories_deleted_at ON memories(deleted_at);"
         )?;
         
+        // Add superseded_by column for memory supersession (GUARD-ss.3: idempotent migration)
+        match conn.execute(
+            "ALTER TABLE memories ADD COLUMN superseded_by TEXT DEFAULT ''",
+            [],
+        ) {
+            Ok(_) => {},
+            Err(e) if e.to_string().contains("duplicate column name") => {},
+            Err(e) => return Err(e),
+        }
+        
         Ok(Self { conn })
     }
     
@@ -953,7 +963,7 @@ impl Storage {
 
     /// Get all memories.
     pub fn all(&self) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
-        let mut stmt = self.conn.prepare("SELECT * FROM memories WHERE deleted_at IS NULL")?;
+        let mut stmt = self.conn.prepare("SELECT * FROM memories WHERE deleted_at IS NULL AND (superseded_by IS NULL OR superseded_by = '')")?;
         let rows = stmt.query_map([], |row| {
             let id: String = row.get("id")?;
             let access_times = self.get_access_times(&id).unwrap_or_default();
@@ -1157,7 +1167,7 @@ impl Storage {
         
         if ns == "*" {
             let mut stmt = self.conn.prepare(
-                "SELECT * FROM memories WHERE memory_type = ? AND deleted_at IS NULL ORDER BY importance DESC LIMIT ?"
+                "SELECT * FROM memories WHERE memory_type = ? AND deleted_at IS NULL AND (superseded_by IS NULL OR superseded_by = '') ORDER BY importance DESC LIMIT ?"
             )?;
             
             let rows = stmt.query_map(params![memory_type.to_string(), limit as i64], |row| {
@@ -1169,7 +1179,7 @@ impl Storage {
             rows.collect()
         } else {
             let mut stmt = self.conn.prepare(
-                "SELECT * FROM memories WHERE memory_type = ? AND namespace = ? AND deleted_at IS NULL ORDER BY importance DESC LIMIT ?"
+                "SELECT * FROM memories WHERE memory_type = ? AND namespace = ? AND deleted_at IS NULL AND (superseded_by IS NULL OR superseded_by = '') ORDER BY importance DESC LIMIT ?"
             )?;
             
             let rows = stmt.query_map(params![memory_type.to_string(), ns, limit as i64], |row| {
@@ -1222,6 +1232,7 @@ impl Storage {
             SELECT m.* FROM memories m
             JOIN memories_fts f ON m.rowid = f.rowid
             WHERE memories_fts MATCH ? AND m.deleted_at IS NULL
+            AND (m.superseded_by IS NULL OR m.superseded_by = '')
             ORDER BY rank LIMIT ?
             "#,
         )?;
@@ -1249,7 +1260,7 @@ impl Storage {
 
         if ns == "*" {
             let mut stmt = self.conn.prepare(
-                "SELECT * FROM memories ORDER BY created_at DESC LIMIT ?"
+                "SELECT * FROM memories WHERE (superseded_by IS NULL OR superseded_by = '') AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ?"
             )?;
             let rows = stmt.query_map(params![limit as i64], |row| {
                 let id: String = row.get("id")?;
@@ -1259,7 +1270,7 @@ impl Storage {
             rows.collect()
         } else {
             let mut stmt = self.conn.prepare(
-                "SELECT * FROM memories WHERE namespace = ? ORDER BY created_at DESC LIMIT ?"
+                "SELECT * FROM memories WHERE namespace = ? AND (superseded_by IS NULL OR superseded_by = '') AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ?"
             )?;
             let rows = stmt.query_map(params![ns, limit as i64], |row| {
                 let id: String = row.get("id")?;
@@ -1273,7 +1284,7 @@ impl Storage {
     pub fn search_by_type(&self, memory_type: MemoryType) -> Result<Vec<MemoryRecord>, rusqlite::Error> {
         let mut stmt = self
             .conn
-            .prepare("SELECT * FROM memories WHERE memory_type = ? AND deleted_at IS NULL")?;
+            .prepare("SELECT * FROM memories WHERE memory_type = ? AND deleted_at IS NULL AND (superseded_by IS NULL OR superseded_by = '')")?;
         
         let rows = stmt.query_map(params![memory_type.to_string()], |row| {
             let id: String = row.get("id")?;
@@ -1520,6 +1531,7 @@ impl Storage {
         
         let contradicts_str: String = row.get("contradicts")?;
         let contradicted_by_str: String = row.get("contradicted_by")?;
+        let superseded_by_str: String = row.get("superseded_by").unwrap_or_default();
         
         let metadata = metadata_str
             .and_then(|s| serde_json::from_str(&s).ok());
@@ -1540,6 +1552,7 @@ impl Storage {
             source: row.get("source")?,
             contradicts: if contradicts_str.is_empty() { None } else { Some(contradicts_str) },
             contradicted_by: if contradicted_by_str.is_empty() { None } else { Some(contradicted_by_str) },
+            superseded_by: if superseded_by_str.is_empty() { None } else { Some(superseded_by_str) },
             metadata,
         })
     }
@@ -1553,6 +1566,177 @@ impl Storage {
                 |row| row.get(0),
             )
             .optional()
+    }
+
+    // === Supersession Methods ===
+
+    /// Mark old_id as superseded by new_id.
+    ///
+    /// Validates: old_id exists, new_id exists, old_id != new_id, same namespace.
+    /// If old_id is already superseded, updates the link (last-write-wins).
+    pub fn supersede(&self, old_id: &str, new_id: &str) -> Result<(), crate::types::SupersessionError> {
+        use crate::types::SupersessionError;
+
+        if old_id == new_id {
+            return Err(SupersessionError::SelfSupersession(old_id.to_string()));
+        }
+        // Validate old exists
+        if self.get(old_id).map_err(SupersessionError::Db)?.is_none() {
+            return Err(SupersessionError::NotFound(old_id.to_string()));
+        }
+        // Validate new exists
+        if self.get(new_id).map_err(SupersessionError::Db)?.is_none() {
+            return Err(SupersessionError::NotFound(new_id.to_string()));
+        }
+        // Namespace check (SEC-ss.1): both must be in the same namespace
+        let old_ns = self.get_namespace(old_id).map_err(SupersessionError::Db)?;
+        let new_ns = self.get_namespace(new_id).map_err(SupersessionError::Db)?;
+        if old_ns != new_ns {
+            return Err(SupersessionError::CrossNamespace {
+                old_ns: old_ns.unwrap_or_default(),
+                new_ns: new_ns.unwrap_or_default(),
+            });
+        }
+
+        self.conn.execute(
+            "UPDATE memories SET superseded_by = ? WHERE id = ?",
+            params![new_id, old_id],
+        ).map_err(SupersessionError::Db)?;
+        Ok(())
+    }
+
+    /// Supersede multiple old IDs with one new ID. Transactional.
+    ///
+    /// If any old_id doesn't exist, rolls back and returns error with invalid IDs.
+    /// Empty old_ids = no-op success (returns 0).
+    pub fn supersede_bulk(&self, old_ids: &[&str], new_id: &str) -> Result<usize, crate::types::SupersessionError> {
+        use crate::types::SupersessionError;
+
+        if old_ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Validate new_id exists
+        if self.get(new_id).map_err(SupersessionError::Db)?.is_none() {
+            return Err(SupersessionError::NotFound(new_id.to_string()));
+        }
+        let new_ns = self.get_namespace(new_id).map_err(SupersessionError::Db)?;
+
+        // Validate all old IDs exist and are in the same namespace
+        let mut invalid_ids = Vec::new();
+        for &old_id in old_ids {
+            if old_id == new_id {
+                invalid_ids.push(old_id.to_string());
+                continue;
+            }
+            match self.get(old_id).map_err(SupersessionError::Db)? {
+                None => invalid_ids.push(old_id.to_string()),
+                Some(_) => {
+                    let old_ns = self.get_namespace(old_id).map_err(SupersessionError::Db)?;
+                    if old_ns != new_ns {
+                        return Err(SupersessionError::CrossNamespace {
+                            old_ns: old_ns.unwrap_or_default(),
+                            new_ns: new_ns.unwrap_or_default(),
+                        });
+                    }
+                }
+            }
+        }
+
+        if !invalid_ids.is_empty() {
+            return Err(SupersessionError::InvalidIds(invalid_ids));
+        }
+
+        // All validated — execute in a savepoint
+        self.conn.execute("SAVEPOINT supersede_bulk", []).map_err(SupersessionError::Db)?;
+        let result = (|| {
+            for &old_id in old_ids {
+                self.conn.execute(
+                    "UPDATE memories SET superseded_by = ? WHERE id = ?",
+                    params![new_id, old_id],
+                ).map_err(SupersessionError::Db)?;
+            }
+            Ok::<usize, SupersessionError>(old_ids.len())
+        })();
+
+        match result {
+            Ok(count) => {
+                self.conn.execute("RELEASE supersede_bulk", []).map_err(SupersessionError::Db)?;
+                Ok(count)
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK TO supersede_bulk", []);
+                let _ = self.conn.execute("RELEASE supersede_bulk", []);
+                Err(e)
+            }
+        }
+    }
+
+    /// Clear superseded_by for a memory, restoring it to active recall.
+    pub fn unsupersede(&self, id: &str) -> Result<(), crate::types::SupersessionError> {
+        use crate::types::SupersessionError;
+
+        if self.get(id).map_err(SupersessionError::Db)?.is_none() {
+            return Err(SupersessionError::NotFound(id.to_string()));
+        }
+
+        self.conn.execute(
+            "UPDATE memories SET superseded_by = '' WHERE id = ?",
+            params![id],
+        ).map_err(SupersessionError::Db)?;
+        Ok(())
+    }
+
+    /// List all superseded memories, optionally filtered by namespace.
+    pub fn list_superseded(&self, namespace: Option<&str>) -> Result<Vec<(MemoryRecord, String)>, rusqlite::Error> {
+        let query = if let Some(ns) = namespace {
+            let mut stmt = self.conn.prepare(
+                "SELECT * FROM memories WHERE superseded_by != '' AND namespace = ? AND deleted_at IS NULL ORDER BY created_at DESC"
+            )?;
+            let rows = stmt.query_map(params![ns], |row| {
+                let id: String = row.get("id")?;
+                let access_times = self.get_access_times(&id).unwrap_or_default();
+                let record = self.row_to_record(row, access_times)?;
+                let superseded_by: String = row.get("superseded_by")?;
+                Ok((record, superseded_by))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT * FROM memories WHERE superseded_by != '' AND deleted_at IS NULL ORDER BY created_at DESC"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let id: String = row.get("id")?;
+                let access_times = self.get_access_times(&id).unwrap_or_default();
+                let record = self.row_to_record(row, access_times)?;
+                let superseded_by: String = row.get("superseded_by")?;
+                Ok((record, superseded_by))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(query)
+    }
+
+    /// Resolve the supersession chain head for a given memory.
+    ///
+    /// Returns the final non-superseded memory ID, or None if cycle detected.
+    pub fn resolve_chain_head(&self, id: &str) -> Result<Option<String>, rusqlite::Error> {
+        let mut current = id.to_string();
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            if !visited.insert(current.clone()) {
+                // Cycle detected
+                log::warn!("Supersession cycle detected involving {}", current);
+                return Ok(None);
+            }
+            match self.get(&current)? {
+                Some(record) => match &record.superseded_by {
+                    Some(next) => current = next.clone(),
+                    None => return Ok(Some(current)),
+                },
+                None => return Ok(None), // broken chain
+            }
+        }
     }
     
     /// Full-text search using FTS5, filtered by namespace.
@@ -1584,6 +1768,7 @@ impl Storage {
                 SELECT m.* FROM memories m
                 JOIN memories_fts f ON m.rowid = f.rowid
                 WHERE memories_fts MATCH ? AND m.deleted_at IS NULL
+                AND (m.superseded_by IS NULL OR m.superseded_by = '')
                 ORDER BY rank LIMIT ?
                 "#,
             )?;
@@ -1602,6 +1787,7 @@ impl Storage {
                 SELECT m.* FROM memories m
                 JOIN memories_fts f ON m.rowid = f.rowid
                 WHERE memories_fts MATCH ? AND m.namespace = ? AND m.deleted_at IS NULL
+                AND (m.superseded_by IS NULL OR m.superseded_by = '')
                 ORDER BY rank LIMIT ?
                 "#,
             )?;
@@ -1624,7 +1810,7 @@ impl Storage {
             return self.all();
         }
         
-        let mut stmt = self.conn.prepare("SELECT * FROM memories WHERE namespace = ? AND deleted_at IS NULL")?;
+        let mut stmt = self.conn.prepare("SELECT * FROM memories WHERE namespace = ? AND deleted_at IS NULL AND (superseded_by IS NULL OR superseded_by = '')")?;
         let rows = stmt.query_map(params![ns], |row| {
             let id: String = row.get("id")?;
             let access_times = self.get_access_times(&id).unwrap_or_default();
@@ -1736,7 +1922,8 @@ impl Storage {
         let mut stmt = self.conn.prepare(
             r#"SELECT e.memory_id, e.embedding FROM memory_embeddings e
             JOIN memories m ON e.memory_id = m.id
-            WHERE e.model = ? AND m.deleted_at IS NULL"#
+            WHERE e.model = ? AND m.deleted_at IS NULL
+            AND (m.superseded_by IS NULL OR m.superseded_by = '')"#
         )?;
         
         let rows = stmt.query_map(params![model], |row| {
@@ -1769,6 +1956,7 @@ impl Storage {
             SELECT e.memory_id, e.embedding FROM memory_embeddings e
             JOIN memories m ON e.memory_id = m.id
             WHERE m.namespace = ? AND e.model = ? AND m.deleted_at IS NULL
+            AND (m.superseded_by IS NULL OR m.superseded_by = '')
             "#
         )?;
         
@@ -3512,6 +3700,12 @@ impl Storage {
                 added_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS cluster_incremental_state (
+                cluster_id TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_cluster_assignments_cluster ON cluster_assignments(cluster_id);
         "#)?;
         Ok(())
@@ -3758,6 +3952,35 @@ impl Storage {
     /// Quality scores and signal summaries use defaults since the full pairwise
     /// data is not recomputed — this is intentional for the warm/cached path
     /// where we skip expensive Infomap recomputation.
+    /// Get the incremental synthesis state for a cluster.
+    pub fn get_incremental_state(&self, cluster_id: &str) -> Result<Option<crate::synthesis::types::IncrementalState>, rusqlite::Error> {
+        let result: Option<String> = self.conn.query_row(
+            "SELECT state_json FROM cluster_incremental_state WHERE cluster_id = ?",
+            params![cluster_id],
+            |row| row.get(0),
+        ).optional()?;
+        match result {
+            Some(json) => {
+                match serde_json::from_str(&json) {
+                    Ok(state) => Ok(Some(state)),
+                    Err(_) => Ok(None),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Save the incremental synthesis state for a cluster.
+    pub fn set_incremental_state(&self, cluster_id: &str, state: &crate::synthesis::types::IncrementalState) -> Result<(), rusqlite::Error> {
+        let json = serde_json::to_string(state).unwrap_or_default();
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO cluster_incremental_state (cluster_id, state_json, updated_at) VALUES (?1, ?2, ?3)",
+            params![cluster_id, json, now],
+        )?;
+        Ok(())
+    }
+
     pub fn get_all_cluster_data(&self) -> Result<Vec<crate::synthesis::types::MemoryCluster>, rusqlite::Error> {
         use std::collections::HashMap;
         let mut clusters: HashMap<String, Vec<String>> = HashMap::new();
@@ -3790,6 +4013,81 @@ impl Storage {
 
         Ok(result)
     }
+    // ── Lifecycle: Health & Rebalance helpers (FEAT-003 Phase 5) ───────
+
+    /// List distinct namespaces.
+    pub fn list_namespaces(&self) -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT namespace FROM memories WHERE deleted_at IS NULL")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// Count memories without embeddings (orphans).
+    pub fn count_orphan_memories(&self) -> Result<usize, rusqlite::Error> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM memories m WHERE m.deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM memory_embeddings me WHERE me.memory_id = m.id)",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    /// Count Hebbian links referencing deleted/non-existent memories.
+    pub fn count_dangling_hebbian(&self) -> Result<usize, rusqlite::Error> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM hebbian_links h WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = h.source_id AND m.deleted_at IS NULL) OR NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = h.target_id AND m.deleted_at IS NULL)",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    /// Get IDs of memories without embeddings.
+    pub fn get_orphan_memory_ids(&self) -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id FROM memories m WHERE m.deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM memory_embeddings me WHERE me.memory_id = m.id)"
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// Clean up access_log entries for deleted/non-existent memories.
+    pub fn cleanup_orphaned_access_log(&self) -> Result<usize, rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM access_log WHERE memory_id NOT IN (SELECT id FROM memories WHERE deleted_at IS NULL)",
+            [],
+        )
+    }
+
+    /// Clean up Hebbian links where either side is deleted/non-existent.
+    pub fn cleanup_dangling_hebbian(&self) -> Result<usize, rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM hebbian_links WHERE source_id NOT IN (SELECT id FROM memories WHERE deleted_at IS NULL) OR target_id NOT IN (SELECT id FROM memories WHERE deleted_at IS NULL)",
+            [],
+        )
+    }
+
+    /// Clean up entity links for deleted/non-existent memories.
+    pub fn cleanup_orphaned_entity_links(&self) -> Result<usize, rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM memory_entities WHERE memory_id NOT IN (SELECT id FROM memories WHERE deleted_at IS NULL)",
+            [],
+        )
+    }
+
+    /// Count memories in a specific namespace (or all if None).
+    pub fn count_memories_in_namespace(&self, namespace: Option<&str>) -> Result<usize, rusqlite::Error> {
+        match namespace {
+            Some(ns) => self.conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = ? AND deleted_at IS NULL",
+                params![ns],
+                |row| row.get(0),
+            ),
+            None => self.conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL",
+                [],
+                |row| row.get(0),
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3818,6 +4116,7 @@ mod tests {
             source: String::new(),
             contradicts: None,
             contradicted_by: None,
+            superseded_by: None,
             metadata: None,
         }
     }

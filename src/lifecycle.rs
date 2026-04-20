@@ -64,6 +64,36 @@ pub struct ReconcileReport {
     pub dry_run: bool,
 }
 
+/// Phase timing within sleep cycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhaseReport {
+    pub name: String,
+    pub duration_ms: u64,
+    pub count: usize,
+}
+
+/// Health check report.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct HealthReport {
+    pub total_memories: usize,
+    pub per_namespace: std::collections::HashMap<String, usize>,
+    pub below_threshold: usize,
+    pub orphan_memories: usize,
+    pub stale_clusters: usize,
+    pub dangling_hebbian_links: usize,
+    pub soft_deleted: usize,
+}
+
+/// Rebalance repair report.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct RebalanceReport {
+    pub embeddings_rebuilt: usize,
+    pub access_log_cleaned: usize,
+    pub hebbian_repaired: usize,
+    pub entity_links_cleaned: usize,
+    pub repairs: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +319,105 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0]["source_id"], "donor-123");
         assert_eq!(history[0]["content_updated"], true);
+    }
+
+    #[test]
+    fn test_health_report() {
+        let mut mem = test_memory();
+        mem.add("health check memory one", MemoryType::Factual, Some(0.5), None, None).unwrap();
+        mem.add("health check memory two", MemoryType::Factual, Some(0.5), None, None).unwrap();
+
+        let report = mem.health().unwrap();
+        assert_eq!(report.total_memories, 2);
+        assert!(report.per_namespace.contains_key("default"));
+        assert_eq!(*report.per_namespace.get("default").unwrap(), 2);
+        assert_eq!(report.soft_deleted, 0);
+    }
+
+    #[test]
+    fn test_rebalance_cleans_orphaned_access_log() {
+        let mut mem = test_memory();
+        let id = mem.add("rebalance access log test", MemoryType::Factual, Some(0.5), None, None).unwrap();
+        mem.storage_mut().record_access(&id).unwrap();
+
+        // Soft-delete the memory
+        mem.storage_mut().soft_delete(&id).unwrap();
+
+        // Rebalance should clean up orphaned access_log entries
+        let report = mem.rebalance().unwrap();
+        assert!(report.access_log_cleaned > 0, "Expected orphaned access_log entries to be cleaned");
+        assert!(report.repairs > 0);
+    }
+
+    #[test]
+    fn test_rebalance_cleans_dangling_hebbian() {
+        let mut mem = test_memory();
+        let id_a = mem.add("hebbian rebalance A", MemoryType::Factual, Some(0.5), None, None).unwrap();
+        let id_b = mem.add("hebbian rebalance B", MemoryType::Factual, Some(0.5), None, None).unwrap();
+
+        // Create a Hebbian link between A and B (need 2 coactivations with threshold 1)
+        mem.storage_mut().record_coactivation(&id_a, &id_b, 1).unwrap();
+        mem.storage_mut().record_coactivation(&id_a, &id_b, 1).unwrap();
+
+        // Verify link exists
+        let links = mem.storage().get_hebbian_links_weighted(&id_a).unwrap();
+        assert!(!links.is_empty(), "Hebbian link should exist");
+
+        // Soft-delete memory A
+        mem.storage_mut().soft_delete(&id_a).unwrap();
+
+        // Rebalance should clean the dangling link
+        let report = mem.rebalance().unwrap();
+        assert!(report.hebbian_repaired > 0, "Expected dangling Hebbian links to be cleaned");
+    }
+
+    #[test]
+    fn test_enhanced_sleep_cycle_phases() {
+        let mut mem = test_memory();
+        mem.add("sleep cycle phase test", MemoryType::Factual, Some(0.5), None, None).unwrap();
+
+        let report = mem.sleep_cycle(1.0, None).unwrap();
+        assert!(report.consolidation_ok);
+        assert!(report.phases.len() >= 3, "Expected at least consolidate, decay, forget phases");
+
+        // Verify phase names
+        let phase_names: Vec<&str> = report.phases.iter().map(|p| p.name.as_str()).collect();
+        assert!(phase_names.contains(&"consolidate"));
+        assert!(phase_names.contains(&"decay"));
+        assert!(phase_names.contains(&"forget"));
+        assert!(phase_names.contains(&"rebalance"));
+
+        // Verify decay and forget reports are present
+        assert!(report.decay.is_some());
+        assert!(report.forget.is_some());
+        assert!(report.rebalance.is_some());
+        assert!(report.duration_ms < 10_000); // sanity: should complete in <10s
+    }
+
+    #[test]
+    fn test_list_namespaces() {
+        let mut mem = test_memory();
+        mem.add_to_namespace("ns test alpha", MemoryType::Factual, Some(0.5), None, None, Some("alpha")).unwrap();
+        mem.add_to_namespace("ns test beta", MemoryType::Factual, Some(0.5), None, None, Some("beta")).unwrap();
+        mem.add("ns test default", MemoryType::Factual, Some(0.5), None, None).unwrap();
+
+        let namespaces = mem.storage().list_namespaces().unwrap();
+        assert!(namespaces.contains(&"alpha".to_string()));
+        assert!(namespaces.contains(&"beta".to_string()));
+        assert!(namespaces.contains(&"default".to_string()));
+    }
+
+    #[test]
+    fn test_count_orphan_memories() {
+        let mut mem = test_memory();
+        // Insert a memory directly into DB without embeddings to guarantee orphan status
+        let now = chrono::Utc::now().timestamp() as f64;
+        mem.storage_mut().conn().execute(
+            "INSERT INTO memories (id, content, memory_type, layer, importance, created_at, namespace) VALUES ('orphan-test-1', 'orphan memory', 'factual', 'working', 0.5, ?1, 'default')",
+            rusqlite::params![now],
+        ).unwrap();
+
+        let count = mem.storage().count_orphan_memories().unwrap();
+        assert!(count >= 1, "Expected at least 1 orphan memory (no embeddings)");
     }
 }

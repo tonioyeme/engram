@@ -69,6 +69,7 @@ impl DefaultSynthesisEngine {
 
     /// Store an insight + provenance + demotion in a single transaction.
     /// Returns (insight_id, demoted_source_ids).
+    #[allow(clippy::too_many_arguments)]
     fn store_insight_atomically(
         &self,
         storage: &mut Storage,
@@ -501,7 +502,7 @@ fn generate_id() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .subsec_nanos();
-    let random_part: u32 = nanos ^ (std::process::id() as u32);
+    let random_part: u32 = nanos ^ std::process::id();
     format!("{:08x}", random_part)
 }
 

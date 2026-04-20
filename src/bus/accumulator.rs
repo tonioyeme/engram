@@ -95,7 +95,7 @@ impl<'a> EmpathyAccumulator<'a> {
     /// Valence should be in range -1.0 (very negative) to 1.0 (very positive).
     pub fn record_emotion(&self, domain: &str, valence: f64) -> Result<(), rusqlite::Error> {
         // Clamp valence to valid range
-        let valence = valence.max(-1.0).min(1.0);
+        let valence = valence.clamp(-1.0, 1.0);
         
         // Try to get existing trend
         let existing: Option<(f64, i32)> = self.conn

@@ -895,7 +895,7 @@ impl Storage {
     pub fn add(&mut self, record: &MemoryRecord, namespace: &str) -> Result<(), rusqlite::Error> {
         let tx = self.conn.transaction()?;
         
-        let metadata_json = record.metadata.as_ref().map(|m| serde_json::to_string(m).ok()).flatten();
+        let metadata_json = record.metadata.as_ref().and_then(|m| serde_json::to_string(m).ok());
         
         tx.execute(
             r#"
@@ -980,7 +980,7 @@ impl Storage {
     /// If already inside a transaction (e.g., called from undo_synthesis), skips
     /// creating a new transaction to avoid "cannot start a transaction within a transaction".
     pub fn update(&mut self, record: &MemoryRecord) -> Result<(), rusqlite::Error> {
-        let metadata_json = record.metadata.as_ref().map(|m| serde_json::to_string(m).ok()).flatten();
+        let metadata_json = record.metadata.as_ref().and_then(|m| serde_json::to_string(m).ok());
         let needs_tx = self.conn.is_autocommit();
         
         if needs_tx {
@@ -1112,7 +1112,7 @@ impl Storage {
         new_content: &str,
         metadata: Option<serde_json::Value>,
     ) -> Result<(), rusqlite::Error> {
-        let metadata_json = metadata.map(|m| serde_json::to_string(&m).ok()).flatten();
+        let metadata_json = metadata.and_then(|m| serde_json::to_string(&m).ok());
         let needs_tx = self.conn.is_autocommit();
         
         if needs_tx {
@@ -1969,7 +1969,6 @@ impl Storage {
         rows.collect()
     }
     
-    /// Delete embedding for a specific (memory_id, model) pair.
     // === Soft-Delete / Lifecycle Methods ===
 
     /// Get a reference to the underlying connection (for tests).

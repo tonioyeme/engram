@@ -335,7 +335,7 @@ fn check_identity_evolution(
             // Feedback baseline must exist and be calibrated (proves consistent history).
             let feedback_calibrated = hub
                 .baseline("feedback", &ds.domain)
-                .map_or(false, |bl| bl.is_calibrated());
+                .is_some_and(|bl| bl.is_calibrated());
 
             if valence_is_stable && feedback_calibrated {
                 let (aspect, observation, suggestion) = if ds.action_success_rate > 0.9 {
@@ -393,10 +393,10 @@ fn check_identity_evolution(
             // Confidence and alignment baselines must be calibrated.
             let conf_calibrated = hub
                 .baseline("confidence", &ds.domain)
-                .map_or(false, |bl| bl.is_calibrated());
+                .is_some_and(|bl| bl.is_calibrated());
             let align_calibrated = hub
                 .baseline("alignment", &ds.domain)
-                .map_or(false, |bl| bl.is_calibrated());
+                .is_some_and(|bl| bl.is_calibrated());
 
             if valence_stable && conf_calibrated && align_calibrated {
                 actions.push(RegulationAction::IdentityEvolutionSuggestion {
@@ -539,7 +539,7 @@ fn check_heartbeat_frequency(
     // If ≥2 domains are troubled, or global arousal is high → increase frequency.
     let high_global_arousal = state.global_arousal > 0.6;
     let should_increase = troubled_domains.len() >= 2
-        || (troubled_domains.len() >= 1 && high_global_arousal);
+        || (!troubled_domains.is_empty() && high_global_arousal);
 
     if should_increase {
         // Severity determines multiplier: more troubled domains → more aggressive.

@@ -119,7 +119,7 @@ impl TopicDiscovery {
         // Step 4: Build TopicCandidates, filtering by min_cluster_size.
         let mut candidates = Vec::new();
 
-        for (_module_id, member_indices) in &modules {
+        for member_indices in modules.values() {
             if member_indices.len() < self.min_cluster_size {
                 continue;
             }

@@ -820,8 +820,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     // Build memory config with embedding settings
-    let mut mem_config = MemoryConfig::default();
-    mem_config.embedding = embedding_config;
+    let mem_config = MemoryConfig { embedding: embedding_config, ..Default::default() };
     
     // Create Memory with or without Empathy Bus
     let mut mem = if let Some(ref workspace) = cli.workspace {
@@ -1574,8 +1573,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::Synthesize { dry_run, json } => {
             // Enable synthesis with defaults for this run
-            let mut settings = engramai::SynthesisSettings::default();
-            settings.enabled = true;
+            let settings = engramai::SynthesisSettings { enabled: true, ..Default::default() };
 
             if dry_run {
                 mem.set_synthesis_settings(settings);
@@ -1651,7 +1649,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if insights.is_empty() {
                     println!("No insights found. Run `engram synthesize` first.");
                 } else {
-                    println!("{:<12} {:<8} {:<8} {:<12} {}", "ID", "Type", "Sources", "Created", "Content");
+                    println!("{:<12} {:<8} {:<8} {:<12} Content", "ID", "Type", "Sources", "Created");
                     for insight in &insights {
                         let meta = insight.metadata.as_ref();
                         let synth_type = meta
@@ -1715,7 +1713,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("\nNo provenance records found.");
                             } else {
                                 println!("\nSources ({}):", src_records.len());
-                                println!("  {:<12} {:<10} {:<10} {}", "ID", "Orig Imp.", "Confidence", "Content");
+                                println!("  {:<12} {:<10} {:<10} Content", "ID", "Orig Imp.", "Confidence");
                                 for pr in &src_records {
                                     if let Ok(Some(src_mem)) = mem.get(&pr.source_id) {
                                         let preview: String = src_mem.content.chars().take(50).collect();
@@ -1746,8 +1744,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::Sleep { ns, days, json } => {
             // Enable synthesis for the sleep cycle
-            let mut settings = engramai::SynthesisSettings::default();
-            settings.enabled = true;
+            let settings = engramai::SynthesisSettings { enabled: true, ..Default::default() };
             mem.set_synthesis_settings(settings);
 
             let report = mem.sleep_cycle(days, ns.as_deref())?;
@@ -2140,7 +2137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let all_topics = kc_store.list_topic_pages()
                         .map_err(|e| format!("Failed to list topics: {}", e))?;
 
-                    if links || (!links && !duplicates) {
+                    if links || !duplicates {
                         println!("Link Audit:");
                         let mut total_broken = 0usize;
                         let mut total_stale = 0usize;

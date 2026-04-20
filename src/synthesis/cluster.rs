@@ -22,6 +22,7 @@ use crate::synthesis::types::*;
 use crate::types::MemoryRecord;
 
 /// Compute pairwise signals between two memories.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_pairwise_signals(
     _storage: &Storage,
     id_a: &str,
@@ -824,10 +825,10 @@ fn infomap_communities(
     } else {
         edges.len() as f64 / id_list.len() as f64
     };
-    let trials = config.infomap_trials.unwrap_or_else(|| {
+    let trials = config.infomap_trials.unwrap_or({
         if edge_density < 5.0 { 1 } else { 3 }
     });
-    let hierarchical = config.infomap_hierarchical.unwrap_or_else(|| {
+    let hierarchical = config.infomap_hierarchical.unwrap_or({
         id_list.len() > 2000
     });
 

@@ -118,9 +118,7 @@ impl ConflictDetector {
                 }
             } else {
                 // No LLM: heuristic classification
-                match self.heuristic_classify(overlap) {
-                    ct => ct,
-                }
+                self.heuristic_classify(overlap)
             };
 
             let severity = severity_from_overlap(overlap);

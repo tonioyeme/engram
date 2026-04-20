@@ -38,6 +38,7 @@ impl<'a> LinkFormer<'a> {
     /// 6. Persist each link via `storage.record_association()`
     ///
     /// Returns the number of newly created links.
+    #[allow(clippy::too_many_arguments)]
     pub fn discover_associations(
         &self,
         new_memory_id: &str,

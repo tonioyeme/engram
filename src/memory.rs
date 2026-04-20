@@ -95,7 +95,7 @@ impl Memory {
     /// # Arguments
     ///
     /// * `path` - Path to SQLite database file. Created if it doesn't exist.
-    ///           Use `:memory:` for in-memory (non-persistent) operation.
+    ///   Use `:memory:` for in-memory (non-persistent) operation.
     /// * `config` - MemoryConfig with tunable parameters. None = literature defaults.
     ///
     /// If Ollama is available, embeddings will be used for semantic search.
@@ -1573,6 +1573,7 @@ impl Memory {
     /// * `namespace` - Namespace to store in
     /// * `emotion` - Emotional valence (-1.0 to 1.0)
     /// * `domain` - Domain for emotional tracking
+    #[allow(clippy::too_many_arguments)]
     pub fn add_with_emotion(
         &mut self,
         content: &str,
@@ -2298,13 +2299,12 @@ impl Memory {
         }
 
         // [ISS-016] Triple extraction phase (cold path, no DB lock during LLM calls)
-        if self.config.triple.enabled {
-            if self.triple_extractor.is_some() {
+        if self.config.triple.enabled
+            && self.triple_extractor.is_some() {
                 if let Err(e) = self.run_triple_extraction() {
                     log::warn!("Triple extraction failed (non-fatal): {e}");
                 }
             }
-        }
 
         // [ISS-008] Promotion detection phase
         if self.config.promotion.enabled {
@@ -2348,7 +2348,8 @@ impl Memory {
 
         // Step 3: LLM extraction — NO DB lock held
         let extractor = self.triple_extractor.as_ref().unwrap(); // caller checks this
-        let mut results: Vec<(String, Result<Vec<crate::triple::Triple>, Box<dyn std::error::Error + Send + Sync>>)> = Vec::new();
+        type TripleResult = Vec<(String, Result<Vec<crate::triple::Triple>, Box<dyn std::error::Error + Send + Sync>>)>;
+        let mut results: TripleResult = Vec::new();
         for (id, content) in &memory_texts {
             let result = extractor.extract_triples(content);
             results.push((id.clone(), result));
@@ -2393,7 +2394,7 @@ impl Memory {
 
     /// Detect knowledge clusters ready for promotion to persistent documents.
     pub fn detect_promotion_candidates(&self) -> Result<Vec<crate::promotion::PromotionCandidate>, Box<dyn std::error::Error>> {
-        Ok(crate::promotion::detect_promotable_clusters(&self.storage, &self.config.promotion)?)
+        crate::promotion::detect_promotable_clusters(&self.storage, &self.config.promotion)
     }
 
     /// Get pending promotion suggestions.
@@ -2425,13 +2426,12 @@ impl Memory {
             let now = Utc::now();
             let all = self.storage.all()?;
             for record in all {
-                if !record.pinned && effective_strength(&record, now) < threshold {
-                    if record.layer != MemoryLayer::Archive {
+                if !record.pinned && effective_strength(&record, now) < threshold
+                    && record.layer != MemoryLayer::Archive {
                         let mut updated = record;
                         updated.layer = MemoryLayer::Archive;
                         self.storage.update(&updated)?;
                     }
-                }
             }
         }
 
@@ -3473,7 +3473,7 @@ impl Memory {
         namespace: &str,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let mgr = SubscriptionManager::new(self.storage.connection())?;
-        Ok(mgr.unsubscribe(agent_id, namespace)?)
+        mgr.unsubscribe(agent_id, namespace)
     }
     
     /// List subscriptions for an agent.
@@ -3482,7 +3482,7 @@ impl Memory {
         agent_id: &str,
     ) -> Result<Vec<Subscription>, Box<dyn std::error::Error>> {
         let mgr = SubscriptionManager::new(self.storage.connection())?;
-        Ok(mgr.list_subscriptions(agent_id)?)
+        mgr.list_subscriptions(agent_id)
     }
     
     /// Check for notifications since last check.
@@ -3494,7 +3494,7 @@ impl Memory {
         agent_id: &str,
     ) -> Result<Vec<Notification>, Box<dyn std::error::Error>> {
         let mgr = SubscriptionManager::new(self.storage.connection())?;
-        Ok(mgr.check_notifications(agent_id)?)
+        mgr.check_notifications(agent_id)
     }
     
     /// Peek at notifications without updating cursor.
@@ -3503,7 +3503,7 @@ impl Memory {
         agent_id: &str,
     ) -> Result<Vec<Notification>, Box<dyn std::error::Error>> {
         let mgr = SubscriptionManager::new(self.storage.connection())?;
-        Ok(mgr.peek_notifications(agent_id)?)
+        mgr.peek_notifications(agent_id)
     }
 
     /// Extract entities from existing memories that don't have entity links yet.
@@ -3563,6 +3563,7 @@ impl Memory {
     /// Removes:
     /// - Person entities that are 1-2 chars or pure digits (e.g., "0", "1", "types")
     /// - Orphaned entities with no memory links
+    ///
     /// Returns count of entities deleted.
     pub fn purge_garbage_entities(&self) -> Result<usize, Box<dyn std::error::Error>> {
         let mut total_deleted = 0;
@@ -3746,7 +3747,7 @@ impl Memory {
 
         // Phase 2: Knowledge synthesis (if enabled, now incremental via C4)
         let t = Instant::now();
-        let synthesis = if self.synthesis_settings.as_ref().map_or(false, |s| s.enabled) {
+        let synthesis = if self.synthesis_settings.as_ref().is_some_and(|s| s.enabled) {
             match self.synthesize() {
                 Ok(report) => {
                     phases.push(PhaseReport {
@@ -3823,7 +3824,7 @@ impl Memory {
         let all = self.storage.all()?;
         let mut insights: Vec<MemoryRecord> = all
             .into_iter()
-            .filter(|r| is_insight(r))
+            .filter(is_insight)
             .collect();
         insights.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         if let Some(l) = limit {
@@ -3837,7 +3838,7 @@ impl Memory {
         &self,
         insight_id: &str,
     ) -> Result<Vec<crate::synthesis::types::ProvenanceRecord>, Box<dyn std::error::Error>> {
-        Ok(self.storage.get_insight_sources(insight_id)?)
+        self.storage.get_insight_sources(insight_id)
     }
 
     /// Get insights derived from a specific source memory.
@@ -3845,7 +3846,7 @@ impl Memory {
         &self,
         memory_id: &str,
     ) -> Result<Vec<crate::synthesis::types::ProvenanceRecord>, Box<dyn std::error::Error>> {
-        Ok(self.storage.get_memory_insights(memory_id)?)
+        self.storage.get_memory_insights(memory_id)
     }
 
     /// Reverse a synthesis: archive the insight and restore source importances.

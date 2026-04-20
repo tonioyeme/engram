@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::storage::Storage;
@@ -437,6 +438,19 @@ pub struct RestoredSource {
 // §6 — Incremental Updates
 // ===========================================================================
 
+/// Per-cluster incremental state for staleness detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncrementalState {
+    /// Member IDs from last synthesis run.
+    pub last_member_snapshot: HashSet<String>,
+    /// Quality score from last synthesis run.
+    pub last_quality_score: f64,
+    /// When last synthesis ran.
+    pub last_run: DateTime<Utc>,
+    /// How many times this cluster has been synthesized.
+    pub run_count: usize,
+}
+
 /// Configuration for incremental/staleness detection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncrementalConfig {
@@ -472,6 +486,10 @@ pub struct SynthesisReport {
     pub clusters_deferred: usize,
     /// Number of clusters skipped.
     pub clusters_skipped: usize,
+    /// Number of full synthesis runs (no prior state).
+    pub synthesis_runs_full: usize,
+    /// Number of incremental synthesis runs (seeded from existing insight).
+    pub synthesis_runs_incremental: usize,
     /// IDs of newly created insight memories.
     pub insights_created: Vec<String>,
     /// IDs of source memories whose importance was demoted.

@@ -40,6 +40,33 @@ impl DefaultSynthesisEngine {
         self.llm_provider
     }
 
+    /// Check whether a cluster has changed enough to warrant re-synthesis.
+    fn should_resynthesize(
+        cluster: &MemoryCluster,
+        state: &IncrementalState,
+        config: &IncrementalConfig,
+    ) -> bool {
+        // Condition 1: member change > staleness_member_change_pct (Jaccard distance)
+        let current_members: HashSet<&str> = cluster.members.iter().map(|s| s.as_str()).collect();
+        let old_members: HashSet<&str> = state.last_member_snapshot.iter().map(|s| s.as_str()).collect();
+        let intersection = current_members.intersection(&old_members).count();
+        let union_size = current_members.union(&old_members).count();
+        if union_size == 0 {
+            return true; // empty/new cluster
+        }
+        let change_pct = 1.0 - (intersection as f64 / union_size as f64);
+        if change_pct >= config.staleness_member_change_pct {
+            return true;
+        }
+
+        // Condition 2: quality_score delta > staleness_quality_delta
+        if (cluster.quality_score - state.last_quality_score).abs() >= config.staleness_quality_delta {
+            return true;
+        }
+
+        false
+    }
+
     /// Store an insight + provenance + demotion in a single transaction.
     /// Returns (insight_id, demoted_source_ids).
     fn store_insight_atomically(
@@ -144,6 +171,8 @@ impl SynthesisEngine for DefaultSynthesisEngine {
             clusters_auto_updated: 0,
             clusters_deferred: 0,
             clusters_skipped: 0,
+            synthesis_runs_full: 0,
+            synthesis_runs_incremental: 0,
             insights_created: Vec::new(),
             sources_demoted: Vec::new(),
             errors: Vec::new(),
@@ -245,6 +274,24 @@ impl SynthesisEngine for DefaultSynthesisEngine {
 
         // Step 4: Process each cluster
         for cluster_data in &clusters {
+            // --- Incremental staleness check (C4) ---
+            // If we have a previous incremental state for this cluster and
+            // the cluster hasn't changed enough, skip it entirely.
+            let incremental_state = storage
+                .get_incremental_state(&cluster_data.id)
+                .ok()
+                .flatten();
+            if let Some(ref state) = incremental_state {
+                if !Self::should_resynthesize(cluster_data, state, &settings.incremental) {
+                    log::debug!(
+                        "synthesis: skipping unchanged cluster {} (incremental)",
+                        cluster_data.id
+                    );
+                    report.clusters_skipped += 1;
+                    continue;
+                }
+            }
+
             // Load members
             let all_memories = storage.all()?;
             let member_set: HashSet<&str> =
@@ -358,6 +405,32 @@ impl SynthesisEngine for DefaultSynthesisEngine {
                             report.sources_demoted.extend(demoted_ids);
                             report.clusters_synthesized += 1;
                             insights_remaining = insights_remaining.saturating_sub(1);
+
+                            // Track full vs incremental
+                            if incremental_state.is_some() {
+                                report.synthesis_runs_incremental += 1;
+                            } else {
+                                report.synthesis_runs_full += 1;
+                            }
+
+                            // Save incremental state for next run
+                            let new_state = IncrementalState {
+                                last_member_snapshot: cluster_data
+                                    .members
+                                    .iter()
+                                    .cloned()
+                                    .collect(),
+                                last_quality_score: cluster_data.quality_score,
+                                last_run: Utc::now(),
+                                run_count: incremental_state
+                                    .as_ref()
+                                    .map(|s| s.run_count + 1)
+                                    .unwrap_or(1),
+                            };
+                            let _ = storage.set_incremental_state(
+                                &cluster_data.id,
+                                &new_state,
+                            );
                         }
                         Err(e) => {
                             report.errors.push(SynthesisError::StorageError {
@@ -513,6 +586,7 @@ mod tests {
             source: "test".to_string(),
             contradicts: None,
             contradicted_by: None,
+            superseded_by: None,
             metadata: None,
         }
     }
@@ -529,6 +603,163 @@ mod tests {
         SynthesisSettings {
             enabled: true,
             ..Default::default()
+        }
+    }
+
+    fn make_cluster(id: &str, members: &[&str], quality: f64) -> MemoryCluster {
+        MemoryCluster {
+            id: id.to_string(),
+            members: members.iter().map(|s| s.to_string()).collect(),
+            quality_score: quality,
+            centroid_id: members.first().unwrap_or(&"").to_string(),
+            signals_summary: SignalsSummary {
+                dominant_signal: ClusterSignal::Hebbian,
+                hebbian_contribution: 0.4,
+                entity_contribution: 0.3,
+                embedding_contribution: 0.2,
+                temporal_contribution: 0.1,
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Incremental / C4 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_resynthesize_new_cluster() {
+        // No previous state means should_resynthesize isn't even called;
+        // but if called with an empty snapshot, union=0 → true
+        let cluster = make_cluster("c1", &["m1", "m2", "m3"], 0.7);
+        let state = IncrementalState {
+            last_member_snapshot: HashSet::new(),
+            last_quality_score: 0.7,
+            last_run: Utc::now(),
+            run_count: 0,
+        };
+        let config = IncrementalConfig::default();
+        assert!(DefaultSynthesisEngine::should_resynthesize(&cluster, &state, &config));
+    }
+
+    #[test]
+    fn test_should_resynthesize_no_change() {
+        let cluster = make_cluster("c1", &["m1", "m2", "m3"], 0.7);
+        let state = IncrementalState {
+            last_member_snapshot: vec!["m1".to_string(), "m2".to_string(), "m3".to_string()]
+                .into_iter().collect(),
+            last_quality_score: 0.7,
+            last_run: Utc::now(),
+            run_count: 1,
+        };
+        let config = IncrementalConfig::default();
+        // Same members, same quality → false (skip)
+        assert!(!DefaultSynthesisEngine::should_resynthesize(&cluster, &state, &config));
+    }
+
+    #[test]
+    fn test_should_resynthesize_member_change() {
+        // Original: m1, m2, m3.  New: m1, m4, m5 → intersection=1, union=5
+        // change_pct = 1 - 1/5 = 0.8 ≥ 0.5 → true
+        let cluster = make_cluster("c1", &["m1", "m4", "m5"], 0.7);
+        let state = IncrementalState {
+            last_member_snapshot: vec!["m1".to_string(), "m2".to_string(), "m3".to_string()]
+                .into_iter().collect(),
+            last_quality_score: 0.7,
+            last_run: Utc::now(),
+            run_count: 1,
+        };
+        let config = IncrementalConfig::default();
+        assert!(DefaultSynthesisEngine::should_resynthesize(&cluster, &state, &config));
+    }
+
+    #[test]
+    fn test_should_resynthesize_quality_delta() {
+        // Same members but quality changed by 0.3 (> 0.2 threshold)
+        let cluster = make_cluster("c1", &["m1", "m2", "m3"], 1.0);
+        let state = IncrementalState {
+            last_member_snapshot: vec!["m1".to_string(), "m2".to_string(), "m3".to_string()]
+                .into_iter().collect(),
+            last_quality_score: 0.7,
+            last_run: Utc::now(),
+            run_count: 1,
+        };
+        let config = IncrementalConfig::default();
+        assert!(DefaultSynthesisEngine::should_resynthesize(&cluster, &state, &config));
+    }
+
+    #[test]
+    fn test_incremental_state_storage_roundtrip() {
+        let storage = Storage::new(":memory:").expect("in-memory db");
+        let state = IncrementalState {
+            last_member_snapshot: vec!["m1".to_string(), "m2".to_string()].into_iter().collect(),
+            last_quality_score: 0.75,
+            last_run: Utc::now(),
+            run_count: 3,
+        };
+        storage.set_incremental_state("cluster-abc", &state).unwrap();
+        let loaded = storage.get_incremental_state("cluster-abc").unwrap();
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.last_member_snapshot.len(), 2);
+        assert!(loaded.last_member_snapshot.contains("m1"));
+        assert!(loaded.last_member_snapshot.contains("m2"));
+        assert!((loaded.last_quality_score - 0.75).abs() < 0.001);
+        assert_eq!(loaded.run_count, 3);
+    }
+
+    #[test]
+    fn test_incremental_state_missing() {
+        let storage = Storage::new(":memory:").expect("in-memory db");
+        let loaded = storage.get_incremental_state("nonexistent").unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn test_synthesize_skips_unchanged_clusters() {
+        // Set up a storage with a pre-existing incremental state matching the cluster.
+        // The synthesize loop should skip it.
+        let memories = vec![
+            make_memory("m1", "Rust is fast and safe", MemoryType::Factual, 0.7),
+            make_memory("m2", "Borrow checker prevents bugs", MemoryType::Episodic, 0.7),
+            make_memory("m3", "Ownership model is unique", MemoryType::Relational, 0.7),
+        ];
+        let mut storage = setup_storage_with_memories(&memories);
+
+        // Create Hebbian links to force a cluster
+        for _ in 0..10 {
+            storage.record_coactivation("m1", "m2", 0).unwrap();
+            storage.record_coactivation("m1", "m3", 0).unwrap();
+            storage.record_coactivation("m2", "m3", 0).unwrap();
+        }
+
+        // First run: discover clusters and run synthesis
+        let provider = MockLlmProvider::valid_for(&["m1", "m2", "m3"]);
+        let engine = DefaultSynthesisEngine::new(Some(Box::new(provider)), None);
+        let mut settings = default_settings();
+        settings.cluster_discovery.min_importance = 0.3;
+        settings.cluster_discovery.cluster_threshold = 0.1;
+        settings.gate.gate_quality_threshold = 0.1;
+        settings.gate.defer_quality_threshold = 0.1;
+        settings.gate.min_type_diversity = 1;
+
+        let report1 = engine.synthesize(&mut storage, &settings).unwrap();
+        // If clusters were found and synthesized, incremental state should have been saved
+        if report1.clusters_synthesized > 0 {
+            // Second run with a new engine (same storage) — clusters unchanged
+            let provider2 = MockLlmProvider::valid_for(&["m1", "m2", "m3"]);
+            let engine2 = DefaultSynthesisEngine::new(Some(Box::new(provider2)), None);
+            let report2 = engine2.synthesize(&mut storage, &settings).unwrap();
+
+            // The same clusters should be skipped because incremental state matches
+            assert!(
+                report2.clusters_skipped >= report1.clusters_synthesized,
+                "Expected unchanged clusters to be skipped. \
+                 First run synthesized {}, second run skipped {}",
+                report1.clusters_synthesized,
+                report2.clusters_skipped
+            );
+            assert_eq!(report2.clusters_synthesized, 0,
+                "No new synthesis should happen on unchanged clusters");
         }
     }
 

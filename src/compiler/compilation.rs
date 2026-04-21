@@ -548,6 +548,14 @@ impl<S: KnowledgeStore, L: LlmProvider> CompilationPipeline<S, L> {
         // Persist
         self.store.create_topic_page(&page)?;
 
+        // Populate kc_compilation_sources for decay/health tracking
+        let source_refs: Vec<SourceMemoryRef> = memories.iter().map(|m| SourceMemoryRef {
+            memory_id: m.id.clone(),
+            relevance_score: m.importance,
+            added_at: now,
+        }).collect();
+        self.store.save_source_refs(&topic_id, &source_refs)?;
+
         let record = CompilationRecord {
             topic_id: topic_id.clone(),
             compiled_at: now,
@@ -611,6 +619,14 @@ impl<S: KnowledgeStore, L: LlmProvider> CompilationPipeline<S, L> {
 
         // Persist
         self.store.update_topic_page(&updated)?;
+
+        // Populate kc_compilation_sources for decay/health tracking
+        let source_refs: Vec<SourceMemoryRef> = memories.iter().map(|m| SourceMemoryRef {
+            memory_id: m.id.clone(),
+            relevance_score: m.importance,
+            added_at: now,
+        }).collect();
+        self.store.save_source_refs(&topic.id, &source_refs)?;
 
         let record = CompilationRecord {
             topic_id: topic.id.clone(),

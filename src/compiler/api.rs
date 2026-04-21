@@ -610,6 +610,7 @@ impl<S: KnowledgeStore> MaintenanceApi<S> {
             memories.iter().map(|m| (m.id.as_str(), m)).collect();
 
         let mut pages = Vec::new();
+        let mut topic_counter: u64 = 0;
 
         for candidate in &candidates {
             // Gather the memories for this candidate
@@ -633,7 +634,8 @@ impl<S: KnowledgeStore> MaintenanceApi<S> {
                 super::compilation::compile_without_llm(&title, &candidate_memories);
 
             let now = chrono::Utc::now();
-            let topic_id = TopicId(format!("topic-{}", now.timestamp_millis()));
+            let topic_id = TopicId(format!("topic-{}-{}", now.timestamp_millis(), topic_counter));
+            topic_counter += 1;
 
             let page = TopicPage {
                 id: topic_id.clone(),
@@ -661,6 +663,14 @@ impl<S: KnowledgeStore> MaintenanceApi<S> {
 
             // Persist
             self.store.create_topic_page(&page)?;
+
+            // Populate kc_compilation_sources for decay/health tracking
+            let source_refs: Vec<SourceMemoryRef> = candidate_memories.iter().map(|m| SourceMemoryRef {
+                memory_id: m.id.clone(),
+                relevance_score: m.importance,
+                added_at: now,
+            }).collect();
+            self.store.save_source_refs(&topic_id, &source_refs)?;
 
             let record = CompilationRecord {
                 topic_id: topic_id.clone(),

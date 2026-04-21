@@ -2,8 +2,9 @@
 
 > Feature: Memory Lifecycle Management
 > Priority: P1
-> Status: Partial (4 of 9 components implemented)
+> Status: Partial (4 fully implemented, 3 partial, 2 not implemented — see §Scope for per-component breakdown)
 > Date: 2026-04-16
+> Last reviewed: 2026-04-20
 
 ## Overview
 

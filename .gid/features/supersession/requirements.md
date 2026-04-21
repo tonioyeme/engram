@@ -1,5 +1,8 @@
 # Requirements: Memory Supersession
 
+**Status**: Partial — data model implemented (`types.rs` superseded_by field, `memory.rs::supersede()`, `association/*` respects it); automatic supersession detection on write **not** implemented. Currently requires explicit API call. Will emerge naturally once ISS-016 triple extraction + ISS-003 dedup + ISS-007 confidence are all live (see issues-index.md §Supersedes).
+**Last reviewed**: 2026-04-20
+
 ## Overview
 
 When a user corrects a fact ("engram doesn't use MCP" correcting an earlier "engram uses MCP"), the old memory must be **excluded** from recall results — not just downranked. The current system has `contradicted_by` fields and `contradiction_penalty` in ACT-R scoring, but nothing ever populates `contradicted_by`, so old/wrong memories persist indefinitely and outnumber corrections.

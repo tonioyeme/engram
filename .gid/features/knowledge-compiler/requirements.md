@@ -1,5 +1,8 @@
 # Requirements: Knowledge Compiler
 
+**Status**: P0 Complete — `src/compiler/` is live (discovery / compilation / conflict / decay / health / promotion). ISS-017 (O(n²)→HNSW) closed 2026-04-20. P1/P2 roadmap pending re-evaluation.
+**Last reviewed**: 2026-04-20
+
 ## Project Structure Decision (2026-04-17)
 
 **Decision: KC P0 代码在 engram-ai-rust 项目内开发，不单独立项。P1/P2 再评估。**

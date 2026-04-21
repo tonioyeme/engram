@@ -485,6 +485,81 @@ Haiku extractor 提取的 importance 没有上限/基线校准。理论上系统
 
 ---
 
+## ISS-017 [bug] [P0] [closed]
+**标题**: TopicDiscovery O(n²) 爆炸 — KnowledgeCompileTool 在真实记忆量下卡死
+**发现日期**: 2026-04-20
+**关闭日期**: 2026-04-20
+**发现者**: potato + RustClaw
+**组件**: src/compiler/discovery.rs, Cargo.toml
+**跨项目引用**: —
+
+**描述**:
+`TopicDiscovery::discover()` 做全对相似度计算构建 Infomap 输入图。16,366 条记忆时 n(n-1)/2 ≈ 1.34 亿对比较，~4000 万条边幸存，Infomap `local_moves` 不收敛，CPU 100%、3.7GB 内存，进程卡死。
+
+**根因**:
+1. O(n²) pairwise loop 在 discovery.rs 内层循环，超过 ~2000 条记忆后无法扩展
+2. `edge_threshold = 0.3` 过低，放进过多边，构成稠密图
+
+**修复**:
+- 用 HNSW (`hnsw 0.11` + `space 0.17`) ANN 索引替代暴力对比
+- 每节点只连 K=20 个最近邻，保证稀疏图
+- 总时间复杂度：O(n²) → O(n·log n)
+- 保持 `discover()` 公共 API 不变，调用方零改动
+
+**提交**: `40bb499 perf(compiler): HNSW-based topic discovery, O(n²) → O(n·log n) (ISS-017)`
+
+**测试**: 新增 `test_discover_ann_with_many_memories`，309 compiler tests pass
+
+---
+
+## ISS-016 [feature] [P1] [closed]
+**标题**: LLM 三元组抽取 — 解决 Hebbian 链接质量的实体覆盖盲区
+**发现日期**: 2026-04-18
+**关闭日期**: 2026-04-19
+**发现者**: potato + RustClaw
+**组件**: src/extractor.rs, src/entities.rs, storage 三元组表
+**跨项目引用**: gid-core (未来知识图谱共享协议)
+
+**描述**:
+ISS-015 引入多信号 Hebbian 链接后暴露结构性弱点：entity overlap 只对 Aho-Corasick 字典内硬编码词（Rust/Python/React 等）触发，embedding cosine 因此成了主导信号（权重 0.5），链接以"含糊相似"而非"真正相关"形成。往字典里加词是死路——无上限维护、无关系类型、无法识别新概念。
+
+**根因**:
+实体覆盖来自固定字典 → 新领域词汇（Infomap、do-calculus、ACT-R 等）永远抽不到 → entity overlap 信号沉默 → cosine 接管 → 链接噪音。
+
+**修复**:
+两层架构（非替换）：
+- Hot path（写时）：Aho-Corasick 字典继续用，延迟 <1ms
+- Cold path（异步批量）：LLM 抽取 `(Subject, Predicate, Object)` 三元组，存独立表
+- Hebbian 信号升级：entity overlap 基于抽取出的实体（不是字典命中）→ 更强更精准
+
+**谓词起始集**: is_a / part_of / uses / depends_on / caused_by / leads_to / implements / contradicts / related_to
+
+**提交**: `0383584 feat(engram): LLM triple extraction for Hebbian link quality (ISS-016)`、`3d862f5 chore: update issue statuses — close ISS-009, ISS-015, ISS-016`
+
+---
+
+## ISS-015 [improvement] [P1] [closed]
+**标题**: 聚类算法升级 — Union-Find 连通分量 → Infomap 社区检测
+**发现日期**: 2026-04-18
+**关闭日期**: 2026-04-18
+**发现者**: potato + RustClaw
+**组件**: src/synthesis/cluster.rs, src/clustering.rs, src/compiler/discovery.rs
+**跨项目引用**: gid-core (infomap-rs 实现已存在)
+
+**描述**:
+engram 有两套独立聚类实现都有根本缺陷：
+- `synthesis/cluster.rs`: 4 信号（Hebbian + entity Jaccard + embedding + 时间）加权后只做 Union-Find 连通分量 → 链式污染（single-linkage 经典缺陷），A-B-C-D 被连成一个"编程语言"簇
+- `compiler/discovery.rs`: 单信号（embedding cosine）+ 单链接凝聚聚类，完全忽略 Hebbian/实体/时间
+
+**修复**:
+- 抽 `infomap-rs` 为独立 crate（gid-core 已有实现）
+- engram 的 synthesis/cluster.rs 和 compiler/discovery.rs 统一走 Infomap
+- 4 信号仍用于加权边权，聚类算法换成社区检测
+
+**提交**: `3d862f5 chore: update issue statuses — close ISS-009, ISS-015, ISS-016`（关闭标记，代码落地在 synthesis 引擎重构）
+
+---
+
 ## ISS-013 [maintenance] [P3] [closed]
 **标题**: STDP 自动因果链接质量审计 — 34,859 条 Hebbian link 未验证
 **关闭日期**: 2026-04-19
@@ -713,17 +788,19 @@ struct SqliteStore { ... }     // 现有代码包装，零行为变更
 
 ---
 
-# 全局实现路线建议 (2026-04-16)
+# 全局实现路线建议 (更新于 2026-04-20)
 
 **当前 open 的操作性 Issues（可直接做）：**
+- ~~ISS-017 (P0) TopicDiscovery O(n²) 爆炸~~ ✅ closed — HNSW ANN 替换暴力对比 (commit 40bb499)
+- ~~ISS-016 (P1) LLM 三元组抽取~~ ✅ closed — extractor.rs 三元组表 + 两层架构
+- ~~ISS-015 (P1) 聚类算法升级~~ ✅ closed — infomap-rs crate 独立，synthesis/cluster.rs + discovery.rs 统一走 Infomap
 - ~~ISS-009 (P1) Entity 索引~~ ✅ closed — entity_recall 已实现 + ISS-016 triple extraction
 - ~~ISS-008 (P1) Knowledge promotion~~ ✅ closed — promotion.rs detect_promotable_clusters()
-- ~~ISS-015 (P1) 聚类算法升级~~ ✅ closed — infomap-rs crate 独立, synthesis/cluster.rs 已用 Infomap
 - ~~ISS-004 (P2) 中文分词~~ ✅ closed — jieba_rs 集成
 - ~~ISS-011 (P2) Recall 结果去重~~ ✅ closed
 - ~~ISS-012 (P2) Importance 校准~~ ✅ closed
 - ~~ISS-013 (P3) STDP 审计~~ ✅ closed — STDP 全可配置
-- ISS-014 (P2) Storage Trait 抽象 — 解耦算法层与存储后端（唯一 open issue）
+- **ISS-014 (P2) Storage Trait 抽象** — 解耦算法层与存储后端（**唯一 open issue**）
 
 **Feature 推荐顺序：**
 1. **ISS-009 + ISS-011 + ISS-012** — 操作性修复，直接提升 recall 质量

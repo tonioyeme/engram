@@ -1,5 +1,8 @@
 # Requirements: Multi-Signal Hebbian Link Formation
 
+**Status**: Implemented — `synthesis/cluster.rs` runs 4 signals (Hebbian + entity Jaccard + embedding cosine + temporal). ISS-015 (clustering upgrade → Infomap) and ISS-016 (LLM triple extraction) both closed. Ongoing tuning via ISS-012 importance calibration (closed).
+**Last reviewed**: 2026-04-20
+
 ## Overview
 
 The Hebbian link system currently forms associations only through co-recall events (two memories returned together in a query). This feature enables proactive association discovery at memory write-time using multiple signals: entity overlap, embedding similarity, and temporal proximity. New memories will immediately gain connections to related existing memories, improving discoverability and reducing the cold-start problem for newly stored content.

@@ -1,8 +1,8 @@
 # Entity Indexing (B1) - Implementation Plan
 
 **Feature**: Entity Indexing  
-**Issue**: ISS-009  
-**Status**: ✅ Task graph configured, ready for implementation  
+**Issue**: ISS-009 (closed) — extended by ISS-016 (LLM triple extraction)  
+**Status**: ✅ Implemented — `entity_recall` live as 4th retrieval path; triple extraction landed in commit `0383584`  
 **Priority**: 20 (Phase B - Core improvements)  
 
 ---

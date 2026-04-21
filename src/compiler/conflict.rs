@@ -4,6 +4,7 @@
 //! near-duplicate topics that should be merged.
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use chrono::Utc;
 
@@ -24,6 +25,62 @@ fn jaccard_similarity(a: &HashSet<&str>, b: &HashSet<&str>) -> f64 {
     intersection as f64 / union as f64
 }
 
+/// Returns the set of stop words to exclude from content similarity computation.
+///
+/// Includes: template/markdown vocabulary, memory type labels, common English
+/// stop words, and common Chinese stop words.
+fn stop_words() -> &'static HashSet<&'static str> {
+    static STOP_WORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    STOP_WORDS.get_or_init(|| {
+        [
+            // Markdown headers / formatting
+            "#", "##", "###", "---", "|", "*", "**",
+            // Template labels
+            "Topic", "Summary", "Compiled", "compiled", "from", "memories",
+            "Key", "Points", "Details", "Memory", "Memory:", "Type", "Type:",
+            "Importance", "Importance:", "Date", "Date:",
+            // Memory type labels
+            "factual", "procedural", "episodic", "relational", "emotional",
+            "opinion", "causal",
+            // Common English stop words
+            "the", "a", "an", "is", "are", "was", "were", "be", "been",
+            "being", "have", "has", "had", "do", "does", "did", "will",
+            "would", "could", "should", "may", "might", "shall", "can",
+            "need", "must", "to", "of", "in", "for", "on", "with", "at",
+            "by", "as", "into", "through", "during", "before", "after",
+            "above", "below", "between", "and", "but", "or", "nor", "not",
+            "no", "so", "if", "then", "than", "that", "this", "these",
+            "those", "it", "its", "they", "them", "their", "we", "our",
+            "you", "your", "he", "she", "his", "her",
+            // Common Chinese stop words
+            "的", "了", "在", "是", "和", "有", "我", "不", "也", "就",
+            "人", "都", "一", "这", "中", "上", "大", "会", "到", "来",
+            "用", "要", "可以", "他", "她", "它", "个", "把", "被", "让",
+            "给", "从", "对", "向", "与", "而", "但", "还", "又", "或",
+            "如", "很", "更", "最", "那", "着", "过", "能", "时", "等",
+            "所", "之", "以",
+        ]
+        .into_iter()
+        .collect()
+    })
+}
+
+/// Returns true if a token should be excluded from content similarity.
+///
+/// Filters out: stop words, tokens <= 2 chars, and pure-digit tokens.
+fn is_noise_token(token: &str) -> bool {
+    // Short tokens (catches date fragments, formatting artifacts, most single-char words)
+    if token.len() <= 2 {
+        return true;
+    }
+    // Pure digits (dates, numbers)
+    if token.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    // Stop words (template vocab, common English/Chinese)
+    stop_words().contains(token)
+}
+
 /// Compute Jaccard similarity of source_memory_ids for two topics.
 fn source_overlap(a: &TopicPage, b: &TopicPage) -> f64 {
     let set_a: HashSet<&str> = a.metadata.source_memory_ids.iter().map(|s| s.as_str()).collect();
@@ -32,9 +89,21 @@ fn source_overlap(a: &TopicPage, b: &TopicPage) -> f64 {
 }
 
 /// Compute word-set Jaccard similarity of content strings.
+///
+/// Filters out non-discriminative vocabulary (template structure, stop words,
+/// short tokens, pure digits) before computing Jaccard similarity. This prevents
+/// false-positive conflicts caused by shared template boilerplate.
 fn content_similarity(a: &TopicPage, b: &TopicPage) -> f64 {
-    let words_a: HashSet<&str> = a.content.split_whitespace().collect();
-    let words_b: HashSet<&str> = b.content.split_whitespace().collect();
+    let words_a: HashSet<&str> = a
+        .content
+        .split_whitespace()
+        .filter(|w| !is_noise_token(w))
+        .collect();
+    let words_b: HashSet<&str> = b
+        .content
+        .split_whitespace()
+        .filter(|w| !is_noise_token(w))
+        .collect();
     jaccard_similarity(&words_a, &words_b)
 }
 
@@ -64,11 +133,11 @@ pub struct ConflictDetector {
 impl ConflictDetector {
     /// Create a new detector with default thresholds.
     ///
-    /// - `similarity_threshold`: 0.1 (minimum Jaccard for candidate pairs)
+    /// - `similarity_threshold`: 0.3 (minimum Jaccard for candidate pairs, after stop-word filtering)
     /// - `duplicate_threshold`: 0.6 (source overlap above which topics are duplicates)
     pub fn new() -> Self {
         Self {
-            similarity_threshold: 0.1,
+            similarity_threshold: 0.3,
             duplicate_threshold: 0.6,
         }
     }
@@ -759,7 +828,105 @@ mod tests {
     #[test]
     fn test_default_impl() {
         let detector = ConflictDetector::default();
-        assert_eq!(detector.similarity_threshold, 0.1);
+        assert_eq!(detector.similarity_threshold, 0.3);
         assert_eq!(detector.duplicate_threshold, 0.6);
+    }
+
+    // ── Stop-word filtering tests ────────────────────────────────────────
+
+    #[test]
+    fn test_content_similarity_template_only_returns_zero() {
+        // Two topics that share ONLY template vocabulary — should return 0.0
+        let topic_a = make_topic_with_content(
+            "a",
+            "Topic A",
+            "# Topic\n## Summary\nCompiled from 3 memories\n## Key Points\n## Details\n### Memory:\nType: factual\nImportance: 0.8\nDate: 2024-01-15\n---",
+            &["m1", "m2"],
+        );
+        let topic_b = make_topic_with_content(
+            "b",
+            "Topic B",
+            "# Topic\n## Summary\nCompiled from 5 memories\n## Key Points\n## Details\n### Memory:\nType: procedural\nImportance: 0.6\nDate: 2024-03-20\n---",
+            &["m3", "m4"],
+        );
+
+        let sim = content_similarity(&topic_a, &topic_b);
+        assert_eq!(sim, 0.0, "Topics sharing only template vocabulary should have 0.0 similarity");
+    }
+
+    #[test]
+    fn test_content_similarity_same_subject_different_templates() {
+        // Two topics about the same subject but with different template decorations
+        let topic_a = make_topic_with_content(
+            "a",
+            "Rust Ownership",
+            "# Topic\n## Summary\nCompiled from 4 memories\nRust ownership borrowing lifetimes stack heap allocation move semantics\nType: factual\nImportance: 0.9",
+            &["m1", "m2"],
+        );
+        let topic_b = make_topic_with_content(
+            "b",
+            "Rust Memory",
+            "## Details\n### Memory:\nRust ownership borrowing lifetimes stack heap allocation drop trait\nDate: 2024-06-01\nType: procedural",
+            &["m3", "m4"],
+        );
+
+        let sim = content_similarity(&topic_a, &topic_b);
+        assert!(
+            sim > 0.4,
+            "Topics about the same subject should have high similarity after filtering, got {sim}"
+        );
+    }
+
+    #[test]
+    fn test_stop_word_set_includes_template_vocabulary() {
+        let sw = stop_words();
+        // Template markdown
+        assert!(sw.contains("#"));
+        assert!(sw.contains("##"));
+        assert!(sw.contains("###"));
+        assert!(sw.contains("---"));
+        // Template labels
+        assert!(sw.contains("Topic"));
+        assert!(sw.contains("Summary"));
+        assert!(sw.contains("Compiled"));
+        assert!(sw.contains("compiled"));
+        assert!(sw.contains("memories"));
+        assert!(sw.contains("Key"));
+        assert!(sw.contains("Points"));
+        assert!(sw.contains("Details"));
+        assert!(sw.contains("Memory:"));
+        assert!(sw.contains("Type:"));
+        assert!(sw.contains("Importance:"));
+        assert!(sw.contains("Date:"));
+        // Memory types
+        assert!(sw.contains("factual"));
+        assert!(sw.contains("procedural"));
+        assert!(sw.contains("episodic"));
+        assert!(sw.contains("relational"));
+        assert!(sw.contains("emotional"));
+        assert!(sw.contains("opinion"));
+        assert!(sw.contains("causal"));
+    }
+
+    #[test]
+    fn test_noise_token_filter() {
+        // Short tokens filtered
+        assert!(is_noise_token("a"));
+        assert!(is_noise_token("is"));
+        assert!(is_noise_token(""));
+        // Pure digits filtered
+        assert!(is_noise_token("2024"));
+        assert!(is_noise_token("04"));
+        assert!(is_noise_token("15"));
+        // Stop words filtered
+        assert!(is_noise_token("the"));
+        assert!(is_noise_token("and"));
+        assert!(is_noise_token("的"));
+        assert!(is_noise_token("factual"));
+        // Real content words NOT filtered
+        assert!(!is_noise_token("Rust"));
+        assert!(!is_noise_token("ownership"));
+        assert!(!is_noise_token("borrowing"));
+        assert!(!is_noise_token("programming"));
     }
 }
